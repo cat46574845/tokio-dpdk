@@ -230,6 +230,8 @@ pub(crate) enum Kind {
     CurrentThread,
     #[cfg(feature = "rt-multi-thread")]
     MultiThread,
+    #[cfg(feature = "rt-multi-thread")]
+    Dpdk,
 }
 
 impl Builder {
@@ -987,6 +989,8 @@ impl Builder {
             Kind::CurrentThread => self.build_current_thread_runtime(),
             #[cfg(feature = "rt-multi-thread")]
             Kind::MultiThread => self.build_threaded_runtime(),
+            #[cfg(feature = "rt-multi-thread")]
+            Kind::Dpdk => self.build_dpdk_runtime(),
         }
     }
 
@@ -1030,6 +1034,8 @@ impl Builder {
                 Kind::CurrentThread => true,
                 #[cfg(feature = "rt-multi-thread")]
                 Kind::MultiThread => false,
+                #[cfg(feature = "rt-multi-thread")]
+                Kind::Dpdk => false,
             },
             enable_io: self.enable_io,
             enable_time: self.enable_time,
@@ -1823,6 +1829,30 @@ cfg_rt_multi_thread! {
             launch.launch();
 
             Ok(Runtime::from_parts(Scheduler::MultiThread(scheduler), handle, blocking_pool))
+        }
+
+        /// Builds the DPDK runtime.
+        ///
+        /// This function initializes the DPDK runtime with busy-poll workers.
+        /// Currently returns an error as DPDK initialization requires additional
+        /// configuration that is not yet exposed through the Builder API.
+        fn build_dpdk_runtime(&mut self) -> io::Result<Runtime> {
+            // TODO: Full DPDK initialization requires:
+            // 1. rte_eal_init() - must be called before any DPDK operations
+            // 2. rte_pktmbuf_pool_create() - create memory pool
+            // 3. Port initialization and configuration
+            // 4. DpdkDevice/DpdkDriver/smoltcp setup
+            //
+            // For now, we provide a stub that returns an error indicating
+            // that DPDK must be initialized separately before the runtime can be created.
+            //
+            // Future API: Builder::new_dpdk(dpdk_config) where dpdk_config contains
+            // pre-initialized DPDK resources.
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "DPDK runtime requires explicit DPDK initialization. \
+                 Use dpdk_runtime crate for DPDK-based async runtime.",
+            ))
         }
     }
 }

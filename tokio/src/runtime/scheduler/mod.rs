@@ -22,6 +22,9 @@ cfg_rt_multi_thread! {
 
     pub(crate) mod multi_thread;
     pub(crate) use multi_thread::MultiThread;
+
+    // DPDK scheduler - busy-poll, thread-per-core, no work stealing
+    pub(crate) mod dpdk;
 }
 
 pub(super) mod util;
@@ -36,6 +39,9 @@ pub(crate) enum Handle {
     #[cfg(feature = "rt-multi-thread")]
     MultiThread(Arc<multi_thread::Handle>),
 
+    #[cfg(feature = "rt-multi-thread")]
+    Dpdk(Arc<dpdk::Handle>),
+
     // TODO: This is to avoid triggering "dead code" warnings many other places
     // in the codebase. Remove this during a later cleanup
     #[cfg(not(feature = "rt"))]
@@ -49,6 +55,9 @@ pub(super) enum Context {
 
     #[cfg(feature = "rt-multi-thread")]
     MultiThread(multi_thread::Context),
+
+    #[cfg(feature = "rt-multi-thread")]
+    Dpdk(dpdk::Context),
 }
 
 impl Handle {
@@ -60,6 +69,9 @@ impl Handle {
 
             #[cfg(feature = "rt-multi-thread")]
             Handle::MultiThread(ref h) => &h.driver,
+
+            #[cfg(feature = "rt-multi-thread")]
+            Handle::Dpdk(ref h) => &h.driver,
 
             #[cfg(not(feature = "rt"))]
             Handle::Disabled => unreachable!(),
@@ -83,6 +95,9 @@ cfg_rt! {
 
                 #[cfg(feature = "rt-multi-thread")]
                 $ty::MultiThread($h) => $e,
+
+                #[cfg(feature = "rt-multi-thread")]
+                $ty::Dpdk($h) => $e,
             }
         }
     }
@@ -106,6 +121,9 @@ cfg_rt! {
 
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(_) => false,
+
+                #[cfg(feature = "rt-multi-thread")]
+                Handle::Dpdk(_) => false,
             }
         }
 
@@ -116,6 +134,10 @@ cfg_rt! {
 
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(h) => h.timer_flavor,
+
+                // DPDK always uses Traditional timer
+                #[cfg(feature = "rt-multi-thread")]
+                Handle::Dpdk(_) => crate::runtime::TimerFlavor::Traditional,
             }
         }
 
@@ -158,6 +180,9 @@ cfg_rt! {
 
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(_) => false,
+
+                #[cfg(feature = "rt-multi-thread")]
+                Handle::Dpdk(_) => false,
             }
         }
 
@@ -171,6 +196,9 @@ cfg_rt! {
 
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(h) => multi_thread::Handle::spawn(h, future, id, spawned_at),
+
+                #[cfg(feature = "rt-multi-thread")]
+                Handle::Dpdk(h) => dpdk::Handle::spawn(h, future, id, spawned_at),
             }
         }
 
@@ -201,6 +229,9 @@ cfg_rt! {
 
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(ref h) => h.shutdown(),
+
+                #[cfg(feature = "rt-multi-thread")]
+                Handle::Dpdk(ref h) => h.shutdown(),
             }
         }
 
@@ -221,6 +252,8 @@ cfg_rt! {
                 Handle::CurrentThread(h) => &h.task_hooks,
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(h) => &h.task_hooks,
+                #[cfg(feature = "rt-multi-thread")]
+                Handle::Dpdk(h) => &h.task_hooks,
             }
         }
     }
@@ -231,6 +264,8 @@ cfg_rt! {
                 Handle::CurrentThread(_) => 1,
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(handle) => handle.num_workers(),
+                #[cfg(feature = "rt-multi-thread")]
+                Handle::Dpdk(handle) => handle.num_workers(),
             }
         }
 

@@ -447,6 +447,8 @@ impl Handle {
             scheduler::Handle::CurrentThread(_) => RuntimeFlavor::CurrentThread,
             #[cfg(feature = "rt-multi-thread")]
             scheduler::Handle::MultiThread(_) => RuntimeFlavor::MultiThread,
+            #[cfg(feature = "rt-multi-thread")]
+            scheduler::Handle::Dpdk(_) => RuntimeFlavor::Dpdk,
         }
     }
 
@@ -469,6 +471,8 @@ impl Handle {
             scheduler::Handle::CurrentThread(handle) => handle.owned_id(),
             #[cfg(feature = "rt-multi-thread")]
             scheduler::Handle::MultiThread(handle) => handle.owned_id(),
+            #[cfg(feature = "rt-multi-thread")]
+            scheduler::Handle::Dpdk(handle) => handle.owned_id(),
         };
         runtime::Id::new(owned_id)
     }

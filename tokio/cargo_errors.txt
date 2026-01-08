@@ -1,0 +1,251 @@
+﻿cargo :     Checking tokio v1.49.0 (F:\tokio-dpdk\tokio)
+位於 線路:1 字元:1
++ cargo check -p tokio --features "full" 2>&1 | Out-File -
+FilePath carg ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Checking 
+    to...kio-dpdk\tokio):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+error[E0433]: failed to resolve: use of undeclared crate o
+r module `smoltcp`
+ --> tokio\src\runtime\scheduler\dpdk\config.rs:3:5
+  |
+3 | use smoltcp::wire::{IpCidr, Ipv4Address};
+  |     ^^^^^^^ use of undeclared crate or module `smoltcp
+`
+
+error[E0364]: `create` is private, and cannot be re-export
+ed
+  --> tokio\src\runtime\scheduler\dpdk\mod.rs:22:25
+   |
+22 | pub(crate) use worker::{create, Context, Core, Launch
+, Notified, Shared, Worker};
+   |                         ^^^^^^
+   |
+note: consider marking `create` as `pub` in the imported m
+odule
+  --> tokio\src\runtime\scheduler\dpdk\mod.rs:22:25
+   |
+22 | pub(crate) use worker::{create, Context, Core, Launch
+, Notified, Shared, Worker};
+   |                         ^^^^^^
+
+error[E0365]: `Worker` is private, and cannot be re-export
+ed
+  --> tokio\src\runtime\scheduler\dpdk\mod.rs:22:74
+   |
+22 | pub(crate) use worker::{create, Context, Core, Launch
+, Notified, Shared, Worker};
+   |                                                      
+                    ^^^^^^ re-export of private `Worker`
+   |
+   = note: consider declaring type or module `Worker` with
+ `pub`
+
+warning: unused import: `Mutex`
+ --> tokio\src\runtime\scheduler\dpdk\handle.rs:7:30
+  |
+7 | use crate::loom::sync::{Arc, Mutex, MutexGuard};
+  |                              ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `crate::loom::cell::UnsafeCell`
+ --> tokio\src\runtime\scheduler\dpdk\worker.rs:9:5
+  |
+9 | use crate::loom::cell::UnsafeCell;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `MutexGuard`
+  --> tokio\src\runtime\scheduler\dpdk\worker.rs:11:37
+   |
+11 | use crate::loom::sync::{Arc, Mutex, MutexGuard};
+   |                                     ^^^^^^^^^^
+
+warning: unused imports: `AcqRel`, `Acquire`, and `Release
+`
+  --> tokio\src\runtime\scheduler\dpdk\worker.rs:20:35
+   |
+20 | use std::sync::atomic::Ordering::{AcqRel, Acquire, Re
+lease};
+   |                                   ^^^^^^  ^^^^^^^  ^^
+^^^^^
+
+warning: unused import: `std::sync::atomic::Ordering`
+   --> tokio\src\runtime\scheduler\dpdk\worker.rs:146:5
+    |
+146 | use std::sync::atomic::Ordering;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `config::DpdkConfig`
+  --> tokio\src\runtime\scheduler\dpdk\mod.rs:17:16
+   |
+17 | pub(crate) use config::DpdkConfig;
+   |                ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `io_thread::IoThread`
+  --> tokio\src\runtime\scheduler\dpdk\mod.rs:19:16
+   |
+19 | pub(crate) use io_thread::IoThread;
+   |                ^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Local`, `Overflow`, and `local`
+  --> tokio\src\runtime\scheduler\dpdk\mod.rs:20:24
+   |
+20 | pub(crate) use queue::{local, Local, Overflow};
+   |                        ^^^^^  ^^^^^  ^^^^^^^^
+
+warning: unused imports: `Context`, `Core`, `Launch`, `Not
+ified`, `Shared`, `Worker`, and `create`
+  --> tokio\src\runtime\scheduler\dpdk\mod.rs:22:25
+   |
+22 | pub(crate) use worker::{create, Context, Core, Launch
+, Notified, Shared, Worker};
+   |                         ^^^^^^  ^^^^^^^  ^^^^  ^^^^^^
+  ^^^^^^^^  ^^^^^^  ^^^^^^
+
+warning: unreachable call
+   --> tokio\src\runtime\scheduler\dpdk\handle.rs:127:52
+    |
+127 |                 if Arc::ptr_eq(&cx.worker.handle, &A
+rc::new(todo!())) {
+    |                                                    ^
+^^^^^^^ ------- any code following this expression is unre
+achable
+    |                                                    |
+    |                                                    u
+nreachable call
+    |
+    = note: `#[warn(unreachable_code)]` on by default
+
+error[E0593]: closure is expected to take 1 argument, but 
+it takes 0 arguments
+   --> tokio\src\runtime\scheduler\dpdk\worker.rs:276:5
+    |
+276 |       crate::runtime::context::enter_runtime(&worker
+.handle.driver, false, || {
+    |       ^                                             
+                       -- takes 0 arguments
+    |  _____|
+    | |
+277 | |         // Set scheduler context
+278 | |         CURRENT.with(|current| {
+279 | |             current.set(&cx as *const Context as *
+const ());
+...   |
+283 | |         });
+284 | |     });
+    | |______^ expected closure that takes 1 argument
+    |
+help: consider changing the closure to take and ignore the
+ expected argument
+    |
+276 |     crate::runtime::context::enter_runtime(&worker.h
+andle.driver, false, |_| {
+    |                                                     
+                     ~~~
+
+error[E0308]: mismatched types
+   --> tokio\src\runtime\scheduler\dpdk\worker.rs:276:44
+    |
+276 |     crate::runtime::context::enter_runtime(&worker.h
+andle.driver, false, || {
+    |     -------------------------------------- ^^^^^^^^^
+^^^^^^^^^^^^ expected `scheduler::Handle`, found `runtime:
+:driver::Handle`
+    |     |
+    |     arguments to this function are incorrect
+    |
+    = note: `runtime::driver::Handle` and `scheduler::Hand
+le` have similar names, but are actually distinct types
+note: `runtime::driver::Handle` is defined in module `crat
+e::runtime::driver` of the current crate
+   --> tokio\src\runtime\driver.rs:21:1
+    |
+21  | pub(crate) struct Handle {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^
+note: `scheduler::Handle` is defined in module `crate::run
+time::scheduler` of the current crate
+   --> tokio\src\runtime\scheduler\mod.rs:35:1
+    |
+35  | pub(crate) enum Handle {
+    | ^^^^^^^^^^^^^^^^^^^^^^
+note: function defined here
+   --> tokio\src\runtime\context\runtime.rs:35:15
+    |
+35  | pub(crate) fn enter_runtime<F, R>(handle: &scheduler
+::Handle, allow_block_in_place: bool, f: F) -> R
+    |               ^^^^^^^^^^^^^       ------------------
+--------
+
+error[E0599]: no method named `run` found for struct `runt
+ime::task::Notified` in the current scope
+   --> tokio\src\runtime\scheduler\dpdk\worker.rs:367:14
+    |
+367 |         task.run();
+    |              ^^^ method not found in `Notified<Arc<H
+andle>>`
+    |
+   ::: tokio\src\runtime\task\mod.rs:242:1
+    |
+242 | pub(crate) struct Notified<S: 'static>(Task<S>);
+    | -------------------------------------- method `run` 
+not found for this struct
+
+warning: unused import: `Overflow`
+  --> tokio\src\runtime\scheduler\dpdk\worker.rs:23:33
+   |
+23 | use super::queue::{self, Local, Overflow};
+   |                                 ^^^^^^^^
+
+error[E0133]: call to unsafe function `shared::Shared::<T>
+::pop` is unsafe and requires unsafe block
+   --> tokio\src\runtime\scheduler\dpdk\handle.rs:174:9
+    |
+174 | /         self.shared
+175 | |             .inject
+176 | |             .pop(&mut self.shared.synced.lock().in
+ject)
+    | |___________________________________________________
+____^ call to unsafe function
+    |
+    = note: consult the function's documentation for infor
+mation on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `shared::Shared::<T>
+::push` is unsafe and requires unsafe block
+   --> tokio\src\runtime\scheduler\dpdk\handle.rs:181:9
+    |
+181 | /         self.shared
+182 | |             .inject
+183 | |             .push(&mut self.shared.synced.lock().i
+nject, task);
+    | |___________________________________________________
+___________^ call to unsafe function
+    |
+    = note: consult the function's documentation for infor
+mation on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `rt_multi_thread::<i
+mpl shared::Shared<T>>::push_batch` is unsafe and requires
+ unsafe block
+   --> tokio\src\runtime\scheduler\dpdk\handle.rs:216:9
+    |
+216 | /         self.shared
+217 | |             .inject
+218 | |             .push_batch(&mut self.shared.synced.lo
+ck().inject, iter);
+    | |___________________________________________________
+_________________^ call to unsafe function
+    |
+    = note: consult the function's documentation for infor
+mation on how to avoid undefined behavior
+
+Some errors have detailed explanations: E0133, E0308, E036
+4, E0365, E0433, E0593, E0599.
+For more information about an error, try `rustc --explain 
+E0133`.
+warning: `tokio` (lib) generated 11 warnings
+error: could not compile `tokio` (lib) due to 9 previous e
+rrors; 11 warnings emitted

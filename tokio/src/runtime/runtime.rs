@@ -14,6 +14,7 @@ use std::time::Duration;
 cfg_rt_multi_thread! {
     use crate::runtime::Builder;
     use crate::runtime::scheduler::MultiThread;
+    use crate::runtime::scheduler::dpdk;
 }
 
 /// The Tokio runtime.
@@ -115,6 +116,9 @@ pub enum RuntimeFlavor {
     CurrentThread,
     /// The flavor that executes tasks across multiple threads.
     MultiThread,
+    /// The DPDK scheduler for low-latency networking.
+    #[cfg(feature = "rt-multi-thread")]
+    Dpdk,
 }
 
 /// The runtime scheduler is either a multi-thread or a current-thread executor.
@@ -126,6 +130,10 @@ pub(super) enum Scheduler {
     /// Execute tasks across multiple threads.
     #[cfg(feature = "rt-multi-thread")]
     MultiThread(MultiThread),
+
+    /// DPDK scheduler for low-latency networking.
+    #[cfg(feature = "rt-multi-thread")]
+    Dpdk(dpdk::Dpdk),
 }
 
 impl Runtime {
@@ -370,6 +378,8 @@ impl Runtime {
             Scheduler::CurrentThread(exec) => exec.block_on(&self.handle.inner, future),
             #[cfg(feature = "rt-multi-thread")]
             Scheduler::MultiThread(exec) => exec.block_on(&self.handle.inner, future),
+            #[cfg(feature = "rt-multi-thread")]
+            Scheduler::Dpdk(exec) => exec.block_on(&self.handle.inner, future),
         }
     }
 
@@ -507,6 +517,11 @@ impl Drop for Runtime {
                 // The threaded scheduler drops its tasks on its worker threads, which is
                 // already in the runtime's context.
                 multi_thread.shutdown(&self.handle.inner);
+            }
+            #[cfg(feature = "rt-multi-thread")]
+            Scheduler::Dpdk(dpdk) => {
+                // DPDK scheduler drops tasks on its worker threads
+                dpdk.shutdown(&self.handle.inner);
             }
         }
     }
