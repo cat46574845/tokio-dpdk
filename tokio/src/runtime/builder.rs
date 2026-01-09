@@ -137,6 +137,9 @@ pub struct Builder {
     pub(super) unhandled_panic: UnhandledPanic,
 
     timer_flavor: TimerFlavor,
+
+    /// DPDK builder configuration (only used when Kind::Dpdk)
+    pub(super) dpdk_builder: Option<crate::runtime::scheduler::dpdk::DpdkBuilder>,
 }
 
 cfg_unstable! {
@@ -265,6 +268,31 @@ impl Builder {
         Builder::new(Kind::MultiThread, 61)
     }
 
+    /// Returns a new builder with the DPDK scheduler selected.
+    ///
+    /// This creates a runtime that uses DPDK for high-performance networking
+    /// with kernel bypass and busy-poll workers.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use tokio::runtime::Builder;
+    ///
+    /// let rt = Builder::new_dpdk()
+    ///     .dpdk_device("eth0")
+    ///     .enable_io()
+    ///     .enable_time()
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[cfg(feature = "rt-multi-thread")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    pub fn new_dpdk() -> Builder {
+        let mut builder = Builder::new(Kind::Dpdk, 61);
+        builder.dpdk_builder = Some(crate::runtime::scheduler::dpdk::DpdkBuilder::new());
+        builder
+    }
+
     /// Returns a new runtime builder initialized with default configuration
     /// values.
     ///
@@ -328,6 +356,8 @@ impl Builder {
             disable_lifo_slot: false,
 
             timer_flavor: TimerFlavor::Traditional,
+
+            dpdk_builder: None,
         }
     }
 
@@ -1066,6 +1096,74 @@ impl Builder {
     /// ```
     pub fn thread_keep_alive(&mut self, duration: Duration) -> &mut Self {
         self.keep_alive = Some(duration);
+        self
+    }
+
+    /// Configures a DPDK device for the runtime.
+    ///
+    /// This method must be called at least once when using `new_dpdk()`.
+    /// Device configuration (IP, gateway, MAC, CPU core) will be automatically
+    /// resolved from the operating system.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let rt = Builder::new_dpdk()
+    ///     .dpdk_device("0000:00:1f.6")  // PCI address or interface name
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[cfg(feature = "rt-multi-thread")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    pub fn dpdk_device(&mut self, device: &str) -> &mut Self {
+        if let Some(ref mut dpdk_builder) = self.dpdk_builder {
+            *dpdk_builder = std::mem::take(dpdk_builder).device(device);
+        }
+        self
+    }
+
+    /// Configures multiple DPDK devices for the runtime.
+    ///
+    /// Each device will be assigned to a separate worker thread.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let rt = Builder::new_dpdk()
+    ///     .dpdk_devices(&["eth0", "eth1"])
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[cfg(feature = "rt-multi-thread")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    pub fn dpdk_devices(&mut self, devices: &[&str]) -> &mut Self {
+        if let Some(ref mut dpdk_builder) = self.dpdk_builder {
+            *dpdk_builder = std::mem::take(dpdk_builder).devices(devices);
+        }
+        self
+    }
+
+    /// Adds an EAL argument for DPDK initialization.
+    ///
+    /// EAL (Environment Abstraction Layer) arguments control low-level DPDK
+    /// behavior such as memory allocation, CPU affinity, and logging.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let rt = Builder::new_dpdk()
+    ///     .dpdk_device("eth0")
+    ///     .dpdk_eal_arg("--no-huge")
+    ///     .dpdk_eal_arg("-m").dpdk_eal_arg("128")
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[cfg(feature = "rt-multi-thread")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    pub fn dpdk_eal_arg(&mut self, arg: &str) -> &mut Self {
+        if let Some(ref mut dpdk_builder) = self.dpdk_builder {
+            *dpdk_builder = std::mem::take(dpdk_builder).eal_arg(arg);
+        }
         self
     }
 
@@ -1834,26 +1932,91 @@ cfg_rt_multi_thread! {
         /// Builds the DPDK runtime.
         ///
         /// This function initializes the DPDK runtime with busy-poll workers.
-        /// Currently returns an error as DPDK initialization requires additional
-        /// configuration that is not yet exposed through the Builder API.
+        /// It requires a valid `dpdk_builder` configuration to be set.
         fn build_dpdk_runtime(&mut self) -> io::Result<Runtime> {
-            // TODO: Full DPDK initialization requires:
-            // 1. rte_eal_init() - must be called before any DPDK operations
-            // 2. rte_pktmbuf_pool_create() - create memory pool
-            // 3. Port initialization and configuration
-            // 4. DpdkDevice/DpdkDriver/smoltcp setup
-            //
-            // For now, we provide a stub that returns an error indicating
-            // that DPDK must be initialized separately before the runtime can be created.
-            //
-            // Future API: Builder::new_dpdk(dpdk_config) where dpdk_config contains
-            // pre-initialized DPDK resources.
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "DPDK runtime requires explicit DPDK initialization. \
-                 Use dpdk_runtime crate for DPDK-based async runtime.",
-            ))
+            use crate::runtime::{Config, runtime::Scheduler};
+            use crate::runtime::scheduler::{self, dpdk::{Dpdk, io_thread::IoThread}};
+
+            // Validate DPDK builder is configured
+            let dpdk_builder = self.dpdk_builder.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "DPDK runtime requires dpdk_builder configuration. \
+                     Use Builder::dpdk_config() to set device configuration.",
+                )
+            })?;
+
+            // Create two drivers:
+            // - scheduler_driver_handle: for scheduler Handle to access timer/IO context
+            // - io_driver: for IoThread to own and park on I/O events
+            let (_scheduler_driver, scheduler_driver_handle) = driver::Driver::new(self.get_cfg())?;
+            let (io_driver, io_driver_handle) = driver::Driver::new(self.get_cfg())?;
+
+            // Estimate worker count from dpdk_builder's devices
+            let worker_threads = dpdk_builder.get_devices().len().max(1);
+
+            // Create the blocking pool
+            let blocking_pool =
+                blocking::create_blocking_pool(self, self.max_blocking_threads + worker_threads);
+            let blocking_spawner = blocking_pool.spawner().clone();
+
+            // Generate an rng seed for this runtime
+            let seed_generator_1 = self.seed_generator.next_generator();
+            let seed_generator_2 = self.seed_generator.next_generator();
+
+            // Create runtime config using Builder's standard configuration,
+            // with DpdkBuilder settings as overrides when specified
+            let dpdk_scheduler_config = dpdk_builder.get_scheduler_config();
+            let config = Config {
+                before_park: self.before_park.clone(),
+                after_unpark: self.after_unpark.clone(),
+                before_spawn: self.before_spawn.clone(),
+                #[cfg(tokio_unstable)]
+                before_poll: self.before_poll.clone(),
+                #[cfg(tokio_unstable)]
+                after_poll: self.after_poll.clone(),
+                after_termination: self.after_termination.clone(),
+                // Use DpdkBuilder override if set, otherwise use Builder's value
+                global_queue_interval: dpdk_scheduler_config
+                    .global_queue_interval
+                    .or(self.global_queue_interval),
+                event_interval: dpdk_scheduler_config.event_interval,
+                #[cfg(tokio_unstable)]
+                unhandled_panic: self.unhandled_panic.clone(),
+                disable_lifo_slot: dpdk_scheduler_config.disable_lifo_slot || self.disable_lifo_slot,
+                seed_generator: seed_generator_1,
+                metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
+            };
+
+            // Initialize DPDK and create scheduler
+            let (scheduler, launch, _resources) = Dpdk::new(
+                dpdk_builder,
+                scheduler_driver_handle,
+                blocking_spawner,
+                seed_generator_2,
+                config,
+            )?;
+
+            let handle = Handle {
+                inner: scheduler::Handle::Dpdk(scheduler.handle().clone()),
+            };
+
+            // Launch worker threads
+            let _enter = handle.enter();
+            launch.launch();
+
+            // Create and spawn the I/O thread for standard I/O and timers
+            // This thread handles file I/O, signals, and timer processing
+            let io_thread = IoThread::new(io_driver, io_driver_handle, scheduler.handle().clone());
+            let _io_thread_handle = io_thread.spawn();
+
+            // Note: _io_thread_handle is the JoinHandle for the I/O thread.
+            // In a full implementation, this would be stored in the Runtime
+            // for proper shutdown coordination.
+
+            Ok(Runtime::from_parts(Scheduler::Dpdk(scheduler), handle, blocking_pool))
         }
+
     }
 }
 

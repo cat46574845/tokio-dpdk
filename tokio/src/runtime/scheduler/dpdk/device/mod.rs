@@ -32,7 +32,7 @@ mod dpdk_wrappers {
 
     /// Receive packets from DPDK port.
     #[inline(always)]
-    pub unsafe fn rx_burst(
+    pub(crate) unsafe fn rx_burst(
         port_id: u16,
         queue_id: u16,
         rx_pkts: *mut *mut ffi::rte_mbuf,
@@ -44,7 +44,7 @@ mod dpdk_wrappers {
 
     /// Transmit packets to DPDK port.
     #[inline(always)]
-    pub unsafe fn tx_burst(
+    pub(crate) unsafe fn tx_burst(
         port_id: u16,
         queue_id: u16,
         tx_pkts: *mut *mut ffi::rte_mbuf,
@@ -56,35 +56,35 @@ mod dpdk_wrappers {
 
     /// Allocate an mbuf from pool.
     #[inline(always)]
-    pub unsafe fn pktmbuf_alloc(pool: *mut ffi::rte_mempool) -> *mut ffi::rte_mbuf {
+    pub(crate) unsafe fn pktmbuf_alloc(pool: *mut ffi::rte_mempool) -> *mut ffi::rte_mbuf {
         // SAFETY: Caller guarantees valid mempool pointer
         unsafe { ffi::dpdk_wrap_rte_pktmbuf_alloc(pool) }
     }
 
     /// Free an mbuf.
     #[inline(always)]
-    pub unsafe fn pktmbuf_free(mbuf: *mut ffi::rte_mbuf) {
+    pub(crate) unsafe fn pktmbuf_free(mbuf: *mut ffi::rte_mbuf) {
         // SAFETY: Caller guarantees valid mbuf pointer
         unsafe { ffi::dpdk_wrap_rte_pktmbuf_free(mbuf) }
     }
 
     /// Get mbuf data pointer.
     #[inline(always)]
-    pub unsafe fn pktmbuf_mtod(mbuf: *mut ffi::rte_mbuf) -> *mut u8 {
+    pub(crate) unsafe fn pktmbuf_mtod(mbuf: *mut ffi::rte_mbuf) -> *mut u8 {
         // SAFETY: Caller guarantees valid mbuf pointer
         unsafe { ffi::dpdk_wrap_rte_pktmbuf_mtod(mbuf) as *mut u8 }
     }
 
     /// Get mbuf data length.
     #[inline(always)]
-    pub unsafe fn pktmbuf_data_len(mbuf: *const ffi::rte_mbuf) -> u16 {
+    pub(crate) unsafe fn pktmbuf_data_len(mbuf: *const ffi::rte_mbuf) -> u16 {
         // SAFETY: Caller guarantees valid mbuf pointer
         unsafe { ffi::dpdk_wrap_rte_pktmbuf_data_len(mbuf) }
     }
 
     /// Get mbuf packet length.
     #[inline(always)]
-    pub unsafe fn pktmbuf_pkt_len(mbuf: *const ffi::rte_mbuf) -> u32 {
+    pub(crate) unsafe fn pktmbuf_pkt_len(mbuf: *const ffi::rte_mbuf) -> u32 {
         // SAFETY: Caller guarantees valid mbuf pointer
         unsafe { ffi::dpdk_wrap_rte_pktmbuf_pkt_len(mbuf) }
     }
@@ -98,7 +98,7 @@ mod dpdk_wrappers {
 ///
 /// Implements `smoltcp::phy::Device` to use DPDK for packet transmission
 /// and reception.
-pub struct DpdkDevice {
+pub(crate) struct DpdkDevice {
     /// DPDK port ID
     port_id: u16,
     /// DPDK queue ID
@@ -123,7 +123,7 @@ impl DpdkDevice {
     ///
     /// `mempool` must be a valid DPDK memory pool pointer that outlives
     /// this device.
-    pub unsafe fn new(port_id: u16, queue_id: u16, mempool: *mut ffi::rte_mempool) -> Self {
+    pub(crate) unsafe fn new(port_id: u16, queue_id: u16, mempool: *mut ffi::rte_mempool) -> Self {
         Self {
             port_id,
             queue_id,
@@ -135,12 +135,12 @@ impl DpdkDevice {
     }
 
     /// Get the port ID.
-    pub fn port_id(&self) -> u16 {
+    pub(crate) fn port_id(&self) -> u16 {
         self.port_id
     }
 
     /// Get the queue ID.
-    pub fn queue_id(&self) -> u16 {
+    pub(crate) fn queue_id(&self) -> u16 {
         self.queue_id
     }
 
@@ -172,7 +172,7 @@ impl DpdkDevice {
     /// Flush the transmit buffer.
     ///
     /// This should be called periodically to ensure packets are sent.
-    pub fn flush_tx(&mut self) {
+    pub(crate) fn flush_tx(&mut self) {
         if self.tx_buffer.is_empty() {
             return;
         }
@@ -231,12 +231,12 @@ impl Drop for DpdkDevice {
 // =============================================================================
 
 /// Receive token for smoltcp Device trait.
-pub struct DpdkRxToken {
+pub(crate) struct DpdkRxToken {
     mbuf: *mut ffi::rte_mbuf,
 }
 
 /// Transmit token for smoltcp Device trait.
-pub struct DpdkTxToken<'a> {
+pub(crate) struct DpdkTxToken<'a> {
     device: &'a mut DpdkDevice,
 }
 

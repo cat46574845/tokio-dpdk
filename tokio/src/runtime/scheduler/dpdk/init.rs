@@ -12,10 +12,10 @@ use std::io;
 use super::config::DpdkBuilder;
 use super::device::DpdkDevice;
 use super::ffi;
-use super::resolve::{resolve_device, ResolvedDevice};
+use super::resolve::ResolvedDevice;
 
 /// Initialized DPDK runtime resources.
-pub struct DpdkResources {
+pub(crate) struct DpdkResources {
     /// Memory pool for packet buffers
     pub mempool: *mut ffi::rte_mempool,
     /// Initialized devices (one per network interface)
@@ -23,7 +23,7 @@ pub struct DpdkResources {
 }
 
 /// A fully initialized DPDK device ready for use.
-pub struct InitializedDevice {
+pub(crate) struct InitializedDevice {
     /// The resolved device configuration
     pub config: ResolvedDevice,
     /// The DPDK device for smoltcp
@@ -34,7 +34,7 @@ pub struct InitializedDevice {
 
 impl DpdkResources {
     /// Clean up DPDK resources.
-    pub fn cleanup(&mut self) {
+    pub(crate) fn cleanup(&mut self) {
         // Note: In a full implementation, we would properly cleanup
         // DPDK resources here. For now, this is a placeholder.
     }
@@ -43,7 +43,7 @@ impl DpdkResources {
 /// Initialize DPDK EAL (Environment Abstraction Layer).
 ///
 /// This must be called before any other DPDK functions.
-pub fn init_eal(args: &[String]) -> io::Result<()> {
+pub(crate) fn init_eal(args: &[String]) -> io::Result<()> {
     let c_args: Vec<CString> = args
         .iter()
         .map(|s| CString::new(s.as_str()).expect("Invalid EAL argument"))
@@ -64,7 +64,7 @@ pub fn init_eal(args: &[String]) -> io::Result<()> {
 }
 
 /// Create DPDK memory pool for packet buffers.
-pub fn create_mempool(
+pub(crate) fn create_mempool(
     name: &str,
     n_mbufs: u32,
     cache_size: u32,
@@ -93,7 +93,7 @@ pub fn create_mempool(
 }
 
 /// Initialize a DPDK port.
-pub fn init_port(
+pub(crate) fn init_port(
     port_id: u16,
     mempool: *mut ffi::rte_mempool,
     nb_rx_queues: u16,
@@ -183,7 +183,7 @@ pub fn init_port(
 }
 
 /// Get MAC address for a DPDK port.
-pub fn get_mac_address(port_id: u16) -> io::Result<[u8; 6]> {
+pub(crate) fn get_mac_address(port_id: u16) -> io::Result<[u8; 6]> {
     let mut mac: ffi::rte_ether_addr = unsafe { std::mem::zeroed() };
     let ret = unsafe { ffi::rte_eth_macaddr_get(port_id, &mut mac) };
 
@@ -198,7 +198,7 @@ pub fn get_mac_address(port_id: u16) -> io::Result<[u8; 6]> {
 }
 
 /// Find DPDK port by MAC address.
-pub fn find_port_by_mac(target_mac: &[u8; 6]) -> io::Result<Option<u16>> {
+pub(crate) fn find_port_by_mac(target_mac: &[u8; 6]) -> io::Result<Option<u16>> {
     let n_ports = unsafe { ffi::rte_eth_dev_count_avail() };
 
     for port_id in 0..n_ports {
@@ -213,7 +213,7 @@ pub fn find_port_by_mac(target_mac: &[u8; 6]) -> io::Result<Option<u16>> {
 }
 
 /// Generate EAL arguments from resolved devices.
-pub fn generate_eal_args(devices: &[ResolvedDevice], extra_args: &[String]) -> Vec<String> {
+pub(crate) fn generate_eal_args(devices: &[ResolvedDevice], extra_args: &[String]) -> Vec<String> {
     let mut args = vec!["tokio-dpdk".to_string()];
 
     // Generate core list from device configurations
@@ -235,7 +235,7 @@ pub fn generate_eal_args(devices: &[ResolvedDevice], extra_args: &[String]) -> V
 }
 
 /// Initialize all DPDK resources based on builder configuration.
-pub fn initialize_dpdk(builder: &DpdkBuilder) -> io::Result<DpdkResources> {
+pub(crate) fn initialize_dpdk(builder: &DpdkBuilder) -> io::Result<DpdkResources> {
     // 1. Resolve all devices
     let resolved_devices = builder.resolve_devices()?;
 
@@ -292,7 +292,7 @@ pub fn initialize_dpdk(builder: &DpdkBuilder) -> io::Result<DpdkResources> {
 
 /// Set CPU affinity for the current thread.
 #[cfg(target_os = "linux")]
-pub fn set_cpu_affinity(core: usize) -> io::Result<()> {
+pub(crate) fn set_cpu_affinity(core: usize) -> io::Result<()> {
     use std::mem;
 
     let mut cpuset: libc::cpu_set_t = unsafe { mem::zeroed() };
@@ -309,7 +309,7 @@ pub fn set_cpu_affinity(core: usize) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_cpu_affinity(_core: usize) -> io::Result<()> {
+pub(crate) fn set_cpu_affinity(_core: usize) -> io::Result<()> {
     // CPU affinity is not supported on this platform
     Ok(())
 }

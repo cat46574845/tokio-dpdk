@@ -32,14 +32,14 @@ pub(crate) struct ResolvedDevice {
 
 impl ResolvedDevice {
     /// Check if this device has any IPv4 addresses
-    pub fn has_ipv4(&self) -> bool {
+    pub(crate) fn has_ipv4(&self) -> bool {
         self.addresses
             .iter()
             .any(|a| matches!(a.address(), IpAddress::Ipv4(_)))
     }
 
     /// Check if this device has any IPv6 addresses
-    pub fn has_ipv6(&self) -> bool {
+    pub(crate) fn has_ipv6(&self) -> bool {
         self.addresses
             .iter()
             .any(|a| matches!(a.address(), IpAddress::Ipv6(_)))
@@ -48,7 +48,7 @@ impl ResolvedDevice {
 
 /// Device override configuration provided by user.
 #[derive(Debug, Clone, Default)]
-pub struct DeviceOverride {
+pub(super) struct DeviceOverride {
     /// Override IP addresses (if Some, replaces auto-detected)
     pub addresses: Option<Vec<IpCidr>>,
 

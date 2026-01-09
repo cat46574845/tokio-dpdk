@@ -41,21 +41,17 @@
 #![allow(clippy::all)]
 
 // Linux bindings (pre-generated from DPDK 23.11.0 LTS)
-#[cfg(all(feature = "dpdk", target_os = "linux"))]
+#[cfg(target_os = "linux")]
+#[allow(warnings)]
 mod bindings_linux;
 
-#[cfg(all(feature = "dpdk", target_os = "linux"))]
-pub use bindings_linux::*;
+#[cfg(target_os = "linux")]
+pub(super) use bindings_linux::*;
 
 // Windows bindings (pre-generated from DPDK 23.11.0 LTS)
-#[cfg(all(feature = "dpdk", target_os = "windows"))]
+#[cfg(target_os = "windows")]
+#[allow(warnings)]
 mod bindings_windows;
 
-#[cfg(all(feature = "dpdk", target_os = "windows"))]
-pub use bindings_windows::*;
-
-// When dpdk feature is not enabled, provide empty module
-#[cfg(not(feature = "dpdk"))]
-mod empty {
-    // No DPDK support when feature is disabled
-}
+#[cfg(target_os = "windows")]
+pub(super) use bindings_windows::*;

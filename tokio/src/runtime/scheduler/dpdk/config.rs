@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::io;
 
-#[cfg(feature = "dpdk")]
 use super::resolve::{DeviceOverride, ResolvedDevice};
 
 /// Builder for DPDK runtime configuration.
@@ -31,7 +30,7 @@ use super::resolve::{DeviceOverride, ResolvedDevice};
 ///     .build()?;
 /// ```
 #[derive(Debug, Clone, Default)]
-pub struct DpdkBuilder {
+pub(crate) struct DpdkBuilder {
     /// Device names to use
     devices: Vec<String>,
 
@@ -41,13 +40,41 @@ pub struct DpdkBuilder {
     /// Extra EAL arguments
     extra_eal_args: Vec<String>,
 
-    /// Scheduler-specific config
+    /// Scheduler configuration (mirrors Tokio's Builder API)
     scheduler_config: DpdkSchedulerConfig,
+}
+
+/// Scheduler configuration for DPDK runtime.
+/// This mirrors the scheduler-related settings from Tokio's Builder API.
+#[derive(Debug, Clone)]
+pub(crate) struct DpdkSchedulerConfig {
+    /// How often to check for external events (I/O, signals, timers).
+    /// This corresponds to `Builder::event_interval`.
+    pub(crate) event_interval: u32,
+
+    /// How often worker threads steal from the global queue.
+    /// This corresponds to `Builder::global_queue_interval`.
+    pub(crate) global_queue_interval: Option<u32>,
+
+    /// Disable the LIFO slot optimization.
+    /// This corresponds to `Builder::disable_lifo_slot`.
+    pub(crate) disable_lifo_slot: bool,
+}
+
+impl Default for DpdkSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            // Default matches Tokio's defaults
+            event_interval: 61,
+            global_queue_interval: None,
+            disable_lifo_slot: false,
+        }
+    }
 }
 
 /// Device override configuration (public API wrapper).
 #[derive(Debug, Clone, Default)]
-pub struct DeviceOverrideConfig {
+pub(crate) struct DeviceOverrideConfig {
     /// Override IP addresses
     pub addresses: Option<Vec<String>>,
 
@@ -61,124 +88,86 @@ pub struct DeviceOverrideConfig {
     pub core: Option<usize>,
 }
 
-/// Scheduler-specific configuration.
-#[derive(Debug, Clone)]
-pub struct DpdkSchedulerConfig {
-    /// How often to run maintenance tasks (in ticks).
-    pub event_interval: u32,
-
-    /// How often to check the global injection queue (None for auto-tuning).
-    pub global_queue_interval: Option<u32>,
-
-    /// Whether to disable the LIFO slot optimization.
-    pub disable_lifo_slot: bool,
-
-    /// Callback to run before each poll cycle.
-    pub before_poll: Option<fn()>,
-
-    /// Callback to run after each poll cycle.
-    pub after_poll: Option<fn()>,
-}
-
-impl Default for DpdkSchedulerConfig {
-    fn default() -> Self {
-        Self {
-            event_interval: 61,
-            global_queue_interval: None,
-            disable_lifo_slot: false,
-            before_poll: None,
-            after_poll: None,
-        }
-    }
-}
-
 impl DpdkBuilder {
     /// Creates a new DPDK builder.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Add devices by name. Device configuration (IP, gateway, MAC, CPU core)
     /// will be automatically resolved from the operating system.
-    pub fn devices(mut self, names: &[&str]) -> Self {
+    pub(crate) fn devices(mut self, names: &[&str]) -> Self {
         self.devices.extend(names.iter().map(|s| s.to_string()));
         self
     }
 
     /// Add a single device by name.
-    pub fn device(mut self, name: &str) -> Self {
+    pub(crate) fn device(mut self, name: &str) -> Self {
         self.devices.push(name.to_string());
         self
     }
 
     /// Add a device with override configuration.
-    pub fn device_with_override(mut self, name: &str, config: DeviceOverrideConfig) -> Self {
+    pub(crate) fn device_with_override(mut self, name: &str, config: DeviceOverrideConfig) -> Self {
         self.devices.push(name.to_string());
         self.device_overrides.insert(name.to_string(), config);
         self
     }
 
     /// Add an extra EAL argument.
-    pub fn eal_arg(mut self, arg: &str) -> Self {
+    pub(crate) fn eal_arg(mut self, arg: &str) -> Self {
         self.extra_eal_args.push(arg.to_string());
         self
     }
 
     /// Add multiple EAL arguments.
-    pub fn eal_args(mut self, args: &[&str]) -> Self {
+    pub(crate) fn eal_args(mut self, args: &[&str]) -> Self {
         self.extra_eal_args
             .extend(args.iter().map(|s| s.to_string()));
         self
     }
 
-    /// Set the event interval for maintenance tasks.
-    pub fn event_interval(mut self, interval: u32) -> Self {
-        self.scheduler_config.event_interval = interval;
+    /// Get the extra EAL arguments.
+    pub(crate) fn get_eal_args(&self) -> &[String] {
+        &self.extra_eal_args
+    }
+
+    /// Get the configured devices.
+    pub(crate) fn get_devices(&self) -> &[String] {
+        &self.devices
+    }
+
+    /// Sets the number of scheduler ticks between checking for external events.
+    /// This mirrors `Builder::event_interval`.
+    pub(crate) fn event_interval(mut self, val: u32) -> Self {
+        assert!(val > 0, "event_interval must be greater than 0");
+        self.scheduler_config.event_interval = val;
         self
     }
 
-    /// Set the global queue check interval.
-    pub fn global_queue_interval(mut self, interval: u32) -> Self {
-        self.scheduler_config.global_queue_interval = Some(interval);
+    /// Sets the number of scheduler ticks after which the worker thread will
+    /// try to steal tasks from the global queue.
+    /// This mirrors `Builder::global_queue_interval`.
+    pub(crate) fn global_queue_interval(mut self, val: u32) -> Self {
+        assert!(val > 0, "global_queue_interval must be greater than 0");
+        self.scheduler_config.global_queue_interval = Some(val);
         self
     }
 
-    /// Disable the LIFO slot optimization.
-    pub fn disable_lifo_slot(mut self) -> Self {
+    /// Disables the LIFO slot optimization.
+    /// This mirrors `Builder::disable_lifo_slot`.
+    pub(crate) fn disable_lifo_slot(mut self) -> Self {
         self.scheduler_config.disable_lifo_slot = true;
         self
     }
 
-    /// Set the before-poll callback.
-    pub fn before_poll(mut self, callback: fn()) -> Self {
-        self.scheduler_config.before_poll = Some(callback);
-        self
-    }
-
-    /// Set the after-poll callback.
-    pub fn after_poll(mut self, callback: fn()) -> Self {
-        self.scheduler_config.after_poll = Some(callback);
-        self
-    }
-
-    /// Get the configured devices.
-    pub fn get_devices(&self) -> &[String] {
-        &self.devices
-    }
-
-    /// Get the extra EAL arguments.
-    pub fn get_eal_args(&self) -> &[String] {
-        &self.extra_eal_args
-    }
-
     /// Get the scheduler configuration.
-    pub fn get_scheduler_config(&self) -> &DpdkSchedulerConfig {
+    pub(crate) fn get_scheduler_config(&self) -> &DpdkSchedulerConfig {
         &self.scheduler_config
     }
 
     /// Resolve all devices and return their configurations.
-    #[cfg(feature = "dpdk")]
-    pub fn resolve_devices(&self) -> io::Result<Vec<ResolvedDevice>> {
+    pub(crate) fn resolve_devices(&self) -> io::Result<Vec<ResolvedDevice>> {
         use super::resolve::resolve_device;
 
         let mut resolved = Vec::with_capacity(self.devices.len());
@@ -192,16 +181,10 @@ impl DpdkBuilder {
     }
 
     /// Validate the configuration.
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         if self.devices.is_empty() {
             return Err(ConfigError {
                 message: "at least one device must be specified".to_string(),
-            });
-        }
-
-        if self.scheduler_config.event_interval == 0 {
-            return Err(ConfigError {
-                message: "event_interval must be greater than 0".to_string(),
             });
         }
 
@@ -209,7 +192,6 @@ impl DpdkBuilder {
     }
 }
 
-#[cfg(feature = "dpdk")]
 impl DeviceOverrideConfig {
     fn to_device_override(&self) -> DeviceOverride {
         use smoltcp::wire::{IpCidr, Ipv4Address, Ipv6Address};
@@ -238,7 +220,7 @@ impl DeviceOverrideConfig {
 
 /// Error type for configuration validation.
 #[derive(Debug)]
-pub struct ConfigError {
+pub(crate) struct ConfigError {
     pub(crate) message: String,
 }
 

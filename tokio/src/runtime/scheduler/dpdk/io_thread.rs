@@ -58,6 +58,11 @@ impl IoThread {
                 break;
             }
 
+            // Call before_park callback (following multi_thread scheduler pattern)
+            if let Some(f) = &self.handle.shared.config.before_park {
+                f();
+            }
+
             // Park on the driver - this blocks until:
             // - An I/O event occurs (file ready, signal received)
             // - A timer expires
@@ -67,6 +72,11 @@ impl IoThread {
             // - Processing mio events and waking I/O waiters
             // - Processing timer wheel and waking expired timers
             self.driver.park(&self.driver_handle);
+
+            // Call after_unpark callback (following multi_thread scheduler pattern)
+            if let Some(f) = &self.handle.shared.config.after_unpark {
+                f();
+            }
         }
 
         // Shutdown: park with timeout to process remaining events

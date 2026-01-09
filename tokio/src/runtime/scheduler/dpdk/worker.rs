@@ -6,9 +6,8 @@
 //! - No Idle management
 //! - Per-core DPDK driver
 
-use crate::loom::cell::UnsafeCell;
 use crate::loom::sync::atomic::AtomicBool;
-use crate::loom::sync::{Arc, Mutex, MutexGuard};
+use crate::loom::sync::{Arc, Mutex};
 use crate::runtime::scheduler::defer::Defer;
 use crate::runtime::scheduler::inject;
 use crate::runtime::task::{self, OwnedTasks};
@@ -17,14 +16,17 @@ use crate::util::atomic_cell::AtomicCell;
 use crate::util::rand::FastRand;
 
 use std::cell::RefCell;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 
 use super::counters::Counters;
-use super::queue::{self, Local, Overflow};
+use super::dpdk_driver::DpdkDriver;
+use super::init::InitializedDevice;
+use super::queue::{self, Local};
 use super::stats::Stats;
 
+use std::time::Instant;
+
 /// A scheduler worker
-pub(super) struct Worker {
+pub(crate) struct Worker {
     /// Reference to scheduler's handle
     pub(super) handle: Arc<Handle>,
 
@@ -95,6 +97,9 @@ pub(crate) struct Shared {
     /// Per-worker metrics.
     pub(super) worker_metrics: Box<[WorkerMetrics]>,
 
+    /// DPDK drivers (one per worker/core) for network I/O polling.
+    pub(super) drivers: Box<[std::sync::Mutex<DpdkDriver>]>,
+
     /// Internal counters (only active with cfg flag).
     pub(super) _counters: Counters,
 }
@@ -143,13 +148,14 @@ const MAX_LIFO_POLLS_PER_TICK: usize = 3;
 use super::Handle;
 use crate::runtime::{TaskHooks, TimerFlavor};
 use crate::util::RngSeedGenerator;
-use std::sync::atomic::Ordering;
 
 /// Creates the DPDK scheduler workers.
 ///
-/// Unlike multi_thread, this takes a list of core IDs for CPU affinity.
+/// Unlike multi_thread, this takes a list of core IDs for CPU affinity and
+/// initialized DPDK devices for network I/O.
 pub(super) fn create(
     core_ids: Vec<usize>,
+    devices: Vec<InitializedDevice>,
     driver_handle: driver::Handle,
     blocking_spawner: blocking::Spawner,
     seed_generator: RngSeedGenerator,
@@ -159,6 +165,20 @@ pub(super) fn create(
     let mut cores = Vec::with_capacity(size);
     let mut remotes = Vec::with_capacity(size);
     let mut worker_metrics = Vec::with_capacity(size);
+    let mut drivers = Vec::with_capacity(size);
+
+    // Create DpdkDrivers from initialized devices
+    for dev in devices {
+        // Use first address from resolved device config
+        let ip = dev
+            .config
+            .addresses
+            .first()
+            .copied()
+            .expect("Device must have at least one IP address");
+        let driver = DpdkDriver::new(dev.device, dev.config.mac, ip, dev.config.gateway_v4);
+        drivers.push(std::sync::Mutex::new(driver));
+    }
 
     // Create the local queues
     for &core_id in &core_ids {
@@ -200,6 +220,7 @@ pub(super) fn create(
             config,
             scheduler_metrics: SchedulerMetrics::new(),
             worker_metrics: worker_metrics.into_boxed_slice(),
+            drivers: drivers.into_boxed_slice(),
             _counters: Counters,
         },
         driver: driver_handle,
@@ -311,14 +332,46 @@ pub(crate) fn with_current<R>(f: impl FnOnce(Option<&Context>) -> R) -> R {
     })
 }
 
+/// Access the current worker's DpdkDriver.
+///
+/// Returns `None` if:
+/// - Not on a DPDK worker thread
+/// - Driver lock cannot be acquired
+///
+/// This is the primary API for TcpDpdkStream to access the network stack.
+pub(crate) fn with_current_driver<R>(f: impl FnOnce(&mut DpdkDriver) -> R) -> Option<R> {
+    with_current(|ctx| {
+        let ctx = ctx?;
+        let index = ctx.worker.index;
+        let driver_mutex = ctx.worker.handle.shared.drivers.get(index)?;
+        let mut driver = driver_mutex.try_lock().ok()?;
+        Some(f(&mut driver))
+    })
+}
+
+/// Get the current worker's index.
+///
+/// Returns `None` if not on a DPDK worker thread.
+pub(crate) fn current_worker_index() -> Option<usize> {
+    with_current(|ctx| ctx.map(|c| c.worker.index))
+}
+
 impl Context {
     /// Main event loop - busy-poll variant (no parking)
     fn run(&self, core: Box<Core>) -> RunResult {
         // Store core in context
         *self.core.borrow_mut() = Some(core);
 
+        // Track LIFO poll count to prevent starvation
+        let mut lifo_polls = 0usize;
+
         loop {
-            // Check shutdown
+            // Check if runtime is shutting down (handle-level check)
+            if self.worker.handle.is_shutdown() {
+                return self.shutdown_core();
+            }
+
+            // Check core-level shutdown
             if let Some(core) = self.core.borrow().as_ref() {
                 if core.is_shutdown {
                     return self.shutdown_core();
@@ -328,9 +381,22 @@ impl Context {
             // Increment tick
             self.tick();
 
-            // Poll for next task
-            if let Some(task) = self.next_task() {
+            // Poll DPDK network stack (receive packets, process TCP/IP, wake socket tasks)
+            self.poll_dpdk_driver();
+
+            // Start tracking scheduled task processing
+            if let Some(core) = self.core.borrow_mut().as_mut() {
+                core.stats.start_processing_scheduled_tasks();
+            }
+
+            // Poll for next task with LIFO starvation prevention
+            if let Some(task) = self.next_task_with_fairness(&mut lifo_polls) {
                 self.run_task(task)?;
+            }
+
+            // End tracking scheduled task processing
+            if let Some(core) = self.core.borrow_mut().as_mut() {
+                core.stats.end_processing_scheduled_tasks();
             }
 
             // Maintenance every event_interval ticks
@@ -341,30 +407,121 @@ impl Context {
         }
     }
 
+    /// Poll the DPDK network driver for this worker.
+    ///
+    /// This is called on every tick to:
+    /// 1. Receive packets from DPDK
+    /// 2. Process them through smoltcp TCP/IP stack
+    /// 3. Wake async tasks waiting on socket readiness
+    fn poll_dpdk_driver(&self) {
+        // Get worker index to access correct driver
+        let index = self.worker.index;
+
+        // Access the driver for this worker (each worker has dedicated driver)
+        if let Some(driver_mutex) = self.worker.handle.shared.drivers.get(index) {
+            if let Ok(mut driver) = driver_mutex.try_lock() {
+                // Poll with current time
+                let now = Instant::now();
+                driver.poll(now);
+            }
+            // If lock fails, another thread is using it - skip this tick
+        }
+    }
+
     fn tick(&self) {
         if let Some(core) = self.core.borrow_mut().as_mut() {
             core.tick = core.tick.wrapping_add(1);
         }
     }
 
-    fn next_task(&self) -> Option<Notified> {
+    /// Get next task with fairness - uses MAX_LIFO_POLLS_PER_TICK and rand
+    /// This implementation matches the multi_thread scheduler behavior:
+    /// - Periodically check global queue
+    /// - Batch-pull tasks from inject queue to local queue
+    /// - LIFO slot with starvation prevention
+    fn next_task_with_fairness(&self, lifo_polls: &mut usize) -> Option<Notified> {
         let mut core = self.core.borrow_mut();
         let core = core.as_mut()?;
 
         // Check global queue periodically
         if core.tick % core.global_queue_interval == 0 {
+            // Try to get from remote (inject) queue
             if let Some(task) = self.worker.handle.next_remote_task() {
+                *lifo_polls = 0;
                 return Some(task);
+            }
+
+            // If inject queue has more tasks, batch-pull them to local queue
+            // (similar to multi_thread scheduler's next_task logic)
+            self.batch_pull_from_inject(core);
+        } else {
+            // Use rand for occasional global queue checks (for fairness)
+            if core.rand.fastrand_n(64) == 0 {
+                if let Some(task) = self.worker.handle.next_remote_task() {
+                    *lifo_polls = 0;
+                    return Some(task);
+                }
             }
         }
 
-        // Check LIFO slot
-        if let Some(task) = core.lifo_slot.take() {
-            return Some(task);
+        // Check LIFO slot with starvation prevention
+        if core.lifo_enabled && *lifo_polls < MAX_LIFO_POLLS_PER_TICK {
+            if let Some(task) = core.lifo_slot.take() {
+                *lifo_polls += 1;
+                super::counters::inc_lifo_schedules();
+                return Some(task);
+            }
+        } else if *lifo_polls >= MAX_LIFO_POLLS_PER_TICK {
+            // LIFO polling was capped to prevent starvation
+            core.lifo_enabled = false;
+            super::counters::inc_lifo_capped();
+            *lifo_polls = 0;
         }
 
         // Check local queue
-        core.run_queue.pop()
+        if let Some(task) = core.run_queue.pop() {
+            return Some(task);
+        }
+
+        // As last resort, check LIFO slot even if we exceeded count
+        core.lifo_slot.take()
+    }
+
+    /// Batch-pull tasks from inject queue to local queue (like multi_thread scheduler)
+    fn batch_pull_from_inject(&self, core: &mut Core) {
+        let inject = &self.worker.handle.shared.inject;
+
+        // Check if inject queue has tasks
+        if inject.is_empty() {
+            return;
+        }
+
+        // Calculate how many tasks we can pull (use remaining_slots and max_capacity)
+        let cap = usize::min(
+            core.run_queue.remaining_slots(),
+            core.run_queue.max_capacity() / 2,
+        );
+
+        if cap == 0 {
+            return;
+        }
+
+        // Calculate batch size based on number of workers
+        let num_workers = self.worker.handle.shared.remotes.len();
+        let inject_len = inject.len();
+        let n = usize::min(inject_len / num_workers + 1, cap);
+        let n = usize::max(1, n);
+
+        // Pop tasks from inject queue and push to local queue
+        let tasks: Vec<_> = {
+            let mut synced = self.worker.handle.shared.synced.lock();
+            // Safety: passing in the correct inject::Synced
+            unsafe { inject.pop_n(&mut synced.inject, n) }.collect()
+        };
+        // synced is dropped here, lock released
+
+        // Push tasks to local queue using push_back
+        core.run_queue.push_back(tasks.into_iter());
     }
 
     fn run_task(&self, task: Notified) -> RunResult {
@@ -410,17 +567,37 @@ impl Context {
     fn maintenance(&self) {
         super::counters::inc_num_maintenance();
 
-        // Tune global queue interval
+        // Tune global queue interval and submit metrics
         if let Some(core) = self.core.borrow_mut().as_mut() {
             core.global_queue_interval = core
                 .stats
                 .tuned_global_queue_interval(&self.worker.handle.shared.config);
 
-            // Submit stats
+            // Submit worker stats
             let worker_idx = self.worker.index;
             core.stats
                 .submit(&self.worker.handle.shared.worker_metrics[worker_idx]);
+
+            // Record scheduler-level metrics if tracing is enabled
+            if core.is_traced {
+                // The scheduler_metrics is used for aggregate tracking
+                let _scheduler_metrics = &self.worker.handle.shared.scheduler_metrics;
+                // In a full implementation, we would record:
+                // - Total tasks scheduled
+                // - Queue depths
+                // - DPDK packet stats
+            }
+
+            // Check if we have pending work (for diagnostics)
+            if core.has_tasks() && core.should_notify_others() {
+                // In standard multi-thread scheduler this would be used
+                // for work stealing, but DPDK doesn't steal work
+                super::counters::inc_num_maintenance();
+            }
         }
+
+        // Reset LIFO enabled state
+        self.reset_lifo_enabled();
     }
 
     fn shutdown_core(&self) -> RunResult {

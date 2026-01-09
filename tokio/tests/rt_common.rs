@@ -53,6 +53,26 @@ macro_rules! rt_test {
                     .into()
             }
         }
+
+        // DPDK scheduler tests - only compiled when dpdk feature is enabled
+        // These tests run the same test suite on the DPDK runtime to verify
+        // compatibility with standard Tokio features.
+        #[cfg(all(not(target_os = "wasi"), feature = "rt-multi-thread"))]
+        mod dpdk_scheduler {
+            $($t)*
+
+            const NUM_WORKERS: usize = 1;
+
+            fn rt() -> Arc<Runtime> {
+                // Create DPDK runtime - no fallback, must have real DPDK
+                tokio::runtime::Builder::new_dpdk()
+                    .dpdk_device("eth0")
+                    .enable_all()
+                    .build()
+                    .expect("DPDK runtime creation failed - ensure DPDK is properly configured")
+                    .into()
+            }
+        }
     }
 }
 

@@ -4,7 +4,7 @@
 
 use crate::future::Future;
 use crate::loom::sync::atomic::{AtomicBool, Ordering};
-use crate::loom::sync::{Arc, Mutex, MutexGuard};
+use crate::loom::sync::{Arc, MutexGuard};
 use crate::runtime::scheduler::inject;
 use crate::runtime::task::{
     self, JoinHandle, Notified, SpawnLocation, Task, TaskHarnessScheduleHooks,
@@ -123,8 +123,14 @@ impl Handle {
         // Try to schedule locally if we're on a worker thread
         worker::with_current(|maybe_cx| {
             if let Some(cx) = maybe_cx {
-                // Check if same runtime
-                if Arc::ptr_eq(&cx.worker.handle, &Arc::new(todo!())) {
+                // Check if same runtime by comparing shared state pointers
+                // cx.worker.handle.shared and self.shared should be identical if same runtime
+                let same_runtime = std::ptr::eq(
+                    &cx.worker.handle.shared as *const _,
+                    &self.shared as *const _,
+                );
+
+                if same_runtime {
                     // Schedule locally
                     if let Some(core) = cx.core.borrow_mut().as_mut() {
                         self.schedule_local(core, task, is_yield);
