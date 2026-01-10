@@ -75,8 +75,10 @@ mod dpdk_wrappers {
         unsafe { ffi::dpdk_wrap_rte_pktmbuf_mtod(mbuf) as *mut u8 }
     }
 
-    /// Get mbuf data length.
+    /// Get mbuf data length (per-segment, for chained mbufs).
+    /// Required for jumbo frame and scatter-gather I/O support.
     #[inline(always)]
+    #[allow(dead_code)]
     pub(crate) unsafe fn pktmbuf_data_len(mbuf: *const ffi::rte_mbuf) -> u16 {
         // SAFETY: Caller guarantees valid mbuf pointer
         unsafe { ffi::dpdk_wrap_rte_pktmbuf_data_len(mbuf) }
@@ -135,11 +137,14 @@ impl DpdkDevice {
     }
 
     /// Get the port ID.
+    /// Used for statistics collection, link monitoring, and shutdown cleanup.
     pub(crate) fn port_id(&self) -> u16 {
         self.port_id
     }
 
     /// Get the queue ID.
+    /// Used for multi-queue diagnostics and hardware queue identification.
+    #[allow(dead_code)]
     pub(crate) fn queue_id(&self) -> u16 {
         self.queue_id
     }

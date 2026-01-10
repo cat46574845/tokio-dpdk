@@ -9,9 +9,52 @@
 
 use crate::loom::sync::atomic::{AtomicBool, Ordering};
 use crate::loom::sync::Arc;
-use crate::runtime::driver::{self, Driver};
+use crate::runtime::driver::Driver;
 
 use super::Handle;
+
+/// Handle for controlling the I/O thread from outside.
+///
+/// This is returned by `IoThread::spawn()` and allows the runtime
+/// to signal shutdown and wait for the thread to complete.
+pub(crate) struct IoThreadHandle {
+    /// Shared shutdown signal
+    shutdown: Arc<AtomicBool>,
+    /// Reference to scheduler handle for unparking (contains driver::Handle)
+    scheduler_handle: Arc<Handle>,
+    /// Thread join handle
+    join_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl IoThreadHandle {
+    /// Signals the I/O thread to shut down.
+    pub(crate) fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        // Wake up the driver in case it's parked
+        self.scheduler_handle.driver.unpark();
+    }
+
+    /// Waits for the I/O thread to finish.
+    pub(crate) fn join(&mut self) {
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Shuts down and waits for the I/O thread to finish.
+    pub(crate) fn shutdown_and_join(&mut self) {
+        self.shutdown();
+        self.join();
+    }
+}
+
+impl std::fmt::Debug for IoThreadHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoThreadHandle")
+            .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .finish()
+    }
+}
 
 /// Dedicated I/O thread that handles standard I/O and timers.
 ///
@@ -22,24 +65,20 @@ pub(crate) struct IoThread {
     /// This thread has exclusive ownership.
     driver: Driver,
 
-    /// Driver handle for waking up the thread.
-    driver_handle: driver::Handle,
-
-    /// Reference to the scheduler handle.
+    /// Reference to the scheduler handle (contains driver::Handle).
     handle: Arc<Handle>,
 
-    /// Shutdown signal.
-    shutdown: AtomicBool,
+    /// Shared shutdown signal.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl IoThread {
     /// Creates a new I/O thread.
-    pub(crate) fn new(driver: Driver, driver_handle: driver::Handle, handle: Arc<Handle>) -> Self {
+    pub(crate) fn new(driver: Driver, handle: Arc<Handle>) -> Self {
         IoThread {
             driver,
-            driver_handle,
             handle,
-            shutdown: AtomicBool::new(false),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -71,7 +110,7 @@ impl IoThread {
             // The driver handles:
             // - Processing mio events and waking I/O waiters
             // - Processing timer wheel and waking expired timers
-            self.driver.park(&self.driver_handle);
+            self.driver.park(&self.handle.driver);
 
             // Call after_unpark callback (following multi_thread scheduler pattern)
             if let Some(f) = &self.handle.shared.config.after_unpark {
@@ -80,23 +119,25 @@ impl IoThread {
         }
 
         // Shutdown: park with timeout to process remaining events
-        self.driver.shutdown(&self.driver_handle);
+        self.driver.shutdown(&self.handle.driver);
     }
 
-    /// Signals the I/O thread to shut down.
-    pub(crate) fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
-        // Wake up the driver in case it's parked
-        self.driver_handle.unpark();
-    }
+    /// Spawns the I/O thread and returns a handle for shutdown control.
+    pub(crate) fn spawn(mut self) -> IoThreadHandle {
+        let shutdown = self.shutdown.clone();
+        let scheduler_handle = self.handle.clone();
 
-    /// Spawns the I/O thread.
-    pub(crate) fn spawn(mut self) -> std::thread::JoinHandle<()> {
-        std::thread::Builder::new()
+        let join_handle = std::thread::Builder::new()
             .name("dpdk-io".to_string())
             .spawn(move || {
                 self.run();
             })
-            .expect("failed to spawn I/O thread")
+            .expect("failed to spawn I/O thread");
+
+        IoThreadHandle {
+            shutdown,
+            scheduler_handle,
+            join_handle: Some(join_handle),
+        }
     }
 }

@@ -4,8 +4,7 @@
 
 use crate::future::Future;
 use crate::loom::sync::atomic::{AtomicBool, Ordering};
-use crate::loom::sync::{Arc, MutexGuard};
-use crate::runtime::scheduler::inject;
+use crate::loom::sync::Arc;
 use crate::runtime::task::{
     self, JoinHandle, Notified, SpawnLocation, Task, TaskHarnessScheduleHooks,
 };
@@ -15,8 +14,7 @@ use crate::util::RngSeedGenerator;
 use std::fmt;
 use std::num::NonZeroU64;
 
-use super::queue::Overflow;
-use super::worker::{self, Notified as WorkerNotified, Shared, Synced};
+use super::worker::{self, Notified as WorkerNotified, Shared};
 
 /// Handle to the DPDK scheduler
 pub(crate) struct Handle {
@@ -35,22 +33,12 @@ pub(crate) struct Handle {
     /// User-supplied hooks to invoke
     pub(crate) task_hooks: TaskHooks,
 
-    /// Timer flavor (always Traditional for DPDK)
+    /// Timer flavor (always Traditional for DPDK, reserved for future high-precision timers)
+    #[allow(dead_code)]
     pub(crate) timer_flavor: TimerFlavor,
 
     /// Indicates that the runtime is shutting down
     pub(crate) is_shutdown: AtomicBool,
-}
-
-/// Guard for accessing inject queue
-pub(crate) struct InjectGuard<'a> {
-    lock: MutexGuard<'a, Synced>,
-}
-
-impl<'a> AsMut<inject::Synced> for InjectGuard<'a> {
-    fn as_mut(&mut self) -> &mut inject::Synced {
-        &mut self.lock.inject
-    }
 }
 
 impl Handle {
@@ -73,10 +61,31 @@ impl Handle {
         self.is_shutdown.load(Ordering::SeqCst)
     }
 
-    /// Shuts down the runtime
+    /// Shuts down the runtime.
+    ///
+    /// This properly cleans up all spawned tasks by:
+    /// 1. Closing the inject queue to prevent new tasks
+    /// 2. Shutting down all owned tasks (dropping futures)
+    /// 3. Draining any remaining tasks from the inject queue
     pub(crate) fn shutdown(&self) {
+        // First, close the inject queue and signal workers to stop
         self.close();
+
+        // Mark as shutting down
         self.is_shutdown.store(true, Ordering::SeqCst);
+
+        // Shut down all owned tasks. This calls shutdown() on each task,
+        // which causes futures to be dropped and resources to be released.
+        // The parameter 0 is the starting shard for iteration.
+        self.shared.owned.close_and_shutdown_all(0);
+
+        // Drain any remaining tasks from the inject queue
+        let mut synced = self.shared.synced.lock();
+        // Safety: `synced.inject` was created together with `self.shared.inject`
+        // in the same `Shared` struct construction.
+        while let Some(task) = unsafe { self.shared.inject.pop(&mut synced.inject) } {
+            drop(task);
+        }
     }
 
     /// Binds a new task to the scheduler
@@ -156,15 +165,27 @@ impl Handle {
         // If LIFO is enabled and not yielding, use LIFO slot
         if core.lifo_enabled && !is_yield {
             if let Some(prev) = core.lifo_slot.replace(task) {
-                // Push previous to run queue
-                core.run_queue
-                    .push_back_or_overflow(prev, self, &mut core.stats);
+                // Push previous to run queue, overflow to local_overflow if full
+                self.push_to_local_queue_or_overflow(core, prev);
             }
             super::counters::inc_lifo_schedules();
         } else {
-            // Push to run queue
-            core.run_queue
-                .push_back_or_overflow(task, self, &mut core.stats);
+            // Push to run queue, overflow to local_overflow if full
+            self.push_to_local_queue_or_overflow(core, task);
+        }
+    }
+
+    /// Push task to local run queue, or local overflow queue if full.
+    /// This keeps tasks on the same worker (no cross-worker migration).
+    fn push_to_local_queue_or_overflow(&self, core: &mut worker::Core, task: WorkerNotified) {
+        // Check if run_queue has space
+        if core.run_queue.remaining_slots() > 0 {
+            // Safe to push directly (won't trigger Overflow trait)
+            core.run_queue.push_back(std::iter::once(task));
+        } else {
+            // Queue full - use local overflow (lock-free, same worker)
+            core.local_overflow.push_back(task);
+            core.stats.incr_overflow_count();
         }
     }
 
@@ -200,19 +221,9 @@ impl Handle {
         self.shared.shutdown_cores.lock().push(core);
     }
 
-    /// Pointer equality check
-    pub(crate) fn ptr_eq(&self, other: &Handle) -> bool {
-        std::ptr::eq(self, other)
-    }
-
     /// Returns the owned tasks ID (for runtime::Handle::id())
     pub(crate) fn owned_id(&self) -> NonZeroU64 {
         self.shared.owned.id
-    }
-
-    /// Notify all workers (no-op for DPDK since workers never park)
-    pub(crate) fn notify_all(&self) {
-        // DPDK workers are always running (busy-poll), no need to wake them
     }
 
     // ---- Methods required by scheduler::Handle compatibility ----
@@ -235,24 +246,6 @@ impl Handle {
     /// Returns worker metrics for a specific worker
     pub(crate) fn worker_metrics(&self, worker: usize) -> &crate::runtime::WorkerMetrics {
         &self.shared.worker_metrics[worker]
-    }
-}
-
-impl Overflow<Arc<Handle>> for Handle {
-    fn push(&self, task: task::Notified<Arc<Handle>>) {
-        self.push_remote_task(task);
-    }
-
-    fn push_batch<I>(&self, iter: I)
-    where
-        I: Iterator<Item = task::Notified<Arc<Handle>>>,
-    {
-        // Safety: we hold the synced lock
-        unsafe {
-            self.shared
-                .inject
-                .push_batch(&mut self.shared.synced.lock().inject, iter);
-        }
     }
 }
 

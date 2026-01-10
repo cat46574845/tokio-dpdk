@@ -57,19 +57,31 @@ macro_rules! rt_test {
         // DPDK scheduler tests - only compiled when dpdk feature is enabled
         // These tests run the same test suite on the DPDK runtime to verify
         // compatibility with standard Tokio features.
-        #[cfg(all(not(target_os = "wasi"), feature = "rt-multi-thread"))]
+        #[cfg(all(not(target_os = "wasi"), feature = "rt-multi-thread", target_os = "linux"))]
         mod dpdk_scheduler {
             $($t)*
 
             const NUM_WORKERS: usize = 1;
 
+            /// Get DPDK device from environment variable
+            fn detect_dpdk_device() -> String {
+                // Environment variable is required for tests
+                std::env::var("DPDK_DEVICE")
+                    .expect("DPDK_DEVICE environment variable is required for DPDK tests")
+            }
+
             fn rt() -> Arc<Runtime> {
-                // Create DPDK runtime - no fallback, must have real DPDK
+                let device = detect_dpdk_device();
+
+                // Create DPDK runtime with the specified device
                 tokio::runtime::Builder::new_dpdk()
-                    .dpdk_device("eth0")
+                    .dpdk_device(&device)
                     .enable_all()
                     .build()
-                    .expect("DPDK runtime creation failed - ensure DPDK is properly configured")
+                    .expect(&format!(
+                        "DPDK runtime creation failed for device '{}' - ensure DPDK is properly configured",
+                        device
+                    ))
                     .into()
             }
         }

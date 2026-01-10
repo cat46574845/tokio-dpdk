@@ -139,6 +139,7 @@ pub struct Builder {
     timer_flavor: TimerFlavor,
 
     /// DPDK builder configuration (only used when Kind::Dpdk)
+    #[cfg(feature = "rt-multi-thread")]
     pub(super) dpdk_builder: Option<crate::runtime::scheduler::dpdk::DpdkBuilder>,
 }
 
@@ -357,6 +358,7 @@ impl Builder {
 
             timer_flavor: TimerFlavor::Traditional,
 
+            #[cfg(feature = "rt-multi-thread")]
             dpdk_builder: None,
         }
     }
@@ -1167,6 +1169,28 @@ impl Builder {
         self
     }
 
+    /// Adds multiple EAL arguments for DPDK initialization.
+    ///
+    /// This is a convenience method for adding multiple arguments at once.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let rt = Builder::new_dpdk()
+    ///     .dpdk_device("eth0")
+    ///     .dpdk_eal_args(&["--no-huge", "-m", "128"])
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[cfg(feature = "rt-multi-thread")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    pub fn dpdk_eal_args(&mut self, args: &[&str]) -> &mut Self {
+        if let Some(ref mut dpdk_builder) = self.dpdk_builder {
+            *dpdk_builder = std::mem::take(dpdk_builder).eal_args(args);
+        }
+        self
+    }
+
     /// Sets the number of scheduler ticks after which the scheduler will poll the global
     /// task queue.
     ///
@@ -1946,11 +1970,10 @@ cfg_rt_multi_thread! {
                 )
             })?;
 
-            // Create two drivers:
-            // - scheduler_driver_handle: for scheduler Handle to access timer/IO context
-            // - io_driver: for IoThread to own and park on I/O events
-            let (_scheduler_driver, scheduler_driver_handle) = driver::Driver::new(self.get_cfg())?;
-            let (io_driver, io_driver_handle) = driver::Driver::new(self.get_cfg())?;
+            // Create single driver - IoThread will own the Driver,
+            // while the scheduler Handle uses the driver::Handle.
+            // This ensures timer events processed by IoThread wake tasks in scheduler.
+            let (driver, driver_handle) = driver::Driver::new(self.get_cfg())?;
 
             // Estimate worker count from dpdk_builder's devices
             let worker_threads = dpdk_builder.get_devices().len().max(1);
@@ -1964,9 +1987,7 @@ cfg_rt_multi_thread! {
             let seed_generator_1 = self.seed_generator.next_generator();
             let seed_generator_2 = self.seed_generator.next_generator();
 
-            // Create runtime config using Builder's standard configuration,
-            // with DpdkBuilder settings as overrides when specified
-            let dpdk_scheduler_config = dpdk_builder.get_scheduler_config();
+            // Create runtime config using Builder's standard configuration
             let config = Config {
                 before_park: self.before_park.clone(),
                 after_unpark: self.after_unpark.clone(),
@@ -1976,22 +1997,19 @@ cfg_rt_multi_thread! {
                 #[cfg(tokio_unstable)]
                 after_poll: self.after_poll.clone(),
                 after_termination: self.after_termination.clone(),
-                // Use DpdkBuilder override if set, otherwise use Builder's value
-                global_queue_interval: dpdk_scheduler_config
-                    .global_queue_interval
-                    .or(self.global_queue_interval),
-                event_interval: dpdk_scheduler_config.event_interval,
+                global_queue_interval: self.global_queue_interval,
+                event_interval: self.event_interval,
                 #[cfg(tokio_unstable)]
                 unhandled_panic: self.unhandled_panic.clone(),
-                disable_lifo_slot: dpdk_scheduler_config.disable_lifo_slot || self.disable_lifo_slot,
+                disable_lifo_slot: self.disable_lifo_slot,
                 seed_generator: seed_generator_1,
                 metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
             };
 
             // Initialize DPDK and create scheduler
-            let (scheduler, launch, _resources) = Dpdk::new(
+            let (mut scheduler, launch) = Dpdk::new(
                 dpdk_builder,
-                scheduler_driver_handle,
+                driver_handle,
                 blocking_spawner,
                 seed_generator_2,
                 config,
@@ -2007,12 +2025,11 @@ cfg_rt_multi_thread! {
 
             // Create and spawn the I/O thread for standard I/O and timers
             // This thread handles file I/O, signals, and timer processing
-            let io_thread = IoThread::new(io_driver, io_driver_handle, scheduler.handle().clone());
-            let _io_thread_handle = io_thread.spawn();
+            let io_thread = IoThread::new(driver, scheduler.handle().clone());
+            let io_thread_handle = io_thread.spawn();
 
-            // Note: _io_thread_handle is the JoinHandle for the I/O thread.
-            // In a full implementation, this would be stored in the Runtime
-            // for proper shutdown coordination.
+            // Store the I/O thread handle in the scheduler for shutdown coordination
+            scheduler.set_io_thread_handle(io_thread_handle);
 
             Ok(Runtime::from_parts(Scheduler::Dpdk(scheduler), handle, blocking_pool))
         }

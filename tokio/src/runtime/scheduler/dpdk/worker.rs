@@ -11,11 +11,12 @@ use crate::loom::sync::{Arc, Mutex};
 use crate::runtime::scheduler::defer::Defer;
 use crate::runtime::scheduler::inject;
 use crate::runtime::task::{self, OwnedTasks};
-use crate::runtime::{blocking, driver, Config, SchedulerMetrics, WorkerMetrics};
+use crate::runtime::{blocking, driver, Config, WorkerMetrics};
 use crate::util::atomic_cell::AtomicCell;
 use crate::util::rand::FastRand;
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 
 use super::counters::Counters;
 use super::dpdk_driver::DpdkDriver;
@@ -57,9 +58,6 @@ pub(crate) struct Core {
     /// True if the scheduler is being shutdown.
     pub(crate) is_shutdown: bool,
 
-    /// True if the scheduler is being traced.
-    pub(crate) is_traced: bool,
-
     /// Per-worker runtime stats.
     pub(crate) stats: Stats,
 
@@ -68,6 +66,10 @@ pub(crate) struct Core {
 
     /// Fast random number generator.
     pub(crate) rand: FastRand,
+
+    /// Local overflow queue for tasks when run_queue is full.
+    /// Lock-free since only the owning worker accesses it.
+    pub(crate) local_overflow: VecDeque<Notified>,
 }
 
 /// State shared across all workers
@@ -91,9 +93,6 @@ pub(crate) struct Shared {
     /// Scheduler configuration options.
     pub(super) config: Config,
 
-    /// Collects metrics from the runtime.
-    pub(super) scheduler_metrics: SchedulerMetrics,
-
     /// Per-worker metrics.
     pub(super) worker_metrics: Box<[WorkerMetrics]>,
 
@@ -114,6 +113,8 @@ pub(crate) struct Synced {
 /// Unlike multi_thread, no Steal handle since DPDK doesn't use work stealing.
 pub(super) struct Remote {
     /// CPU core ID for this worker.
+    /// Reserved for future NUMA-aware scheduling and diagnostics.
+    #[allow(dead_code)]
     pub(super) core_id: usize,
 
     /// Shutdown signal for this worker.
@@ -169,14 +170,13 @@ pub(super) fn create(
 
     // Create DpdkDrivers from initialized devices
     for dev in devices {
-        // Use first address from resolved device config
-        let ip = dev
-            .config
-            .addresses
-            .first()
-            .copied()
-            .expect("Device must have at least one IP address");
-        let driver = DpdkDriver::new(dev.device, dev.config.mac, ip, dev.config.gateway_v4);
+        let driver = DpdkDriver::new(
+            dev.device,
+            dev.config.mac,
+            dev.config.addresses.clone(),
+            dev.config.gateway_v4,
+            dev.config.gateway_v6,
+        );
         drivers.push(std::sync::Mutex::new(driver));
     }
 
@@ -192,10 +192,10 @@ pub(super) fn create(
             lifo_enabled: !config.disable_lifo_slot,
             run_queue,
             is_shutdown: false,
-            is_traced: false,
             global_queue_interval: stats.tuned_global_queue_interval(&config),
             stats,
             rand: FastRand::from_seed(config.seed_generator.next_seed()),
+            local_overflow: VecDeque::new(),
         }));
 
         remotes.push(Remote {
@@ -218,7 +218,6 @@ pub(super) fn create(
             }),
             shutdown_cores: Mutex::new(vec![]),
             config,
-            scheduler_metrics: SchedulerMetrics::new(),
             worker_metrics: worker_metrics.into_boxed_slice(),
             drivers: drivers.into_boxed_slice(),
             _counters: Counters,
@@ -258,7 +257,6 @@ impl Launch {
                     // Set CPU affinity
                     #[cfg(target_os = "linux")]
                     {
-                        use std::os::unix::thread::JoinHandleExt;
                         let mut cpuset = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
                         unsafe {
                             libc::CPU_ZERO(&mut cpuset);
@@ -478,7 +476,12 @@ impl Context {
             *lifo_polls = 0;
         }
 
-        // Check local queue
+        // Check local overflow queue (lock-free, single-threaded access)
+        if let Some(task) = core.local_overflow.pop_front() {
+            return Some(task);
+        }
+
+        // Check local run queue
         if let Some(task) = core.run_queue.pop() {
             return Some(task);
         }
@@ -524,29 +527,29 @@ impl Context {
         core.run_queue.push_back(tasks.into_iter());
     }
 
-    fn run_task(&self, task: Notified) -> RunResult {
-        let core = self.core.borrow_mut().take();
-        let mut core = match core {
-            Some(c) => c,
-            None => return Err(()),
-        };
-
-        core.stats.start_poll();
+    fn run_task(&self, task: Notified) -> Result<(), ()> {
+        // Start poll tracking
+        if let Some(core) = self.core.borrow_mut().as_mut() {
+            core.stats.start_poll();
+        } else {
+            // No core available - should not happen
+            return Err(());
+        }
 
         // Poll the task using the owned tasks assert_owner pattern
         // Safety: we own this task on this worker
         let task = self.worker.handle.shared.owned.assert_owner(task);
         task.run();
 
-        core.stats.end_poll();
+        // End poll tracking and reset LIFO
+        if let Some(core) = self.core.borrow_mut().as_mut() {
+            core.stats.end_poll();
+            // Reset LIFO enabled after each task
+            core.lifo_enabled = !self.worker.handle.shared.config.disable_lifo_slot;
+        }
 
-        // Reset LIFO enabled after each task
-        core.lifo_enabled = !self.worker.handle.shared.config.disable_lifo_slot;
-
-        // Put core back
-        *self.core.borrow_mut() = Some(core);
-
-        Ok(self.core.borrow_mut().take().unwrap())
+        // Core remains in self.core
+        Ok(())
     }
 
     fn maybe_maintenance(&self) {
@@ -578,16 +581,6 @@ impl Context {
             core.stats
                 .submit(&self.worker.handle.shared.worker_metrics[worker_idx]);
 
-            // Record scheduler-level metrics if tracing is enabled
-            if core.is_traced {
-                // The scheduler_metrics is used for aggregate tracking
-                let _scheduler_metrics = &self.worker.handle.shared.scheduler_metrics;
-                // In a full implementation, we would record:
-                // - Total tasks scheduled
-                // - Queue depths
-                // - DPDK packet stats
-            }
-
             // Check if we have pending work (for diagnostics)
             if core.has_tasks() && core.should_notify_others() {
                 // In standard multi-thread scheduler this would be used
@@ -596,8 +589,31 @@ impl Context {
             }
         }
 
+        // Buffer pool replenishment - inline to avoid hot-path allocation
+        self.replenish_buffer_pool_if_needed();
+
         // Reset LIFO enabled state
         self.reset_lifo_enabled();
+    }
+
+    /// Replenish buffer pool if below low watermark.
+    /// Called during maintenance to keep allocation off the hot path.
+    fn replenish_buffer_pool_if_needed(&self) {
+        const REPLENISH_BATCH_SIZE: usize = 16;
+
+        let index = self.worker.index;
+        if let Some(driver_mutex) = self.worker.handle.shared.drivers.get(index) {
+            // Use try_lock to avoid blocking if driver is busy
+            if let Ok(mut guard) = driver_mutex.try_lock() {
+                let driver = &mut *guard;
+                if driver.buffer_pool_needs_replenish() {
+                    let replenished = driver.buffer_pool_replenish(REPLENISH_BATCH_SIZE);
+                    if replenished > 0 {
+                        super::counters::inc_num_maintenance(); // Track as maintenance work
+                    }
+                }
+            }
+        }
     }
 
     fn shutdown_core(&self) -> RunResult {

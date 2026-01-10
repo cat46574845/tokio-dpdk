@@ -52,6 +52,7 @@ bindgen "$OUT_DIR/dpdk_wrapper.h" \
     --allowlist-function "rte_eth_dev_info_get" \
     --allowlist-function "rte_eth_macaddr_get" \
     --allowlist-function "rte_pktmbuf_pool_create" \
+    --allowlist-function "rte_mempool_free" \
     --allowlist-function "rte_socket_id" \
     --allowlist-function "rte_lcore_id" \
     --allowlist-function "dpdk_wrap_.*" \
@@ -69,9 +70,11 @@ bindgen "$OUT_DIR/dpdk_wrapper.h" \
 echo "Generated bindings at $OUT_DIR/bindings_linux.rs"
 echo "Lines: $(wc -l < $OUT_DIR/bindings_linux.rs)"
 
-# Copy to tokio-dpdk
-cp "$OUT_DIR/bindings_linux.rs" /mnt/f/tokio-dpdk/tokio/src/runtime/scheduler/dpdk/ffi/bindings_linux.rs
+# Copy to tokio-dpdk (default to relative path from script location)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOKIO_FFI_DIR="${TOKIO_FFI_DIR:-$SCRIPT_DIR/../tokio/src/runtime/scheduler/dpdk/ffi}"
+cp "$OUT_DIR/bindings_linux.rs" "$TOKIO_FFI_DIR/bindings_linux.rs"
 
 echo ""
 echo "=== Bindings generated and copied successfully ==="
-echo "Output: /mnt/f/tokio-dpdk/tokio/src/runtime/scheduler/dpdk/ffi/bindings_linux.rs"
+echo "Output: $TOKIO_FFI_DIR/bindings_linux.rs"

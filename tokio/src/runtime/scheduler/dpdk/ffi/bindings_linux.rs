@@ -943,6 +943,9 @@ const _: () = {
     ["Offset of field: rte_mempool::mem_list"]
         [::core::mem::offset_of!(rte_mempool, mem_list) - 136usize];
 };
+unsafe extern "C" {
+    pub fn rte_mempool_free(mp: *mut rte_mempool);
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct rte_mbuf_sched {

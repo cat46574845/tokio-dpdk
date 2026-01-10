@@ -1,0 +1,12 @@
+# Rust Analyzer configuration for tokio-dpdk
+# Ensure DPDK modules are analyzed with correct feature flags
+
+[cargo]
+# Build with all features to enable DPDK code analysis
+allFeatures = true
+# Target Linux for DPDK code
+target = "x86_64-unknown-linux-gnu"
+
+[rustc]
+# Enable cfg flags that DPDK code depends on
+extraArgs = ["--cfg", "tokio_unstable"]

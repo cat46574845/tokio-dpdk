@@ -32,12 +32,19 @@ fn compile_dpdk_wrappers_linux() {
             let mut build = cc::Build::new();
             build
                 .file("src/runtime/scheduler/dpdk/ffi/dpdk_wrappers.c")
-                .opt_level(3);
+                .opt_level(3)
+                // Enable required CPU features for DPDK intrinsics
+                .flag("-mssse3")
+                .flag("-msse4.1")
+                .flag("-msse4.2");
 
-            // Add DPDK include flags
+            // Add DPDK include flags and other compiler flags
             for flag in &cflags {
                 if flag.starts_with("-I") {
                     build.include(&flag[2..]);
+                } else if flag.starts_with("-m") {
+                    // Pass through architecture-specific flags
+                    build.flag(flag);
                 }
             }
 

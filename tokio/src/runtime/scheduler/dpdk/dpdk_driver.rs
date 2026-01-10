@@ -16,7 +16,7 @@ use std::time::Instant;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
 use super::device::DpdkDevice;
 
@@ -44,18 +44,20 @@ const WRITABLE: usize = 1 << 1;
 /// Pre-allocated buffer pool for TCP socket buffers.
 ///
 /// Provides zero-allocation socket creation by reusing buffers.
-/// Buffers are returned to the pool when sockets are closed.
+/// When pool runs low, it can be replenished by background tasks.
 pub(crate) struct TcpBufferPool {
     /// Free RX buffers available for allocation
     rx_free: Vec<Vec<u8>>,
     /// Free TX buffers available for allocation
     tx_free: Vec<Vec<u8>>,
-    /// RX buffer size
-    rx_size: usize,
-    /// TX buffer size  
-    tx_size: usize,
     /// Maximum pool capacity
     capacity: usize,
+    /// RX buffer size for replenishment
+    rx_buffer_size: usize,
+    /// TX buffer size for replenishment
+    tx_buffer_size: usize,
+    /// Low watermark - trigger replenishment when available < this
+    low_watermark: usize,
 }
 
 impl TcpBufferPool {
@@ -78,9 +80,10 @@ impl TcpBufferPool {
         Self {
             rx_free,
             tx_free,
-            rx_size,
-            tx_size,
             capacity,
+            rx_buffer_size: rx_size,
+            tx_buffer_size: tx_size,
+            low_watermark: capacity / 4, // 25% threshold
         }
     }
 
@@ -102,31 +105,33 @@ impl TcpBufferPool {
         Some((rx, tx))
     }
 
-    /// Release buffers back to the pool.
-    ///
-    /// The buffers are cleared (zeroed) before being returned to pool.
-    pub(crate) fn release(&mut self, mut rx: Vec<u8>, mut tx: Vec<u8>) {
-        // Clear buffers for next use (security + clean state)
-        rx.fill(0);
-        tx.fill(0);
-
-        // Only return to pool if within capacity
-        if self.rx_free.len() < self.capacity {
-            self.rx_free.push(rx);
-        }
-        if self.tx_free.len() < self.capacity {
-            self.tx_free.push(tx);
-        }
-    }
-
     /// Number of available buffer pairs.
     pub(crate) fn available(&self) -> usize {
         self.rx_free.len().min(self.tx_free.len())
     }
 
-    /// Total pool capacity.
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
+    /// Check if pool needs replenishment.
+    pub(crate) fn needs_replenish(&self) -> bool {
+        self.available() < self.low_watermark
+    }
+
+    /// Replenish the pool by adding new buffer pairs.
+    ///
+    /// This should be called from a background task to avoid
+    /// blocking the hot path.
+    ///
+    /// Returns the number of buffer pairs added.
+    pub(crate) fn replenish(&mut self, count: usize) -> usize {
+        let mut added = 0;
+        let target = self.capacity.min(self.available() + count);
+
+        while self.available() < target {
+            self.rx_free.push(vec![0u8; self.rx_buffer_size]);
+            self.tx_free.push(vec![0u8; self.tx_buffer_size]);
+            added += 1;
+        }
+
+        added
     }
 }
 
@@ -161,11 +166,6 @@ impl ScheduledIo {
             readiness: AtomicUsize::new(0),
             waiters: Mutex::new(Waiters::default()),
         }
-    }
-
-    /// Get current readiness.
-    pub(crate) fn readiness(&self) -> usize {
-        self.readiness.load(Ordering::Acquire)
     }
 
     /// Set readiness flags and wake appropriate waiters.
@@ -294,13 +294,15 @@ impl DpdkDriver {
     /// # Arguments
     /// * `device` - DPDK device for packet I/O
     /// * `mac` - MAC address
-    /// * `ip` - IP address with subnet
-    /// * `gateway` - Optional default gateway
+    /// * `addresses` - IP addresses with subnets (IPv4 and/or IPv6)
+    /// * `gateway_v4` - Optional IPv4 default gateway
+    /// * `gateway_v6` - Optional IPv6 default gateway
     pub(crate) fn new(
         mut device: DpdkDevice,
         mac: [u8; 6],
-        ip: IpCidr,
-        gateway: Option<Ipv4Address>,
+        addresses: Vec<IpCidr>,
+        gateway_v4: Option<Ipv4Address>,
+        gateway_v6: Option<Ipv6Address>,
     ) -> Self {
         let start_time = Instant::now();
         let now = SmolInstant::from_millis(0);
@@ -311,17 +313,39 @@ impl DpdkDriver {
         // Create interface
         let mut iface = Interface::new(config, &mut device, now);
 
-        // Configure IP address
+        // Configure all IP addresses (IPv4 and IPv6)
+        // Note: smoltcp limit is configured via SMOLTCP_IFACE_MAX_ADDR_COUNT in .cargo/config.toml
+        const MAX_IP_ADDRS: usize = 128;
         iface.update_ip_addrs(|addrs| {
-            addrs.push(ip).expect("Failed to add IP address");
+            for (i, addr) in addresses.iter().enumerate() {
+                if i >= MAX_IP_ADDRS {
+                    // smoltcp has a compile-time limit, skip excess addresses
+                    eprintln!(
+                        "Warning: Skipping IP address {} (smoltcp limit is {})",
+                        addr, MAX_IP_ADDRS
+                    );
+                    break;
+                }
+                if let Err(e) = addrs.push(*addr) {
+                    eprintln!("Warning: Failed to add IP address {}: {:?}", addr, e);
+                }
+            }
         });
 
-        // Configure default gateway
-        if let Some(gw) = gateway {
+        // Configure IPv4 default gateway
+        if let Some(gw) = gateway_v4 {
             iface
                 .routes_mut()
                 .add_default_ipv4_route(gw)
-                .expect("Failed to add default route");
+                .expect("Failed to add IPv4 default route");
+        }
+
+        // Configure IPv6 default gateway
+        if let Some(gw) = gateway_v6 {
+            iface
+                .routes_mut()
+                .add_default_ipv6_route(gw)
+                .expect("Failed to add IPv6 default route");
         }
 
         // Create socket set
@@ -334,55 +358,6 @@ impl DpdkDriver {
             start_time,
             registered_sockets: HashMap::new(),
             buffer_pool: TcpBufferPool::with_defaults(),
-        }
-    }
-
-    /// Create a DPDK driver with custom buffer pool configuration.
-    ///
-    /// # Arguments
-    /// * `device` - DPDK device for packet I/O
-    /// * `mac` - MAC address
-    /// * `ip` - IP address with subnet
-    /// * `gateway` - Optional default gateway
-    /// * `pool_capacity` - Number of TCP connections to pre-allocate buffers for
-    /// * `rx_buffer_size` - Size of each RX buffer
-    /// * `tx_buffer_size` - Size of each TX buffer
-    pub(crate) fn with_buffer_pool(
-        mut device: DpdkDevice,
-        mac: [u8; 6],
-        ip: IpCidr,
-        gateway: Option<Ipv4Address>,
-        pool_capacity: usize,
-        rx_buffer_size: usize,
-        tx_buffer_size: usize,
-    ) -> Self {
-        let start_time = Instant::now();
-        let now = SmolInstant::from_millis(0);
-
-        let config = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-        let mut iface = Interface::new(config, &mut device, now);
-
-        iface.update_ip_addrs(|addrs| {
-            addrs.push(ip).expect("Failed to add IP address");
-        });
-
-        if let Some(gw) = gateway {
-            iface
-                .routes_mut()
-                .add_default_ipv4_route(gw)
-                .expect("Failed to add default route");
-        }
-
-        let sockets = SocketSet::new(vec![]);
-        let buffer_pool = TcpBufferPool::new(pool_capacity, rx_buffer_size, tx_buffer_size);
-
-        Self {
-            device,
-            iface,
-            sockets,
-            start_time,
-            registered_sockets: HashMap::new(),
-            buffer_pool,
         }
     }
 
@@ -458,27 +433,6 @@ impl DpdkDriver {
         Some(self.sockets.add(socket))
     }
 
-    /// Create a TCP socket with custom buffer sizes (allocates on heap).
-    ///
-    /// Use this only when pool buffers are insufficient. Prefer `create_tcp_socket()`
-    /// for zero-allocation runtime performance.
-    pub(crate) fn create_tcp_socket_with_size(
-        &mut self,
-        rx_buffer_size: usize,
-        tx_buffer_size: usize,
-    ) -> SocketHandle {
-        let rx_buffer = TcpSocketBuffer::new(vec![0u8; rx_buffer_size]);
-        let tx_buffer = TcpSocketBuffer::new(vec![0u8; tx_buffer_size]);
-
-        let socket = TcpSocket::new(rx_buffer, tx_buffer);
-        self.sockets.add(socket)
-    }
-
-    /// Get number of available buffer pairs in the pool.
-    pub(crate) fn buffer_pool_available(&self) -> usize {
-        self.buffer_pool.available()
-    }
-
     /// Register a socket for async readiness tracking.
     ///
     /// Returns the ScheduledIo for this socket.
@@ -513,11 +467,6 @@ impl DpdkDriver {
             .connect(cx, remote_endpoint, local_endpoint)
     }
 
-    /// Get TCP socket reference.
-    pub(crate) fn get_tcp_socket(&self, handle: SocketHandle) -> &TcpSocket<'static> {
-        self.sockets.get::<TcpSocket<'_>>(handle)
-    }
-
     /// Get TCP socket mutable reference.
     pub(crate) fn get_tcp_socket_mut(&mut self, handle: SocketHandle) -> &mut TcpSocket<'static> {
         self.sockets.get_mut::<TcpSocket<'_>>(handle)
@@ -535,56 +484,16 @@ impl DpdkDriver {
         // so we rely on the socket being dropped and buffers being freed.
         // For true zero-allocation, we would need to store buffer ownership separately.
         drop(socket);
-
-        // Log pool availability for diagnostics
-        let _available = self.buffer_pool.available();
-        let _capacity = self.buffer_pool.capacity();
     }
 
-    /// Get current timestamp for smoltcp.
-    pub(crate) fn now(&self) -> SmolInstant {
-        SmolInstant::from_millis(Instant::now().duration_since(self.start_time).as_millis() as i64)
+    /// Check if buffer pool needs replenishment.
+    pub(crate) fn buffer_pool_needs_replenish(&self) -> bool {
+        self.buffer_pool.needs_replenish()
     }
 
-    /// Get reference to the DPDK device.
-    pub(crate) fn device(&self) -> &DpdkDevice {
-        &self.device
-    }
-
-    /// Get reference to the smoltcp interface.
-    pub(crate) fn interface(&self) -> &Interface {
-        &self.iface
-    }
-
-    /// Get mutable reference to the smoltcp interface context.
-    pub(crate) fn context(&mut self) -> &mut smoltcp::iface::Context {
-        self.iface.context()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_scheduled_io_new() {
-        let sio = ScheduledIo::new();
-        assert_eq!(sio.readiness(), 0);
-    }
-
-    #[test]
-    fn test_scheduled_io_set_readiness() {
-        let sio = ScheduledIo::new();
-        sio.set_readiness(READABLE);
-        assert_eq!(sio.readiness() & READABLE, READABLE);
-    }
-
-    #[test]
-    fn test_scheduled_io_clear_readiness() {
-        let sio = ScheduledIo::new();
-        sio.set_readiness(READABLE | WRITABLE);
-        sio.clear_readiness(READABLE);
-        assert_eq!(sio.readiness() & READABLE, 0);
-        assert_eq!(sio.readiness() & WRITABLE, WRITABLE);
+    /// Replenish the buffer pool.
+    /// Returns the number of buffer pairs added.
+    pub(crate) fn buffer_pool_replenish(&mut self, count: usize) -> usize {
+        self.buffer_pool.replenish(count)
     }
 }

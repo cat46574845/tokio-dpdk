@@ -42,7 +42,10 @@ use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver}
 /// # Thread Affinity
 ///
 /// Each `TcpDpdkStream` is bound to a specific DPDK worker core.
-/// Operations should be performed on the same core for optimal performance.
+/// **Operations MUST be performed on the same core**. Attempting to use
+/// this stream from a different worker will cause a panic.
+///
+/// Use `core_id()` to check which worker this stream belongs to.
 pub struct TcpDpdkStream {
     /// smoltcp socket handle
     handle: SocketHandle,
@@ -191,6 +194,22 @@ impl TcpDpdkStream {
         self.core_id
     }
 
+    /// Assert that we are on the correct worker thread.
+    /// Panics if called from a different worker than where the stream was created.
+    #[inline]
+    fn assert_on_correct_worker(&self) {
+        let current =
+            current_worker_index().expect("TcpDpdkStream used outside of DPDK worker thread");
+        if current != self.core_id {
+            panic!(
+                "TcpDpdkStream worker affinity violation: stream created on worker {} \
+                 but used on worker {}. DPDK streams must be used on the same worker \
+                 where they were created.",
+                self.core_id, current
+            );
+        }
+    }
+
     /// Set the TCP_NODELAY option.
     ///
     /// Note: smoltcp TCP sockets use Nagle by default; this disables it.
@@ -257,6 +276,9 @@ impl AsyncRead for TcpDpdkStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // Verify worker affinity
+        self.assert_on_correct_worker();
+
         // Wait for read readiness
         match self.scheduled_io.poll_read_ready(cx) {
             Poll::Pending => return Poll::Pending,
@@ -320,6 +342,9 @@ impl AsyncWrite for TcpDpdkStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // Verify worker affinity
+        self.assert_on_correct_worker();
+
         // Wait for write readiness
         match self.scheduled_io.poll_write_ready(cx) {
             Poll::Pending => return Poll::Pending,
@@ -368,6 +393,9 @@ impl AsyncWrite for TcpDpdkStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Verify worker affinity
+        self.assert_on_correct_worker();
+
         // Initiate TCP close via worker context
         let handle = self.handle;
         with_current_driver(|driver| {
@@ -384,6 +412,17 @@ impl AsyncWrite for TcpDpdkStream {
 
 impl Drop for TcpDpdkStream {
     fn drop(&mut self) {
+        // Verify worker affinity - but only warn, don't panic in destructor
+        if let Some(current) = current_worker_index() {
+            if current != self.core_id {
+                // Log error but don't panic - panicking in Drop can cause issues
+                eprintln!(
+                    "WARNING: TcpDpdkStream dropped on wrong worker: created on {} but dropped on {}",
+                    self.core_id, current
+                );
+            }
+        }
+
         // Remove socket from DpdkDriver via worker context.
         // This releases the socket handle and returns buffers to the pool.
         let handle = self.handle;

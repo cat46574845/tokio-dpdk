@@ -7,8 +7,6 @@ use crate::loom::cell::UnsafeCell;
 use crate::loom::sync::Arc;
 use crate::runtime::task;
 
-use super::stats::Stats;
-
 use std::mem::{self, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
@@ -85,15 +83,6 @@ pub(crate) fn local<T: 'static>() -> Local<T> {
     Local { inner }
 }
 
-/// Trait for handling queue overflow.
-pub(crate) trait Overflow<T: 'static> {
-    fn push(&self, task: task::Notified<T>);
-
-    fn push_batch<I>(&self, iter: I)
-    where
-        I: Iterator<Item = task::Notified<T>>;
-}
-
 impl<T> Local<T> {
     /// Returns the number of entries in the queue.
     pub(crate) fn len(&self) -> usize {
@@ -161,135 +150,6 @@ impl<T> Local<T> {
         }
 
         self.inner.tail.store(tail, Release);
-    }
-
-    /// Pushes a task to the back of the queue. If the queue is full,
-    /// triggers overflow to the injection queue.
-    pub(crate) fn push_back_or_overflow<O: Overflow<T>>(
-        &mut self,
-        mut task: task::Notified<T>,
-        overflow: &O,
-        stats: &mut Stats,
-    ) {
-        let tail = loop {
-            let head = self.inner.head.load(Acquire);
-            let (steal, real) = unpack(head);
-
-            // Safety: this is the **only** thread that updates this cell.
-            let tail = unsafe { self.inner.tail.unsync_load() };
-
-            if tail.wrapping_sub(steal) < LOCAL_QUEUE_CAPACITY as UnsignedShort {
-                // There is capacity for the task
-                break tail;
-            } else if steal != real {
-                // Concurrently reading (shouldn't happen in DPDK, but kept for safety)
-                overflow.push(task);
-                return;
-            } else {
-                // Push the current task and half of the queue into overflow
-                match self.push_overflow(task, real, tail, overflow, stats) {
-                    Ok(_) => return,
-                    Err(v) => {
-                        task = v;
-                    }
-                }
-            }
-        };
-
-        self.push_back_finish(task, tail);
-    }
-
-    /// Second half of `push_back` - writes the task and updates tail.
-    fn push_back_finish(&self, task: task::Notified<T>, tail: UnsignedShort) {
-        let idx = tail as usize & MASK;
-
-        self.inner.buffer[idx].with_mut(|ptr| {
-            // Safety: There is only one producer and we verified capacity.
-            unsafe {
-                ptr::write((*ptr).as_mut_ptr(), task);
-            }
-        });
-
-        self.inner.tail.store(tail.wrapping_add(1), Release);
-    }
-
-    /// Moves half of the queue to overflow when full.
-    #[inline(never)]
-    fn push_overflow<O: Overflow<T>>(
-        &mut self,
-        task: task::Notified<T>,
-        head: UnsignedShort,
-        tail: UnsignedShort,
-        overflow: &O,
-        stats: &mut Stats,
-    ) -> Result<(), task::Notified<T>> {
-        const NUM_TASKS_TAKEN: UnsignedShort = (LOCAL_QUEUE_CAPACITY / 2) as UnsignedShort;
-
-        assert_eq!(
-            tail.wrapping_sub(head) as usize,
-            LOCAL_QUEUE_CAPACITY,
-            "queue is not full; tail = {tail}; head = {head}"
-        );
-
-        let prev = pack(head, head);
-
-        // Claim a bunch of tasks
-        if self
-            .inner
-            .head
-            .compare_exchange(
-                prev,
-                pack(
-                    head.wrapping_add(NUM_TASKS_TAKEN),
-                    head.wrapping_add(NUM_TASKS_TAKEN),
-                ),
-                Release,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            return Err(task);
-        }
-
-        // Iterator to extract tasks from the buffer
-        struct BatchTaskIter<'a, T: 'static> {
-            buffer: &'a [UnsafeCell<MaybeUninit<task::Notified<T>>>; LOCAL_QUEUE_CAPACITY],
-            head: UnsignedLong,
-            i: UnsignedLong,
-            count: UnsignedLong,
-        }
-
-        impl<'a, T: 'static> Iterator for BatchTaskIter<'a, T> {
-            type Item = task::Notified<T>;
-
-            #[inline]
-            fn next(&mut self) -> Option<task::Notified<T>> {
-                if self.i == self.count {
-                    None
-                } else {
-                    let i_idx = self.i.wrapping_add(self.head) as usize & MASK;
-                    let slot = &self.buffer[i_idx];
-
-                    // Safety: We claimed exclusive ownership via CAS.
-                    let task = slot.with(|ptr| unsafe { ptr::read((*ptr).as_ptr()) });
-
-                    self.i += 1;
-                    Some(task)
-                }
-            }
-        }
-
-        let batch_iter = BatchTaskIter {
-            buffer: &self.inner.buffer,
-            head: head as UnsignedLong,
-            i: 0,
-            count: NUM_TASKS_TAKEN as UnsignedLong,
-        };
-        overflow.push_batch(batch_iter.chain(std::iter::once(task)));
-
-        stats.incr_overflow_count();
-
-        Ok(())
     }
 
     /// Pops a task from the local queue.

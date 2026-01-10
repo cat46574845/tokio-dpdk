@@ -51,8 +51,10 @@ cfg_net! {
     }
 }
 
-pub mod tcp_dpdk;
-pub use tcp_dpdk::TcpDpdkStream;
+cfg_rt_multi_thread! {
+    pub mod tcp_dpdk;
+    pub use tcp_dpdk::TcpDpdkStream;
+}
 
 cfg_net_unix! {
     pub mod unix;

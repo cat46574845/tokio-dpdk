@@ -25,8 +25,10 @@ cfg_rt_multi_thread! {
 }
 
 // DPDK scheduler - busy-poll, thread-per-core, no work stealing
-// Always enabled (not gated behind features)
-pub(crate) mod dpdk;
+// Gated behind rt-multi-thread to share feature flag infrastructure
+cfg_rt_multi_thread! {
+    pub(crate) mod dpdk;
+}
 
 pub(super) mod util;
 
@@ -40,6 +42,7 @@ pub(crate) enum Handle {
     #[cfg(feature = "rt-multi-thread")]
     MultiThread(Arc<multi_thread::Handle>),
 
+    #[cfg(feature = "rt-multi-thread")]
     Dpdk(Arc<dpdk::Handle>),
 
     // TODO: This is to avoid triggering "dead code" warnings many other places
@@ -56,6 +59,7 @@ pub(super) enum Context {
     #[cfg(feature = "rt-multi-thread")]
     MultiThread(multi_thread::Context),
 
+    #[cfg(feature = "rt-multi-thread")]
     Dpdk(dpdk::Context),
 }
 

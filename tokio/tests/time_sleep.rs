@@ -364,3 +364,65 @@ async fn drop_from_wake() {
         }
     }
 }
+
+/// DPDK flavor tests - these run the same tests on the DPDK runtime
+/// Use: DPDK_DEVICE=enp40s0 cargo test --test time_sleep dpdk_flavor
+#[cfg(all(target_os = "linux", feature = "full"))]
+mod dpdk_flavor {
+    use tokio::time::{self, Duration, Instant};
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[tokio::test(flavor = "dpdk")]
+    async fn dpdk_short_sleeps() {
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(0)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "dpdk")]
+    async fn dpdk_delayed_sleep() {
+        let now = Instant::now();
+        let dur = ms(50);
+
+        time::sleep(dur).await;
+
+        // Allow some tolerance (DPDK busy-poll may be slightly faster or slower)
+        let elapsed = now.elapsed();
+        assert!(elapsed >= ms(40), "elapsed {:?} < 40ms", elapsed);
+    }
+
+    #[tokio::test(flavor = "dpdk")]
+    async fn dpdk_concurrent_sleeps() {
+        let start = Instant::now();
+
+        let h1 = tokio::spawn(async {
+            time::sleep(ms(50)).await;
+            1
+        });
+        let h2 = tokio::spawn(async {
+            time::sleep(ms(50)).await;
+            2
+        });
+        let h3 = tokio::spawn(async {
+            time::sleep(ms(50)).await;
+            3
+        });
+
+        let (r1, r2, r3) = tokio::join!(h1, h2, h3);
+
+        assert_eq!(r1.unwrap(), 1);
+        assert_eq!(r2.unwrap(), 2);
+        assert_eq!(r3.unwrap(), 3);
+
+        // All three should have completed in ~50ms (concurrent), not 150ms (sequential)
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < ms(150),
+            "elapsed {:?} >= 150ms - not concurrent!",
+            elapsed
+        );
+    }
+}

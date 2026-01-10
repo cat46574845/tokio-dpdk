@@ -9,6 +9,7 @@
 mod config;
 mod device;
 pub(crate) mod dpdk_driver;
+pub(crate) mod env_config;
 mod ffi;
 pub(crate) mod init;
 pub(crate) mod io_thread;
@@ -40,10 +41,23 @@ use crate::runtime::scheduler;
 use std::io;
 
 /// DPDK scheduler top-level struct (similar to MultiThread)
-#[derive(Debug)]
 pub(crate) struct Dpdk {
     /// Scheduler handle
     handle: Arc<Handle>,
+    /// I/O thread handle for shutdown coordination
+    io_thread_handle: Option<io_thread::IoThreadHandle>,
+    /// DPDK resources (mempool) - must be kept alive for runtime lifetime
+    resources: Option<init::DpdkResources>,
+}
+
+// Manual Debug implementation since IoThreadHandle is not Debug by default
+impl std::fmt::Debug for Dpdk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dpdk")
+            .field("handle", &self.handle)
+            .field("io_thread_handle", &self.io_thread_handle)
+            .finish()
+    }
 }
 
 impl Dpdk {
@@ -56,14 +70,14 @@ impl Dpdk {
     /// 4. Creates DpdkDevice for each device
     /// 5. Creates scheduler Handle and worker Launch
     ///
-    /// The DPDK resources (devices) will be passed to workers via the Launch struct.
+    /// The DPDK resources (mempool) will be stored in Self for proper lifecycle management.
     pub(crate) fn new(
         dpdk_builder: &DpdkBuilder,
         driver_handle: crate::runtime::driver::Handle,
         blocking_spawner: crate::runtime::blocking::Spawner,
         seed_generator: crate::util::RngSeedGenerator,
         config: crate::runtime::Config,
-    ) -> io::Result<(Self, worker::Launch, init::DpdkResources)> {
+    ) -> io::Result<(Self, worker::Launch)> {
         // Validate DPDK configuration
         dpdk_builder
             .validate()
@@ -92,7 +106,20 @@ impl Dpdk {
             config,
         );
 
-        Ok((Self { handle }, launch, resources))
+        Ok((
+            Self {
+                handle,
+                io_thread_handle: None,
+                resources: Some(resources),
+            },
+            launch,
+        ))
+    }
+
+    /// Sets the I/O thread handle for shutdown coordination.
+    /// Called by the builder after spawning the I/O thread.
+    pub(crate) fn set_io_thread_handle(&mut self, handle: io_thread::IoThreadHandle) {
+        self.io_thread_handle = Some(handle);
     }
 
     /// Returns the scheduler handle
@@ -102,42 +129,29 @@ impl Dpdk {
 
     /// Blocks on a future
     ///
-    /// For DPDK scheduler, this spawns the future on a worker thread and busy-polls
-    /// until completion. Note: DPDK scheduler is optimized for networking workloads
-    /// and block_on may have different performance characteristics than multi-thread.
-    pub(crate) fn block_on<F: Future>(&self, _handle: &scheduler::Handle, future: F) -> F::Output {
-        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-        // For DPDK scheduler, we need to run the future to completion
-        // Since workers are busy-polling, we can use a simple waker that does nothing
-        // and rely on the scheduler's polling
-
-        // Simple waker that does nothing (workers are already busy-polling)
-        fn noop_clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        fn noop(_: *const ()) {}
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
-
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
-
-        // Pin the future on stack and poll until ready
-        let mut future = std::pin::pin!(future);
-
-        loop {
-            match future.as_mut().poll(&mut cx) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => {
-                    // Yield to let worker threads make progress
-                    std::hint::spin_loop();
-                }
-            }
-        }
+    /// For DPDK scheduler, this enters the runtime context and blocks on the future.
+    /// Spawned tasks will be executed on the worker threads.
+    pub(crate) fn block_on<F: Future>(&self, handle: &scheduler::Handle, future: F) -> F::Output {
+        crate::runtime::context::enter_runtime(handle, true, |blocking| {
+            blocking
+                .block_on(future)
+                .expect("failed to block on DPDK runtime")
+        })
     }
 
     /// Shuts down the scheduler
     pub(crate) fn shutdown(&mut self, _handle: &scheduler::Handle) {
+        // First shut down the I/O thread so it stops processing events
+        if let Some(mut io_handle) = self.io_thread_handle.take() {
+            io_handle.shutdown_and_join();
+        }
+
+        // Then shut down the scheduler
         self.handle.shutdown();
+
+        // Finally, clean up DPDK resources (stop devices, free mempool)
+        if let Some(ref mut resources) = self.resources {
+            resources.cleanup();
+        }
     }
 }

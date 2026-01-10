@@ -16,11 +16,18 @@ use super::resolve::ResolvedDevice;
 
 /// Initialized DPDK runtime resources.
 pub(crate) struct DpdkResources {
-    /// Memory pool for packet buffers
+    /// Memory pool for packet buffers.
+    /// MUST remain allocated for the runtime lifetime - all mbufs reference this pool.
+    /// Cleanup is performed via `cleanup()` method during runtime shutdown.
     pub mempool: *mut ffi::rte_mempool,
     /// Initialized devices (one per network interface)
     pub devices: Vec<InitializedDevice>,
 }
+
+// Safety: DPDK mempools are designed to be thread-safe. The mempool pointer
+// is only accessed during cleanup() which happens after all workers have stopped.
+unsafe impl Send for DpdkResources {}
+unsafe impl Sync for DpdkResources {}
 
 /// A fully initialized DPDK device ready for use.
 pub(crate) struct InitializedDevice {
@@ -28,15 +35,42 @@ pub(crate) struct InitializedDevice {
     pub config: ResolvedDevice,
     /// The DPDK device for smoltcp
     pub device: DpdkDevice,
-    /// DPDK port ID
-    pub port_id: u16,
 }
 
 impl DpdkResources {
     /// Clean up DPDK resources.
+    ///
+    /// This must be called during runtime shutdown to properly release:
+    /// - Ethernet devices (stop and close)
+    /// - Memory pool
+    ///
+    /// # Safety
+    /// After calling cleanup(), no mbufs from this pool should be accessed.
     pub(crate) fn cleanup(&mut self) {
-        // Note: In a full implementation, we would properly cleanup
-        // DPDK resources here. For now, this is a placeholder.
+        // Stop and close all ethernet devices
+        for device in &self.devices {
+            let port_id = device.device.port_id();
+            unsafe {
+                // Stop the port (no more RX/TX)
+                let ret = ffi::rte_eth_dev_stop(port_id);
+                if ret != 0 {
+                    eprintln!("Warning: rte_eth_dev_stop({}) failed: {}", port_id, ret);
+                }
+                // Close the port (release resources)
+                let ret = ffi::rte_eth_dev_close(port_id);
+                if ret != 0 {
+                    eprintln!("Warning: rte_eth_dev_close({}) failed: {}", port_id, ret);
+                }
+            }
+        }
+
+        // Free the memory pool
+        if !self.mempool.is_null() {
+            unsafe {
+                ffi::rte_mempool_free(self.mempool);
+            }
+            self.mempool = std::ptr::null_mut();
+        }
     }
 }
 
@@ -283,33 +317,8 @@ pub(crate) fn initialize_dpdk(builder: &DpdkBuilder) -> io::Result<DpdkResources
         devices.push(InitializedDevice {
             config: resolved,
             device: dpdk_device,
-            port_id,
         });
     }
 
     Ok(DpdkResources { mempool, devices })
-}
-
-/// Set CPU affinity for the current thread.
-#[cfg(target_os = "linux")]
-pub(crate) fn set_cpu_affinity(core: usize) -> io::Result<()> {
-    use std::mem;
-
-    let mut cpuset: libc::cpu_set_t = unsafe { mem::zeroed() };
-    unsafe {
-        libc::CPU_ZERO(&mut cpuset);
-        libc::CPU_SET(core, &mut cpuset);
-
-        let result = libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &cpuset);
-        if result != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn set_cpu_affinity(_core: usize) -> io::Result<()> {
-    // CPU affinity is not supported on this platform
-    Ok(())
 }
