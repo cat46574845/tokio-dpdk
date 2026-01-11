@@ -321,7 +321,7 @@ async fn try_read_write() -> io::Result<()> {
     let writer = pipe::OpenOptions::new().open_sender(&fifo)?;
 
     // Fill the pipe buffer with `try_write`.
-    let mut write_data = Vec::new();
+    let mut write_data: Vec<u8> = Vec::new();
     while writable_by_poll(&writer) {
         match writer.try_write(DATA) {
             Ok(n) => write_data.extend(&DATA[..n]),
@@ -364,7 +364,7 @@ async fn try_read_write_vectored() -> io::Result<()> {
     let write_bufs: Vec<_> = DATA.chunks(3).map(io::IoSlice::new).collect();
 
     // Fill the pipe buffer with `try_write_vectored`.
-    let mut write_data = Vec::new();
+    let mut write_data: Vec<u8> = Vec::new();
     while writable_by_poll(&writer) {
         match writer.try_write_vectored(&write_bufs) {
             Ok(n) => write_data.extend(&DATA[..n]),
@@ -410,7 +410,7 @@ async fn try_read_buf() -> std::io::Result<()> {
     let writer = pipe::OpenOptions::new().open_sender(&fifo)?;
 
     // Fill the pipe buffer with `try_write`.
-    let mut write_data = Vec::new();
+    let mut write_data: Vec<u8> = Vec::new();
     while writable_by_poll(&writer) {
         match writer.try_write(DATA) {
             Ok(n) => write_data.extend(&DATA[..n]),

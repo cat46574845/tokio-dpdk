@@ -68,12 +68,27 @@ generate_config() {
     local instance_type=$(fetch_metadata "/instance-type")
     
     echo "{"
-    echo "  \"version\": 1,"
+    echo "  \"version\": 2,"
     echo "  \"generated_at\": \"$timestamp\","
     echo "  \"platform\": \"aws-ec2\","
     echo "  \"metadata\": {"
     echo "    \"instance_type\": \"$instance_type\""
     echo "  },"
+    
+    # Generate dpdk_cores array based on available CPUs
+    # Reserve CPU 0 for kernel, use remaining cores for DPDK
+    local num_cpus=$(nproc --all)
+    echo "  \"dpdk_cores\": ["
+    local cores_first=true
+    for ((i=1; i<num_cpus; i++)); do
+        if [[ "$cores_first" != "true" ]]; then
+            echo ","
+        fi
+        cores_first=false
+        echo -n "    $i"
+    done
+    echo ""
+    echo "  ],"
     
     # Get all MACs from metadata
     local macs=$(fetch_metadata "/network/interfaces/macs/")
@@ -173,12 +188,7 @@ generate_config() {
             gateway_v6="${subnet_base_v6%::*}::1"
         fi
         
-        # Estimate core affinity based on device number, capped to available CPUs
-        local num_cpus=$(nproc --all)
-        local core_affinity=$((device_number + 1))
-        if [[ $core_affinity -ge $num_cpus ]]; then
-            core_affinity=$((num_cpus - 1))
-        fi
+        # Note: core_affinity removed in version 2, use dpdk_cores instead
         
         # Output JSON
         if [[ "$first" != "true" ]]; then
@@ -217,7 +227,6 @@ generate_config() {
         [[ -n "$gateway_v6" ]] && echo "      \"gateway_v6\": \"$gateway_v6\","
         echo "      \"mtu\": 9001,"
         echo "      \"role\": \"$role\","
-        echo "      \"core_affinity\": $core_affinity,"
         echo "      \"original_name\": \"$ifname\""
         echo -n "    }"
     done

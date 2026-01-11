@@ -68,13 +68,28 @@ fn resolve_device_from_os(name: &str) -> io::Result<ResolvedDevice> {
             )
         })?;
 
+    // Get the device index to select corresponding core from dpdk_cores
+    let device_index = env_config
+        .devices
+        .iter()
+        .filter(|d| d.role == super::env_config::DeviceRole::Dpdk)
+        .position(|d| d.pci_address == device_config.pci_address)
+        .unwrap_or(0);
+
+    // Select core from dpdk_cores (fallback to 0 if not enough cores)
+    let core = env_config
+        .dpdk_cores
+        .get(device_index)
+        .copied()
+        .unwrap_or(0);
+
     Ok(ResolvedDevice {
         name: name.to_string(),
         mac: device_config.mac,
         addresses: device_config.addresses.clone(),
         gateway_v4: device_config.gateway_v4,
         gateway_v6: device_config.gateway_v6,
-        core: device_config.core_affinity.unwrap_or(0),
+        core,
     })
 }
 

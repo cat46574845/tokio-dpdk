@@ -37,6 +37,29 @@ pub(crate) struct InitializedDevice {
     pub device: DpdkDevice,
 }
 
+/// A fully initialized DPDK worker for multi-queue mode.
+///
+/// In multi-queue mode, each worker gets its own queue on a shared device.
+pub(crate) struct InitializedWorker {
+    /// The DPDK device for smoltcp (with specific queue_id)
+    pub device: DpdkDevice,
+    /// MAC address
+    pub mac: [u8; 6],
+    /// IP addresses
+    pub addresses: Vec<smoltcp::wire::IpCidr>,
+    /// IPv4 gateway
+    pub gateway_v4: Option<smoltcp::wire::Ipv4Address>,
+    /// IPv6 gateway
+    pub gateway_v6: Option<smoltcp::wire::Ipv6Address>,
+    /// CPU core for this worker
+    pub core_id: usize,
+    /// Queue ID on the device
+    #[allow(dead_code)]
+    pub queue_id: u16,
+    /// DPDK port ID
+    pub port_id: u16,
+}
+
 impl DpdkResources {
     /// Clean up DPDK resources.
     ///
@@ -321,4 +344,187 @@ pub(crate) fn initialize_dpdk(builder: &DpdkBuilder) -> io::Result<DpdkResources
     }
 
     Ok(DpdkResources { mempool, devices })
+}
+
+/// Generate EAL arguments from allocation plan.
+pub(crate) fn generate_eal_args_from_plan(
+    plan: &super::allocation::AllocationPlan,
+    extra_args: &[String],
+) -> Vec<String> {
+    let mut args = vec!["tokio-dpdk".to_string()];
+
+    // Generate core list from allocation plan
+    let mut cores: Vec<usize> = plan.workers.iter().map(|w| w.core_id).collect();
+    cores.sort();
+    cores.dedup();
+
+    if !cores.is_empty() {
+        let core_list: String = cores
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        args.push("-l".to_string());
+        args.push(core_list);
+    }
+
+    // Add extra user-provided arguments
+    args.extend(extra_args.iter().cloned());
+
+    args
+}
+
+/// Initialize DPDK resources based on an allocation plan.
+///
+/// This function is used when multi-queue mode is enabled. It:
+/// 1. Initializes DPDK EAL with cores from the allocation plan
+/// 2. Creates mempool
+/// 3. Initializes each unique port with the required number of queues
+/// 4. Creates InitializedWorker for each worker allocation
+pub(crate) fn initialize_dpdk_from_plan(
+    plan: &super::allocation::AllocationPlan,
+    eal_args: &[String],
+) -> io::Result<(DpdkResourcesMultiQueue, Vec<InitializedWorker>)> {
+    use super::allocation::get_device_queue_counts;
+    use std::collections::HashMap;
+
+    if plan.workers.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Allocation plan has no workers",
+        ));
+    }
+
+    // 1. Generate and call EAL init
+    let full_eal_args = generate_eal_args_from_plan(plan, eal_args);
+    init_eal(&full_eal_args)?;
+
+    // 2. Create mempool
+    let mempool = create_mempool("tokio_dpdk_mbuf_pool", 8192, 256)?;
+
+    // 3. Get queue counts per device
+    let queue_counts = get_device_queue_counts(plan);
+
+    // Track port_id -> num_queues mapping and initialized ports
+    let mut pci_to_port: HashMap<String, u16> = HashMap::new();
+    let mut initialized_ports = Vec::new();
+
+    // Initialize each unique device
+    for (pci_address, num_queues) in &queue_counts {
+        // Find port by MAC (we need to look up MAC from allocation)
+        let worker = plan
+            .workers
+            .iter()
+            .find(|w| &w.pci_address == pci_address)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("No worker found for device {}", pci_address),
+                )
+            })?;
+
+        let port_id = find_port_by_mac(&worker.mac)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "Device {} not found by MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    pci_address,
+                    worker.mac[0],
+                    worker.mac[1],
+                    worker.mac[2],
+                    worker.mac[3],
+                    worker.mac[4],
+                    worker.mac[5]
+                ),
+            )
+        })?;
+
+        // Initialize port with required number of queues
+        init_port(port_id, mempool, *num_queues, *num_queues)?;
+
+        pci_to_port.insert(pci_address.clone(), port_id);
+        initialized_ports.push(port_id);
+    }
+
+    // 4. Create InitializedWorker for each allocation
+    let mut workers = Vec::with_capacity(plan.workers.len());
+
+    for allocation in &plan.workers {
+        let port_id = *pci_to_port.get(&allocation.pci_address).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Port not initialized for {}", allocation.pci_address),
+            )
+        })?;
+
+        // Build addresses list from allocation
+        let mut addresses = Vec::new();
+        if let Some(ipv4) = allocation.ipv4 {
+            addresses.push(ipv4);
+        }
+        if let Some(ipv6) = allocation.ipv6 {
+            addresses.push(ipv6);
+        }
+
+        // Create DpdkDevice with specific queue_id
+        let dpdk_device = unsafe { DpdkDevice::new(port_id, allocation.queue_id, mempool) };
+
+        workers.push(InitializedWorker {
+            device: dpdk_device,
+            mac: allocation.mac,
+            addresses,
+            gateway_v4: allocation.gateway_v4,
+            gateway_v6: allocation.gateway_v6,
+            core_id: allocation.core_id,
+            queue_id: allocation.queue_id,
+            port_id,
+        });
+    }
+
+    Ok((
+        DpdkResourcesMultiQueue {
+            mempool,
+            ports: initialized_ports,
+        },
+        workers,
+    ))
+}
+
+/// DPDK resources for multi-queue mode.
+pub(crate) struct DpdkResourcesMultiQueue {
+    /// Memory pool for packet buffers.
+    pub mempool: *mut ffi::rte_mempool,
+    /// List of initialized port IDs.
+    pub ports: Vec<u16>,
+}
+
+// Safety: DPDK mempools are thread-safe
+unsafe impl Send for DpdkResourcesMultiQueue {}
+unsafe impl Sync for DpdkResourcesMultiQueue {}
+
+impl DpdkResourcesMultiQueue {
+    /// Clean up DPDK resources.
+    pub(crate) fn cleanup(&mut self) {
+        // Stop and close all ports
+        for &port_id in &self.ports {
+            unsafe {
+                let ret = ffi::rte_eth_dev_stop(port_id);
+                if ret != 0 {
+                    eprintln!("Warning: rte_eth_dev_stop({}) failed: {}", port_id, ret);
+                }
+                let ret = ffi::rte_eth_dev_close(port_id);
+                if ret != 0 {
+                    eprintln!("Warning: rte_eth_dev_close({}) failed: {}", port_id, ret);
+                }
+            }
+        }
+
+        // Free the memory pool
+        if !self.mempool.is_null() {
+            unsafe {
+                ffi::rte_mempool_free(self.mempool);
+            }
+            self.mempool = std::ptr::null_mut();
+        }
+    }
 }

@@ -946,6 +946,8 @@ const _: () = {
 unsafe extern "C" {
     pub fn rte_mempool_free(mp: *mut rte_mempool);
 }
+pub type rte_be16_t = u16;
+pub type rte_be32_t = u32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct rte_mbuf_sched {
@@ -1805,6 +1807,1168 @@ const _: () = {
         [::core::mem::offset_of!(rte_ether_addr, addr_bytes) - 0usize];
 };
 #[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rte_ether_hdr {
+    pub dst_addr: rte_ether_addr,
+    pub src_addr: rte_ether_addr,
+    pub ether_type: rte_be16_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_ether_hdr"][::core::mem::size_of::<rte_ether_hdr>() - 14usize];
+    ["Alignment of rte_ether_hdr"][::core::mem::align_of::<rte_ether_hdr>() - 2usize];
+    ["Offset of field: rte_ether_hdr::dst_addr"]
+        [::core::mem::offset_of!(rte_ether_hdr, dst_addr) - 0usize];
+    ["Offset of field: rte_ether_hdr::src_addr"]
+        [::core::mem::offset_of!(rte_ether_hdr, src_addr) - 6usize];
+    ["Offset of field: rte_ether_hdr::ether_type"]
+        [::core::mem::offset_of!(rte_ether_hdr, ether_type) - 12usize];
+};
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct rte_ipv4_hdr {
+    pub __bindgen_anon_1: rte_ipv4_hdr__bindgen_ty_1,
+    pub type_of_service: u8,
+    pub total_length: rte_be16_t,
+    pub packet_id: rte_be16_t,
+    pub fragment_offset: rte_be16_t,
+    pub time_to_live: u8,
+    pub next_proto_id: u8,
+    pub hdr_checksum: rte_be16_t,
+    pub src_addr: rte_be32_t,
+    pub dst_addr: rte_be32_t,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union rte_ipv4_hdr__bindgen_ty_1 {
+    pub version_ihl: u8,
+    pub __bindgen_anon_1: rte_ipv4_hdr__bindgen_ty_1__bindgen_ty_1,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rte_ipv4_hdr__bindgen_ty_1__bindgen_ty_1 {
+    pub _bitfield_align_1: [u8; 0],
+    pub _bitfield_1: __BindgenBitfieldUnit<[u8; 1usize]>,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_ipv4_hdr__bindgen_ty_1__bindgen_ty_1"]
+        [::core::mem::size_of::<rte_ipv4_hdr__bindgen_ty_1__bindgen_ty_1>() - 1usize];
+    ["Alignment of rte_ipv4_hdr__bindgen_ty_1__bindgen_ty_1"]
+        [::core::mem::align_of::<rte_ipv4_hdr__bindgen_ty_1__bindgen_ty_1>() - 1usize];
+};
+impl rte_ipv4_hdr__bindgen_ty_1__bindgen_ty_1 {
+    #[inline]
+    pub fn ihl(&self) -> u8 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(0usize, 4u8) as u8) }
+    }
+    #[inline]
+    pub fn set_ihl(&mut self, val: u8) {
+        unsafe {
+            let val: u8 = ::core::mem::transmute(val);
+            self._bitfield_1.set(0usize, 4u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn ihl_raw(this: *const Self) -> u8 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 1usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                0usize,
+                4u8,
+            ) as u8)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_ihl_raw(this: *mut Self, val: u8) {
+        unsafe {
+            let val: u8 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 1usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                0usize,
+                4u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn version(&self) -> u8 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(4usize, 4u8) as u8) }
+    }
+    #[inline]
+    pub fn set_version(&mut self, val: u8) {
+        unsafe {
+            let val: u8 = ::core::mem::transmute(val);
+            self._bitfield_1.set(4usize, 4u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn version_raw(this: *const Self) -> u8 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 1usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                4usize,
+                4u8,
+            ) as u8)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_version_raw(this: *mut Self, val: u8) {
+        unsafe {
+            let val: u8 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 1usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                4usize,
+                4u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn new_bitfield_1(ihl: u8, version: u8) -> __BindgenBitfieldUnit<[u8; 1usize]> {
+        let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 1usize]> = Default::default();
+        __bindgen_bitfield_unit.set(0usize, 4u8, {
+            let ihl: u8 = unsafe { ::core::mem::transmute(ihl) };
+            ihl as u64
+        });
+        __bindgen_bitfield_unit.set(4usize, 4u8, {
+            let version: u8 = unsafe { ::core::mem::transmute(version) };
+            version as u64
+        });
+        __bindgen_bitfield_unit
+    }
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_ipv4_hdr__bindgen_ty_1"]
+        [::core::mem::size_of::<rte_ipv4_hdr__bindgen_ty_1>() - 1usize];
+    ["Alignment of rte_ipv4_hdr__bindgen_ty_1"]
+        [::core::mem::align_of::<rte_ipv4_hdr__bindgen_ty_1>() - 1usize];
+    ["Offset of field: rte_ipv4_hdr__bindgen_ty_1::version_ihl"]
+        [::core::mem::offset_of!(rte_ipv4_hdr__bindgen_ty_1, version_ihl) - 0usize];
+};
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_ipv4_hdr"][::core::mem::size_of::<rte_ipv4_hdr>() - 20usize];
+    ["Alignment of rte_ipv4_hdr"][::core::mem::align_of::<rte_ipv4_hdr>() - 1usize];
+    ["Offset of field: rte_ipv4_hdr::type_of_service"]
+        [::core::mem::offset_of!(rte_ipv4_hdr, type_of_service) - 1usize];
+    ["Offset of field: rte_ipv4_hdr::total_length"]
+        [::core::mem::offset_of!(rte_ipv4_hdr, total_length) - 2usize];
+    ["Offset of field: rte_ipv4_hdr::packet_id"]
+        [::core::mem::offset_of!(rte_ipv4_hdr, packet_id) - 4usize];
+    ["Offset of field: rte_ipv4_hdr::fragment_offset"]
+        [::core::mem::offset_of!(rte_ipv4_hdr, fragment_offset) - 6usize];
+    ["Offset of field: rte_ipv4_hdr::time_to_live"]
+        [::core::mem::offset_of!(rte_ipv4_hdr, time_to_live) - 8usize];
+    ["Offset of field: rte_ipv4_hdr::next_proto_id"]
+        [::core::mem::offset_of!(rte_ipv4_hdr, next_proto_id) - 9usize];
+    ["Offset of field: rte_ipv4_hdr::hdr_checksum"]
+        [::core::mem::offset_of!(rte_ipv4_hdr, hdr_checksum) - 10usize];
+    ["Offset of field: rte_ipv4_hdr::src_addr"]
+        [::core::mem::offset_of!(rte_ipv4_hdr, src_addr) - 12usize];
+    ["Offset of field: rte_ipv4_hdr::dst_addr"]
+        [::core::mem::offset_of!(rte_ipv4_hdr, dst_addr) - 16usize];
+};
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct rte_ipv6_hdr {
+    pub vtc_flow: rte_be32_t,
+    pub payload_len: rte_be16_t,
+    pub proto: u8,
+    pub hop_limits: u8,
+    pub src_addr: [u8; 16usize],
+    pub dst_addr: [u8; 16usize],
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_ipv6_hdr"][::core::mem::size_of::<rte_ipv6_hdr>() - 40usize];
+    ["Alignment of rte_ipv6_hdr"][::core::mem::align_of::<rte_ipv6_hdr>() - 1usize];
+    ["Offset of field: rte_ipv6_hdr::vtc_flow"]
+        [::core::mem::offset_of!(rte_ipv6_hdr, vtc_flow) - 0usize];
+    ["Offset of field: rte_ipv6_hdr::payload_len"]
+        [::core::mem::offset_of!(rte_ipv6_hdr, payload_len) - 4usize];
+    ["Offset of field: rte_ipv6_hdr::proto"][::core::mem::offset_of!(rte_ipv6_hdr, proto) - 6usize];
+    ["Offset of field: rte_ipv6_hdr::hop_limits"]
+        [::core::mem::offset_of!(rte_ipv6_hdr, hop_limits) - 7usize];
+    ["Offset of field: rte_ipv6_hdr::src_addr"]
+        [::core::mem::offset_of!(rte_ipv6_hdr, src_addr) - 8usize];
+    ["Offset of field: rte_ipv6_hdr::dst_addr"]
+        [::core::mem::offset_of!(rte_ipv6_hdr, dst_addr) - 24usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rte_flow_attr {
+    pub group: u32,
+    pub priority: u32,
+    pub _bitfield_align_1: [u32; 0],
+    pub _bitfield_1: __BindgenBitfieldUnit<[u8; 4usize]>,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_flow_attr"][::core::mem::size_of::<rte_flow_attr>() - 12usize];
+    ["Alignment of rte_flow_attr"][::core::mem::align_of::<rte_flow_attr>() - 4usize];
+    ["Offset of field: rte_flow_attr::group"]
+        [::core::mem::offset_of!(rte_flow_attr, group) - 0usize];
+    ["Offset of field: rte_flow_attr::priority"]
+        [::core::mem::offset_of!(rte_flow_attr, priority) - 4usize];
+};
+impl rte_flow_attr {
+    #[inline]
+    pub fn ingress(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(0usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_ingress(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(0usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn ingress_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                0usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_ingress_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                0usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn egress(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(1usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_egress(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(1usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn egress_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                1usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_egress_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                1usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn transfer(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(2usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_transfer(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(2usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn transfer_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                2usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_transfer_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                2usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn reserved(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(3usize, 29u8) as u32) }
+    }
+    #[inline]
+    pub fn set_reserved(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(3usize, 29u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn reserved_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                3usize,
+                29u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_reserved_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                3usize,
+                29u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn new_bitfield_1(
+        ingress: u32,
+        egress: u32,
+        transfer: u32,
+        reserved: u32,
+    ) -> __BindgenBitfieldUnit<[u8; 4usize]> {
+        let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 4usize]> = Default::default();
+        __bindgen_bitfield_unit.set(0usize, 1u8, {
+            let ingress: u32 = unsafe { ::core::mem::transmute(ingress) };
+            ingress as u64
+        });
+        __bindgen_bitfield_unit.set(1usize, 1u8, {
+            let egress: u32 = unsafe { ::core::mem::transmute(egress) };
+            egress as u64
+        });
+        __bindgen_bitfield_unit.set(2usize, 1u8, {
+            let transfer: u32 = unsafe { ::core::mem::transmute(transfer) };
+            transfer as u64
+        });
+        __bindgen_bitfield_unit.set(3usize, 29u8, {
+            let reserved: u32 = unsafe { ::core::mem::transmute(reserved) };
+            reserved as u64
+        });
+        __bindgen_bitfield_unit
+    }
+}
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_END: rte_flow_item_type = 0;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_VOID: rte_flow_item_type = 1;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_INVERT: rte_flow_item_type = 2;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ANY: rte_flow_item_type = 3;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_PORT_ID: rte_flow_item_type = 4;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_RAW: rte_flow_item_type = 5;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ETH: rte_flow_item_type = 6;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_VLAN: rte_flow_item_type = 7;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_IPV4: rte_flow_item_type = 8;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_IPV6: rte_flow_item_type = 9;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ICMP: rte_flow_item_type = 10;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_UDP: rte_flow_item_type = 11;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_TCP: rte_flow_item_type = 12;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_SCTP: rte_flow_item_type = 13;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_VXLAN: rte_flow_item_type = 14;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_E_TAG: rte_flow_item_type = 15;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_NVGRE: rte_flow_item_type = 16;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_MPLS: rte_flow_item_type = 17;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_GRE: rte_flow_item_type = 18;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_FUZZY: rte_flow_item_type = 19;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_GTP: rte_flow_item_type = 20;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_GTPC: rte_flow_item_type = 21;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_GTPU: rte_flow_item_type = 22;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ESP: rte_flow_item_type = 23;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_GENEVE: rte_flow_item_type = 24;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_VXLAN_GPE: rte_flow_item_type = 25;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ARP_ETH_IPV4: rte_flow_item_type = 26;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_IPV6_EXT: rte_flow_item_type = 27;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ICMP6: rte_flow_item_type = 28;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ICMP6_ND_NS: rte_flow_item_type = 29;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ICMP6_ND_NA: rte_flow_item_type = 30;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ICMP6_ND_OPT: rte_flow_item_type = 31;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ICMP6_ND_OPT_SLA_ETH: rte_flow_item_type = 32;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ICMP6_ND_OPT_TLA_ETH: rte_flow_item_type = 33;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_MARK: rte_flow_item_type = 34;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_META: rte_flow_item_type = 35;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_GRE_KEY: rte_flow_item_type = 36;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_GTP_PSC: rte_flow_item_type = 37;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_PPPOES: rte_flow_item_type = 38;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_PPPOED: rte_flow_item_type = 39;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_PPPOE_PROTO_ID: rte_flow_item_type = 40;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_NSH: rte_flow_item_type = 41;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_IGMP: rte_flow_item_type = 42;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_AH: rte_flow_item_type = 43;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_HIGIG2: rte_flow_item_type = 44;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_TAG: rte_flow_item_type = 45;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_L2TPV3OIP: rte_flow_item_type = 46;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_PFCP: rte_flow_item_type = 47;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ECPRI: rte_flow_item_type = 48;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_IPV6_FRAG_EXT: rte_flow_item_type = 49;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_GENEVE_OPT: rte_flow_item_type = 50;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_INTEGRITY: rte_flow_item_type = 51;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_CONNTRACK: rte_flow_item_type = 52;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_PORT_REPRESENTOR: rte_flow_item_type = 53;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_REPRESENTED_PORT: rte_flow_item_type = 54;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_FLEX: rte_flow_item_type = 55;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_L2TPV2: rte_flow_item_type = 56;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_PPP: rte_flow_item_type = 57;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_GRE_OPTION: rte_flow_item_type = 58;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_MACSEC: rte_flow_item_type = 59;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_METER_COLOR: rte_flow_item_type = 60;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_IPV6_ROUTING_EXT: rte_flow_item_type = 61;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ICMP6_ECHO_REQUEST: rte_flow_item_type = 62;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_ICMP6_ECHO_REPLY: rte_flow_item_type = 63;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_QUOTA: rte_flow_item_type = 64;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_AGGR_AFFINITY: rte_flow_item_type = 65;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_TX_QUEUE: rte_flow_item_type = 66;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_IB_BTH: rte_flow_item_type = 67;
+pub const rte_flow_item_type_RTE_FLOW_ITEM_TYPE_PTYPE: rte_flow_item_type = 68;
+pub type rte_flow_item_type = ::core::ffi::c_uint;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct rte_flow_item_eth {
+    pub __bindgen_anon_1: rte_flow_item_eth__bindgen_ty_1,
+    pub _bitfield_align_1: [u32; 0],
+    pub _bitfield_1: __BindgenBitfieldUnit<[u8; 4usize]>,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union rte_flow_item_eth__bindgen_ty_1 {
+    pub __bindgen_anon_1: rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1,
+    pub hdr: rte_ether_hdr,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1 {
+    pub dst: rte_ether_addr,
+    pub src: rte_ether_addr,
+    pub type_: rte_be16_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1"]
+        [::core::mem::size_of::<rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1>() - 14usize];
+    ["Alignment of rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1"]
+        [::core::mem::align_of::<rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1>() - 2usize];
+    ["Offset of field: rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1::dst"]
+        [::core::mem::offset_of!(rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1, dst) - 0usize];
+    ["Offset of field: rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1::src"]
+        [::core::mem::offset_of!(rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1, src) - 6usize];
+    ["Offset of field: rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1::type_"]
+        [::core::mem::offset_of!(rte_flow_item_eth__bindgen_ty_1__bindgen_ty_1, type_) - 12usize];
+};
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_flow_item_eth__bindgen_ty_1"]
+        [::core::mem::size_of::<rte_flow_item_eth__bindgen_ty_1>() - 14usize];
+    ["Alignment of rte_flow_item_eth__bindgen_ty_1"]
+        [::core::mem::align_of::<rte_flow_item_eth__bindgen_ty_1>() - 2usize];
+    ["Offset of field: rte_flow_item_eth__bindgen_ty_1::hdr"]
+        [::core::mem::offset_of!(rte_flow_item_eth__bindgen_ty_1, hdr) - 0usize];
+};
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_flow_item_eth"][::core::mem::size_of::<rte_flow_item_eth>() - 20usize];
+    ["Alignment of rte_flow_item_eth"][::core::mem::align_of::<rte_flow_item_eth>() - 4usize];
+};
+impl rte_flow_item_eth {
+    #[inline]
+    pub fn has_vlan(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(0usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_has_vlan(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(0usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn has_vlan_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                0usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_has_vlan_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                0usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn reserved(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(1usize, 31u8) as u32) }
+    }
+    #[inline]
+    pub fn set_reserved(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(1usize, 31u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn reserved_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                1usize,
+                31u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_reserved_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                1usize,
+                31u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn new_bitfield_1(has_vlan: u32, reserved: u32) -> __BindgenBitfieldUnit<[u8; 4usize]> {
+        let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 4usize]> = Default::default();
+        __bindgen_bitfield_unit.set(0usize, 1u8, {
+            let has_vlan: u32 = unsafe { ::core::mem::transmute(has_vlan) };
+            has_vlan as u64
+        });
+        __bindgen_bitfield_unit.set(1usize, 31u8, {
+            let reserved: u32 = unsafe { ::core::mem::transmute(reserved) };
+            reserved as u64
+        });
+        __bindgen_bitfield_unit
+    }
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct rte_flow_item_ipv4 {
+    pub hdr: rte_ipv4_hdr,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_flow_item_ipv4"][::core::mem::size_of::<rte_flow_item_ipv4>() - 20usize];
+    ["Alignment of rte_flow_item_ipv4"][::core::mem::align_of::<rte_flow_item_ipv4>() - 1usize];
+    ["Offset of field: rte_flow_item_ipv4::hdr"]
+        [::core::mem::offset_of!(rte_flow_item_ipv4, hdr) - 0usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rte_flow_item_ipv6 {
+    pub hdr: rte_ipv6_hdr,
+    pub _bitfield_align_1: [u32; 0],
+    pub _bitfield_1: __BindgenBitfieldUnit<[u8; 4usize]>,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_flow_item_ipv6"][::core::mem::size_of::<rte_flow_item_ipv6>() - 44usize];
+    ["Alignment of rte_flow_item_ipv6"][::core::mem::align_of::<rte_flow_item_ipv6>() - 4usize];
+    ["Offset of field: rte_flow_item_ipv6::hdr"]
+        [::core::mem::offset_of!(rte_flow_item_ipv6, hdr) - 0usize];
+};
+impl rte_flow_item_ipv6 {
+    #[inline]
+    pub fn has_hop_ext(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(0usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_has_hop_ext(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(0usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn has_hop_ext_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                0usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_has_hop_ext_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                0usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn has_route_ext(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(1usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_has_route_ext(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(1usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn has_route_ext_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                1usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_has_route_ext_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                1usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn has_frag_ext(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(2usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_has_frag_ext(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(2usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn has_frag_ext_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                2usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_has_frag_ext_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                2usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn has_auth_ext(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(3usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_has_auth_ext(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(3usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn has_auth_ext_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                3usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_has_auth_ext_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                3usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn has_esp_ext(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(4usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_has_esp_ext(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(4usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn has_esp_ext_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                4usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_has_esp_ext_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                4usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn has_dest_ext(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(5usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_has_dest_ext(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(5usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn has_dest_ext_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                5usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_has_dest_ext_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                5usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn has_mobil_ext(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(6usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_has_mobil_ext(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(6usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn has_mobil_ext_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                6usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_has_mobil_ext_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                6usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn has_hip_ext(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(7usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_has_hip_ext(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(7usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn has_hip_ext_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                7usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_has_hip_ext_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                7usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn has_shim6_ext(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(8usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_has_shim6_ext(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(8usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn has_shim6_ext_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                8usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_has_shim6_ext_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                8usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn reserved(&self) -> u32 {
+        unsafe { ::core::mem::transmute(self._bitfield_1.get(9usize, 23u8) as u32) }
+    }
+    #[inline]
+    pub fn set_reserved(&mut self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            self._bitfield_1.set(9usize, 23u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn reserved_raw(this: *const Self) -> u32 {
+        unsafe {
+            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::core::ptr::addr_of!((*this)._bitfield_1),
+                9usize,
+                23u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_reserved_raw(this: *mut Self, val: u32) {
+        unsafe {
+            let val: u32 = ::core::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
+                9usize,
+                23u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn new_bitfield_1(
+        has_hop_ext: u32,
+        has_route_ext: u32,
+        has_frag_ext: u32,
+        has_auth_ext: u32,
+        has_esp_ext: u32,
+        has_dest_ext: u32,
+        has_mobil_ext: u32,
+        has_hip_ext: u32,
+        has_shim6_ext: u32,
+        reserved: u32,
+    ) -> __BindgenBitfieldUnit<[u8; 4usize]> {
+        let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 4usize]> = Default::default();
+        __bindgen_bitfield_unit.set(0usize, 1u8, {
+            let has_hop_ext: u32 = unsafe { ::core::mem::transmute(has_hop_ext) };
+            has_hop_ext as u64
+        });
+        __bindgen_bitfield_unit.set(1usize, 1u8, {
+            let has_route_ext: u32 = unsafe { ::core::mem::transmute(has_route_ext) };
+            has_route_ext as u64
+        });
+        __bindgen_bitfield_unit.set(2usize, 1u8, {
+            let has_frag_ext: u32 = unsafe { ::core::mem::transmute(has_frag_ext) };
+            has_frag_ext as u64
+        });
+        __bindgen_bitfield_unit.set(3usize, 1u8, {
+            let has_auth_ext: u32 = unsafe { ::core::mem::transmute(has_auth_ext) };
+            has_auth_ext as u64
+        });
+        __bindgen_bitfield_unit.set(4usize, 1u8, {
+            let has_esp_ext: u32 = unsafe { ::core::mem::transmute(has_esp_ext) };
+            has_esp_ext as u64
+        });
+        __bindgen_bitfield_unit.set(5usize, 1u8, {
+            let has_dest_ext: u32 = unsafe { ::core::mem::transmute(has_dest_ext) };
+            has_dest_ext as u64
+        });
+        __bindgen_bitfield_unit.set(6usize, 1u8, {
+            let has_mobil_ext: u32 = unsafe { ::core::mem::transmute(has_mobil_ext) };
+            has_mobil_ext as u64
+        });
+        __bindgen_bitfield_unit.set(7usize, 1u8, {
+            let has_hip_ext: u32 = unsafe { ::core::mem::transmute(has_hip_ext) };
+            has_hip_ext as u64
+        });
+        __bindgen_bitfield_unit.set(8usize, 1u8, {
+            let has_shim6_ext: u32 = unsafe { ::core::mem::transmute(has_shim6_ext) };
+            has_shim6_ext as u64
+        });
+        __bindgen_bitfield_unit.set(9usize, 23u8, {
+            let reserved: u32 = unsafe { ::core::mem::transmute(reserved) };
+            reserved as u64
+        });
+        __bindgen_bitfield_unit
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rte_flow_item {
+    pub type_: rte_flow_item_type,
+    pub spec: *const ::core::ffi::c_void,
+    pub last: *const ::core::ffi::c_void,
+    pub mask: *const ::core::ffi::c_void,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_flow_item"][::core::mem::size_of::<rte_flow_item>() - 32usize];
+    ["Alignment of rte_flow_item"][::core::mem::align_of::<rte_flow_item>() - 8usize];
+    ["Offset of field: rte_flow_item::type_"]
+        [::core::mem::offset_of!(rte_flow_item, type_) - 0usize];
+    ["Offset of field: rte_flow_item::spec"][::core::mem::offset_of!(rte_flow_item, spec) - 8usize];
+    ["Offset of field: rte_flow_item::last"]
+        [::core::mem::offset_of!(rte_flow_item, last) - 16usize];
+    ["Offset of field: rte_flow_item::mask"]
+        [::core::mem::offset_of!(rte_flow_item, mask) - 24usize];
+};
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_END: rte_flow_action_type = 0;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_VOID: rte_flow_action_type = 1;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_PASSTHRU: rte_flow_action_type = 2;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_JUMP: rte_flow_action_type = 3;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_MARK: rte_flow_action_type = 4;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_FLAG: rte_flow_action_type = 5;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_QUEUE: rte_flow_action_type = 6;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_DROP: rte_flow_action_type = 7;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_COUNT: rte_flow_action_type = 8;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_RSS: rte_flow_action_type = 9;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_PF: rte_flow_action_type = 10;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_VF: rte_flow_action_type = 11;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_PORT_ID: rte_flow_action_type = 12;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_METER: rte_flow_action_type = 13;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SECURITY: rte_flow_action_type = 14;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_OF_DEC_NW_TTL: rte_flow_action_type = 15;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_OF_POP_VLAN: rte_flow_action_type = 16;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_OF_PUSH_VLAN: rte_flow_action_type = 17;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_OF_SET_VLAN_VID: rte_flow_action_type = 18;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_OF_SET_VLAN_PCP: rte_flow_action_type = 19;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_OF_POP_MPLS: rte_flow_action_type = 20;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_OF_PUSH_MPLS: rte_flow_action_type = 21;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_VXLAN_ENCAP: rte_flow_action_type = 22;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_VXLAN_DECAP: rte_flow_action_type = 23;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_NVGRE_ENCAP: rte_flow_action_type = 24;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_NVGRE_DECAP: rte_flow_action_type = 25;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_RAW_ENCAP: rte_flow_action_type = 26;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_RAW_DECAP: rte_flow_action_type = 27;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_IPV4_SRC: rte_flow_action_type = 28;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_IPV4_DST: rte_flow_action_type = 29;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_IPV6_SRC: rte_flow_action_type = 30;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_IPV6_DST: rte_flow_action_type = 31;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_TP_SRC: rte_flow_action_type = 32;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_TP_DST: rte_flow_action_type = 33;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_MAC_SWAP: rte_flow_action_type = 34;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_DEC_TTL: rte_flow_action_type = 35;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_TTL: rte_flow_action_type = 36;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_MAC_SRC: rte_flow_action_type = 37;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_MAC_DST: rte_flow_action_type = 38;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_INC_TCP_SEQ: rte_flow_action_type = 39;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_DEC_TCP_SEQ: rte_flow_action_type = 40;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_INC_TCP_ACK: rte_flow_action_type = 41;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_DEC_TCP_ACK: rte_flow_action_type = 42;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_TAG: rte_flow_action_type = 43;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_META: rte_flow_action_type = 44;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_IPV4_DSCP: rte_flow_action_type = 45;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SET_IPV6_DSCP: rte_flow_action_type = 46;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_AGE: rte_flow_action_type = 47;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SAMPLE: rte_flow_action_type = 48;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SHARED: rte_flow_action_type = 49;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_MODIFY_FIELD: rte_flow_action_type = 50;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_INDIRECT: rte_flow_action_type = 51;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_CONNTRACK: rte_flow_action_type = 52;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_METER_COLOR: rte_flow_action_type = 53;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_PORT_REPRESENTOR: rte_flow_action_type = 54;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_REPRESENTED_PORT: rte_flow_action_type = 55;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_METER_MARK: rte_flow_action_type = 56;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SEND_TO_KERNEL: rte_flow_action_type = 57;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_QUOTA: rte_flow_action_type = 58;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_SKIP_CMAN: rte_flow_action_type = 59;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_IPV6_EXT_PUSH: rte_flow_action_type = 60;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_IPV6_EXT_REMOVE: rte_flow_action_type = 61;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_INDIRECT_LIST: rte_flow_action_type = 62;
+pub const rte_flow_action_type_RTE_FLOW_ACTION_TYPE_PROG: rte_flow_action_type = 63;
+pub type rte_flow_action_type = ::core::ffi::c_uint;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rte_flow_action_queue {
+    pub index: u16,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_flow_action_queue"][::core::mem::size_of::<rte_flow_action_queue>() - 2usize];
+    ["Alignment of rte_flow_action_queue"]
+        [::core::mem::align_of::<rte_flow_action_queue>() - 2usize];
+    ["Offset of field: rte_flow_action_queue::index"]
+        [::core::mem::offset_of!(rte_flow_action_queue, index) - 0usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rte_flow_action {
+    pub type_: rte_flow_action_type,
+    pub conf: *const ::core::ffi::c_void,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_flow_action"][::core::mem::size_of::<rte_flow_action>() - 16usize];
+    ["Alignment of rte_flow_action"][::core::mem::align_of::<rte_flow_action>() - 8usize];
+    ["Offset of field: rte_flow_action::type_"]
+        [::core::mem::offset_of!(rte_flow_action, type_) - 0usize];
+    ["Offset of field: rte_flow_action::conf"]
+        [::core::mem::offset_of!(rte_flow_action, conf) - 8usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rte_flow {
+    _unused: [u8; 0],
+}
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_NONE: rte_flow_error_type = 0;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_UNSPECIFIED: rte_flow_error_type = 1;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_HANDLE: rte_flow_error_type = 2;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ATTR_GROUP: rte_flow_error_type = 3;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ATTR_PRIORITY: rte_flow_error_type = 4;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ATTR_INGRESS: rte_flow_error_type = 5;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ATTR_EGRESS: rte_flow_error_type = 6;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ATTR_TRANSFER: rte_flow_error_type = 7;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ATTR: rte_flow_error_type = 8;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ITEM_NUM: rte_flow_error_type = 9;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ITEM_SPEC: rte_flow_error_type = 10;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ITEM_LAST: rte_flow_error_type = 11;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ITEM_MASK: rte_flow_error_type = 12;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ITEM: rte_flow_error_type = 13;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ACTION_NUM: rte_flow_error_type = 14;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ACTION_CONF: rte_flow_error_type = 15;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_ACTION: rte_flow_error_type = 16;
+pub const rte_flow_error_type_RTE_FLOW_ERROR_TYPE_STATE: rte_flow_error_type = 17;
+pub type rte_flow_error_type = ::core::ffi::c_uint;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rte_flow_error {
+    pub type_: rte_flow_error_type,
+    pub cause: *const ::core::ffi::c_void,
+    pub message: *const ::core::ffi::c_char,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rte_flow_error"][::core::mem::size_of::<rte_flow_error>() - 24usize];
+    ["Alignment of rte_flow_error"][::core::mem::align_of::<rte_flow_error>() - 8usize];
+    ["Offset of field: rte_flow_error::type_"]
+        [::core::mem::offset_of!(rte_flow_error, type_) - 0usize];
+    ["Offset of field: rte_flow_error::cause"]
+        [::core::mem::offset_of!(rte_flow_error, cause) - 8usize];
+    ["Offset of field: rte_flow_error::message"]
+        [::core::mem::offset_of!(rte_flow_error, message) - 16usize];
+};
+unsafe extern "C" {
+    pub fn rte_flow_validate(
+        port_id: u16,
+        attr: *const rte_flow_attr,
+        pattern: *const rte_flow_item,
+        actions: *const rte_flow_action,
+        error: *mut rte_flow_error,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn rte_flow_create(
+        port_id: u16,
+        attr: *const rte_flow_attr,
+        pattern: *const rte_flow_item,
+        actions: *const rte_flow_action,
+        error: *mut rte_flow_error,
+    ) -> *mut rte_flow;
+}
+unsafe extern "C" {
+    pub fn rte_flow_destroy(
+        port_id: u16,
+        flow: *mut rte_flow,
+        error: *mut rte_flow_error,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn rte_flow_flush(port_id: u16, error: *mut rte_flow_error) -> ::core::ffi::c_int;
+}
+#[repr(C)]
 #[repr(align(4))]
 #[derive(Debug, Copy, Clone)]
 pub struct rte_eth_intr_conf {
@@ -2425,4 +3589,26 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn dpdk_wrap_rte_pktmbuf_tailroom(m: *const rte_mbuf) -> u16;
+}
+unsafe extern "C" {
+    pub fn dpdk_wrap_rte_flow_create_queue_rule(
+        port_id: u16,
+        priority: u32,
+        is_ipv4: ::core::ffi::c_int,
+        dst_ip: *const u8,
+        dst_mask: *const u8,
+        queue_id: u16,
+        error: *mut rte_flow_error,
+    ) -> *mut rte_flow;
+}
+unsafe extern "C" {
+    pub fn dpdk_wrap_rte_flow_destroy(
+        port_id: u16,
+        flow: *mut rte_flow,
+        error: *mut rte_flow_error,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn dpdk_wrap_rte_flow_flush(port_id: u16, error: *mut rte_flow_error)
+        -> ::core::ffi::c_int;
 }

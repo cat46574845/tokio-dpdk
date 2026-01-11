@@ -467,7 +467,7 @@ async fn stream_with_interval_poll_tick_no_waking() {
     // We expect the stream to stall because it does not reschedule itself on
     // `Poll::Pending` and neither does [tokio::time::Interval] reschedule the
     // task when returning `Poll::Ready`.
-    assert_eq!(items, vec![]);
+    assert_eq!(items, Vec::<u32>::new());
 }
 
 #[tokio::test(start_paused = true)]

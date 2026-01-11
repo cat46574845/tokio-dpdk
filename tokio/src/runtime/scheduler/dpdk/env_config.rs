@@ -16,26 +16,17 @@
 //!
 //! ```json
 //! {
-//!   "version": 1,
-//!   "generated_at": "2026-01-09T08:00:00Z",
-//!   "platform": "aws-ec2",
+//!   "dpdk_cores": [1, 2, 3, 4],
 //!   "devices": [
 //!     {
 //!       "pci_address": "0000:28:00.0",
 //!       "mac": "02:04:3d:ba:a3:2f",
-//!       "addresses": ["172.31.1.40/20"],
+//!       "addresses": ["172.31.1.40/20", "172.31.1.41/20"],
 //!       "gateway_v4": "172.31.0.1",
 //!       "mtu": 9001,
-//!       "role": "dpdk",
-//!       "core_affinity": 1
+//!       "role": "dpdk"
 //!     }
-//!   ],
-//!   "hugepages": {
-//!     "size_kb": 2048,
-//!     "count": 512,
-//!     "mount": "/mnt/huge"
-//!   },
-//!   "eal_args": ["--iova-mode=pa"]
+//!   ]
 //! }
 //! ```
 
@@ -43,69 +34,74 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use serde::Deserialize;
 use smoltcp::wire::{IpCidr, Ipv4Address, Ipv6Address};
-
-/// Current configuration schema version.
-pub(crate) const ENV_CONFIG_VERSION: u32 = 1;
 
 /// Default configuration file paths (searched in order).
 pub(crate) const DEFAULT_CONFIG_PATHS: &[&str] = &["./config/dpdk-env.json", "/etc/dpdk/env.json"];
 
-#[derive(Debug, Clone)]
+/// DPDK environment configuration.
+///
+/// Contains device and core configuration loaded from env.json.
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DpdkEnvConfig {
-    /// Schema version for forward compatibility.
-    pub version: u32,
-
-    /// Timestamp when this config was generated.
-    pub generated_at: Option<String>,
-
-    /// Platform identifier (e.g., "aws-ec2", "bare-metal").
-    pub platform: String,
-
     /// Configured DPDK devices.
+    #[serde(default)]
     pub devices: Vec<DeviceConfig>,
 
-    /// Additional EAL arguments.
-    pub eal_args: Vec<String>,
+    /// CPU cores available for DPDK workers.
+    #[serde(default)]
+    pub dpdk_cores: Vec<usize>,
 }
 
 /// Configuration for a single DPDK device.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DeviceConfig {
     /// PCI address (e.g., "0000:28:00.0").
+    #[serde(default)]
     pub pci_address: String,
 
     /// MAC address as 6 bytes.
+    #[serde(default, deserialize_with = "deserialize_mac")]
     pub mac: [u8; 6],
 
-    /// IP addresses with prefix length.
+    /// IP addresses with prefix length (as strings, parsed at runtime).
+    #[serde(default, deserialize_with = "deserialize_ip_cidrs")]
     pub addresses: Vec<IpCidr>,
 
     /// IPv4 default gateway.
+    #[serde(default, deserialize_with = "deserialize_ipv4_gateway")]
     pub gateway_v4: Option<Ipv4Address>,
 
     /// IPv6 default gateway.
+    #[serde(default, deserialize_with = "deserialize_ipv6_gateway")]
     pub gateway_v6: Option<Ipv6Address>,
 
     /// MTU (default: 1500, AWS ENA supports 9001).
+    #[serde(default = "default_mtu")]
     pub mtu: u16,
 
     /// Device role: "dpdk" or "kernel".
+    #[serde(default)]
     pub role: DeviceRole,
 
-    /// CPU core affinity for this device's worker.
-    pub core_affinity: Option<usize>,
-
     /// Original interface name (before DPDK binding).
+    #[serde(default)]
     pub original_name: Option<String>,
 }
 
+fn default_mtu() -> u16 {
+    1500
+}
+
 /// Device role - whether bound to DPDK or left to kernel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum DeviceRole {
     /// Bound to DPDK (vfio-pci or igb_uio).
     Dpdk,
     /// Left to kernel driver.
+    #[default]
     Kernel,
 }
 
@@ -147,27 +143,12 @@ impl DpdkEnvConfig {
 
     /// Parse configuration from JSON string.
     pub(crate) fn parse_json(json: &str) -> Result<Self, String> {
-        // Manual JSON parsing to avoid serde dependency
-        // This is a simplified parser for the specific schema
-        parse_env_config_json(json)
-    }
-
-    /// Get devices configured for DPDK.
-    #[allow(dead_code)]
-    pub(crate) fn dpdk_devices(&self) -> impl Iterator<Item = &DeviceConfig> {
-        self.devices.iter().filter(|d| d.role == DeviceRole::Dpdk)
+        serde_json::from_str(json).map_err(|e| format!("Invalid JSON: {}", e))
     }
 
     /// Find device by PCI address.
-    #[allow(dead_code)]
     pub(crate) fn find_by_pci(&self, pci: &str) -> Option<&DeviceConfig> {
         self.devices.iter().find(|d| d.pci_address == pci)
-    }
-
-    /// Find device by MAC address.
-    #[allow(dead_code)]
-    pub(crate) fn find_by_mac(&self, mac: &[u8; 6]) -> Option<&DeviceConfig> {
-        self.devices.iter().find(|d| &d.mac == mac)
     }
 
     /// Find device by original interface name.
@@ -181,11 +162,8 @@ impl DpdkEnvConfig {
 impl Default for DpdkEnvConfig {
     fn default() -> Self {
         Self {
-            version: ENV_CONFIG_VERSION,
-            generated_at: None,
-            platform: "unknown".to_string(),
             devices: Vec::new(),
-            eal_args: Vec::new(),
+            dpdk_cores: Vec::new(),
         }
     }
 }
@@ -200,114 +178,72 @@ impl Default for DeviceConfig {
             gateway_v6: None,
             mtu: 1500,
             role: DeviceRole::Kernel,
-            core_affinity: None,
             original_name: None,
         }
     }
 }
 
 // ============================================================================
-// JSON Parsing (without serde)
+// Custom Deserializers for smoltcp types
 // ============================================================================
 
-/// Parse the environment config JSON manually.
-fn parse_env_config_json(json: &str) -> Result<DpdkEnvConfig, String> {
-    // Very basic JSON parsing - production code should use a proper parser
-    let json = json.trim();
-    if !json.starts_with('{') || !json.ends_with('}') {
-        return Err("Invalid JSON: expected object".to_string());
-    }
-
-    let mut config = DpdkEnvConfig::default();
-
-    // Extract version
-    if let Some(version) = extract_json_number(json, "version") {
-        config.version = version as u32;
-    }
-
-    // Extract platform
-    if let Some(platform) = extract_json_string(json, "platform") {
-        config.platform = platform;
-    }
-
-    // Extract generated_at
-    if let Some(generated_at) = extract_json_string(json, "generated_at") {
-        config.generated_at = Some(generated_at);
-    }
-
-    // Extract devices array
-    if let Some(devices_json) = extract_json_array(json, "devices") {
-        config.devices = parse_devices_array(&devices_json)?;
-    }
-
-    // Extract eal_args
-    if let Some(args_json) = extract_json_array(json, "eal_args") {
-        config.eal_args = parse_string_array(&args_json);
-    }
-
-    Ok(config)
+fn deserialize_mac<'de, D>(deserializer: D) -> Result<[u8; 6], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    parse_mac_string(&s).map_err(serde::de::Error::custom)
 }
 
-fn parse_devices_array(json: &str) -> Result<Vec<DeviceConfig>, String> {
-    let mut devices = Vec::new();
-
-    // Split by },{ pattern (simplified)
-    let objects = split_json_array_objects(json);
-
-    for obj in objects {
-        devices.push(parse_device_config(&obj)?);
+fn deserialize_ip_cidrs<'de, D>(deserializer: D) -> Result<Vec<IpCidr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let strings: Vec<String> = Vec::deserialize(deserializer)?;
+    let mut cidrs = Vec::new();
+    for s in strings {
+        if let Ok(cidr) = s.parse::<IpCidr>() {
+            cidrs.push(cidr);
+        }
+        // Skip invalid addresses silently
     }
-
-    Ok(devices)
+    Ok(cidrs)
 }
 
-fn parse_device_config(json: &str) -> Result<DeviceConfig, String> {
-    let mut device = DeviceConfig::default();
-
-    if let Some(pci) = extract_json_string(json, "pci_address") {
-        device.pci_address = pci;
-    }
-
-    if let Some(mac_str) = extract_json_string(json, "mac") {
-        device.mac = parse_mac_string(&mac_str)?;
-    }
-
-    if let Some(addresses_json) = extract_json_array(json, "addresses") {
-        device.addresses = parse_address_array(&addresses_json)?;
-    }
-
-    if let Some(gw) = extract_json_string(json, "gateway_v4") {
-        if let Ok(addr) = gw.parse::<std::net::Ipv4Addr>() {
-            device.gateway_v4 = Some(Ipv4Address::from_bytes(&addr.octets()));
+fn deserialize_ipv4_gateway<'de, D>(deserializer: D) -> Result<Option<Ipv4Address>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(s) => {
+            if let Ok(addr) = s.parse::<std::net::Ipv4Addr>() {
+                Ok(Some(Ipv4Address::from_bytes(&addr.octets())))
+            } else {
+                Ok(None)
+            }
         }
+        None => Ok(None),
     }
+}
 
-    if let Some(gw) = extract_json_string(json, "gateway_v6") {
-        if let Ok(addr) = gw.parse::<std::net::Ipv6Addr>() {
-            device.gateway_v6 = Some(Ipv6Address::from_bytes(&addr.octets()));
+fn deserialize_ipv6_gateway<'de, D>(deserializer: D) -> Result<Option<Ipv6Address>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(s) => {
+            // Handle malformed gateway like "2406:da18:e99:5d00:0:0:0:0::1"
+            let s_clean = s.replace(":::", "::");
+            if let Ok(addr) = s_clean.parse::<std::net::Ipv6Addr>() {
+                Ok(Some(Ipv6Address::from_bytes(&addr.octets())))
+            } else {
+                Ok(None)
+            }
         }
+        None => Ok(None),
     }
-
-    if let Some(mtu) = extract_json_number(json, "mtu") {
-        device.mtu = mtu as u16;
-    }
-
-    if let Some(role) = extract_json_string(json, "role") {
-        device.role = match role.as_str() {
-            "dpdk" => DeviceRole::Dpdk,
-            _ => DeviceRole::Kernel,
-        };
-    }
-
-    if let Some(core) = extract_json_number(json, "core_affinity") {
-        device.core_affinity = Some(core as usize);
-    }
-
-    if let Some(name) = extract_json_string(json, "original_name") {
-        device.original_name = Some(name);
-    }
-
-    Ok(device)
 }
 
 fn parse_mac_string(mac: &str) -> Result<[u8; 6], String> {
@@ -324,126 +260,6 @@ fn parse_mac_string(mac: &str) -> Result<[u8; 6], String> {
     Ok(result)
 }
 
-fn parse_address_array(json: &str) -> Result<Vec<IpCidr>, String> {
-    let strings = parse_string_array(json);
-    let mut addrs = Vec::new();
-
-    for s in strings {
-        if let Ok(cidr) = s.parse::<IpCidr>() {
-            addrs.push(cidr);
-        }
-    }
-
-    Ok(addrs)
-}
-
-fn parse_string_array(json: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let json = json.trim();
-
-    // Remove brackets
-    let inner = json.trim_start_matches('[').trim_end_matches(']');
-
-    for part in inner.split(',') {
-        let s = part.trim().trim_matches('"');
-        if !s.is_empty() {
-            result.push(s.to_string());
-        }
-    }
-
-    result
-}
-
-// Helper functions for basic JSON extraction
-
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\"", key);
-    let start = json.find(&pattern)?;
-    let after_key = &json[start + pattern.len()..];
-
-    // Find the colon and opening quote
-    let colon_pos = after_key.find(':')?;
-    let after_colon = after_key[colon_pos + 1..].trim_start();
-
-    if !after_colon.starts_with('"') {
-        return None;
-    }
-
-    let value_start = 1;
-    let value_end = after_colon[value_start..].find('"')?;
-
-    Some(after_colon[value_start..value_start + value_end].to_string())
-}
-
-fn extract_json_number(json: &str, key: &str) -> Option<i64> {
-    let pattern = format!("\"{}\"", key);
-    let start = json.find(&pattern)?;
-    let after_key = &json[start + pattern.len()..];
-
-    let colon_pos = after_key.find(':')?;
-    let after_colon = after_key[colon_pos + 1..].trim_start();
-
-    // Read digits
-    let end = after_colon.find(|c: char| !c.is_ascii_digit() && c != '-')?;
-    after_colon[..end].parse().ok()
-}
-
-fn extract_json_array(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\"", key);
-    let start = json.find(&pattern)?;
-    let after_key = &json[start + pattern.len()..];
-
-    let bracket_start = after_key.find('[')?;
-    let remaining = &after_key[bracket_start..];
-
-    // Find matching closing bracket
-    let mut depth = 0;
-    let mut end = 0;
-    for (i, c) in remaining.char_indices() {
-        match c {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = i;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Some(remaining[..=end].to_string())
-}
-
-fn split_json_array_objects(json: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let json = json.trim().trim_start_matches('[').trim_end_matches(']');
-
-    let mut depth = 0;
-    let mut start = 0;
-
-    for (i, c) in json.char_indices() {
-        match c {
-            '{' => {
-                if depth == 0 {
-                    start = i;
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    result.push(json[start..=i].to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,25 +271,9 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_json_string() {
-        let json = r#"{ "platform": "aws-ec2", "version": 1 }"#;
-        assert_eq!(
-            extract_json_string(json, "platform"),
-            Some("aws-ec2".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_json_number() {
-        let json = r#"{ "version": 123, "name": "test" }"#;
-        assert_eq!(extract_json_number(json, "version"), Some(123));
-    }
-
-    #[test]
     fn test_parse_config() {
         let json = r#"{
-            "version": 1,
-            "platform": "aws-ec2",
+            "dpdk_cores": [1, 2, 3],
             "devices": [
                 {
                     "pci_address": "0000:28:00.0",
@@ -481,21 +281,65 @@ mod tests {
                     "addresses": ["172.31.1.40/20"],
                     "gateway_v4": "172.31.0.1",
                     "mtu": 9001,
-                    "role": "dpdk",
-                    "core_affinity": 1
+                    "role": "dpdk"
                 }
-            ],
-            "hugepages": {
-                "size_kb": 2048,
-                "count": 512
-            }
+            ]
         }"#;
 
         let config = DpdkEnvConfig::parse_json(json).unwrap();
-        assert_eq!(config.version, 1);
-        assert_eq!(config.platform, "aws-ec2");
+        assert_eq!(config.dpdk_cores, vec![1, 2, 3]);
         assert_eq!(config.devices.len(), 1);
         assert_eq!(config.devices[0].pci_address, "0000:28:00.0");
         assert_eq!(config.devices[0].mtu, 9001);
+        assert_eq!(config.devices[0].role, DeviceRole::Dpdk);
+        assert_eq!(config.devices[0].mac, [0x02, 0x04, 0x3d, 0xba, 0xa3, 0x2f]);
+    }
+
+    #[test]
+    fn test_parse_config_field_order_independent() {
+        // Test that parsing works regardless of field order in JSON
+        let json = r#"{
+            "devices": [
+                {
+                    "role": "dpdk",
+                    "pci_address": "0000:29:00.0",
+                    "mac": "aa:bb:cc:dd:ee:ff",
+                    "addresses": ["10.0.0.1/24"],
+                    "mtu": 1500
+                }
+            ],
+            "dpdk_cores": [4, 5]
+        }"#;
+
+        let config = DpdkEnvConfig::parse_json(json).unwrap();
+        assert_eq!(config.dpdk_cores, vec![4, 5]);
+        assert_eq!(config.devices[0].pci_address, "0000:29:00.0");
+        assert_eq!(config.devices[0].role, DeviceRole::Dpdk);
+        assert_eq!(config.devices[0].mac, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    }
+
+    #[test]
+    fn test_parse_minimal_config() {
+        let json = r#"{}"#;
+        let config = DpdkEnvConfig::parse_json(json).unwrap();
+        assert!(config.devices.is_empty());
+        assert!(config.dpdk_cores.is_empty());
+    }
+
+    #[test]
+    fn test_parse_config_with_extra_fields() {
+        // Test that extra fields in JSON (like version, platform, eal_args) are ignored
+        let json = r#"{
+            "version": 2,
+            "platform": "aws-ec2",
+            "generated_at": "2026-01-10T00:00:00Z",
+            "dpdk_cores": [1],
+            "devices": [],
+            "eal_args": ["--iova-mode=pa"]
+        }"#;
+
+        let config = DpdkEnvConfig::parse_json(json).unwrap();
+        assert_eq!(config.dpdk_cores, vec![1]);
+        assert!(config.devices.is_empty());
     }
 }

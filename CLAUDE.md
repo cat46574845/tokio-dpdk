@@ -142,9 +142,11 @@ let rt = Builder::new_dpdk()
 ### Using TcpDpdkStream
 
 ```rust
+use tokio::net::TcpDpdkStream;
+
 rt.block_on(async {
-    // Connect
-    let stream = TcpDpdkStream::connect("192.168.1.100:8080").await?;
+    // Connect (uses DPDK userspace networking)
+    let mut stream = TcpDpdkStream::connect("192.168.1.100:8080").await?;
 
     // Read/write
     stream.write_all(b"hello").await?;
@@ -152,6 +154,8 @@ rt.block_on(async {
     let n = stream.read(&mut buf).await?;
 });
 ```
+
+**Note:** `TcpDpdkStream` is separate from `tokio::net::TcpStream`. Using `TcpStream` in a DPDK runtime will still use kernel networking.
 
 ## Dependencies
 

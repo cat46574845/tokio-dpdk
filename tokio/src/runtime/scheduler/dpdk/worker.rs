@@ -243,6 +243,100 @@ pub(super) fn create(
     (handle, launch)
 }
 
+/// Creates DPDK scheduler workers from initialized workers (multi-queue mode).
+///
+/// This variant accepts `InitializedWorker` which contains pre-configured
+/// DpdkDevices with specific queue IDs for multi-queue support.
+pub(super) fn create_from_workers(
+    workers: Vec<super::init::InitializedWorker>,
+    driver_handle: driver::Handle,
+    blocking_spawner: blocking::Spawner,
+    seed_generator: RngSeedGenerator,
+    config: Config,
+) -> (Arc<Handle>, Launch) {
+    let size = workers.len();
+    let mut cores = Vec::with_capacity(size);
+    let mut remotes = Vec::with_capacity(size);
+    let mut worker_metrics = Vec::with_capacity(size);
+    let mut drivers = Vec::with_capacity(size);
+    let mut core_ids = Vec::with_capacity(size);
+
+    // Create DpdkDrivers from initialized workers
+    for worker in workers {
+        let driver = DpdkDriver::new(
+            worker.device,
+            worker.mac,
+            worker.addresses,
+            worker.gateway_v4,
+            worker.gateway_v6,
+        );
+        drivers.push(std::sync::Mutex::new(driver));
+        core_ids.push(worker.core_id);
+    }
+
+    // Create the local queues
+    for &core_id in &core_ids {
+        let run_queue = queue::local();
+        let metrics = WorkerMetrics::from_config(&config);
+        let stats = Stats::new(&metrics);
+
+        cores.push(Box::new(Core {
+            tick: 0,
+            lifo_slot: None,
+            lifo_enabled: !config.disable_lifo_slot,
+            run_queue,
+            is_shutdown: false,
+            global_queue_interval: stats.tuned_global_queue_interval(&config),
+            stats,
+            rand: FastRand::from_seed(config.seed_generator.next_seed()),
+            local_overflow: VecDeque::new(),
+        }));
+
+        remotes.push(Remote {
+            core_id,
+            shutdown: AtomicBool::new(false),
+        });
+        worker_metrics.push(metrics);
+    }
+
+    let (inject, inject_synced) = inject::Shared::new();
+
+    let handle = Arc::new(Handle {
+        task_hooks: TaskHooks::from_config(&config),
+        shared: Shared {
+            remotes: remotes.into_boxed_slice(),
+            inject,
+            owned: OwnedTasks::new(size),
+            synced: Mutex::new(Synced {
+                inject: inject_synced,
+            }),
+            shutdown_cores: Mutex::new(vec![]),
+            config,
+            worker_metrics: worker_metrics.into_boxed_slice(),
+            drivers: drivers.into_boxed_slice(),
+            _counters: Counters,
+        },
+        driver: driver_handle,
+        blocking_spawner,
+        seed_generator,
+        timer_flavor: TimerFlavor::Traditional,
+        is_shutdown: AtomicBool::new(false),
+    });
+
+    let mut launch = Launch(vec![]);
+
+    for (index, (core, &core_id)) in cores.drain(..).zip(core_ids.iter()).enumerate() {
+        launch.0.push(Arc::new(Worker {
+            handle: handle.clone(),
+            index,
+            core_id,
+            core: AtomicCell::new(Some(core)),
+        }));
+    }
+
+    (handle, launch)
+}
+
 impl Launch {
     /// Launch all worker threads.
     pub(crate) fn launch(self) {

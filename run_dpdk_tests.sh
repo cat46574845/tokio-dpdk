@@ -91,7 +91,7 @@ log_header() {
 }
 
 # All DPDK test files in the repository
-DPDK_TEST_FILES=("tcp_dpdk" "tcp_dpdk_real" "rt_common" "time_sleep")
+DPDK_TEST_FILES=("tcp_dpdk" "tcp_dpdk_real" "dpdk_multi_process" "rt_common" "time_sleep")
 
 # Check if a test is in the incompatible list
 is_incompatible_test() {
@@ -120,6 +120,12 @@ get_test_list() {
                 | grep ': test$' \
                 | sed 's/: test$//' \
                 | sed 's/^/tcp_dpdk_real:/'
+            
+            # dpdk_multi_process tests (multi-process/multi-queue tests)
+            cargo test --package tokio --test dpdk_multi_process --features full -- --list 2>/dev/null \
+                | grep ': test$' \
+                | sed 's/: test$//' \
+                | sed 's/^/dpdk_multi_process:/'
             
             # rt_common dpdk_scheduler tests
             cargo test --package tokio --test rt_common --features full -- dpdk_scheduler --list 2>/dev/null \

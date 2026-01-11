@@ -55,26 +55,19 @@ fn detect_dpdk_device() -> String {
     panic!("No DPDK device found. Set DPDK_DEVICE environment variable or configure /etc/dpdk/env.json")
 }
 
-/// Find first DPDK device from JSON config content.
+/// Find first DPDK device (PCI address) from JSON config content using serde_json.
 fn find_dpdk_device_in_json(content: &str) -> Option<String> {
-    let mut in_dpdk_device = false;
+    let json: serde_json::Value = serde_json::from_str(content).ok()?;
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.contains("\"role\"") && line.contains("\"dpdk\"") {
-            in_dpdk_device = true;
-        }
-        if in_dpdk_device && line.contains("\"original_name\"") {
-            if let Some(start) = line.rfind('"') {
-                let before = &line[..start];
-                if let Some(name_start) = before.rfind('"') {
-                    let name = &before[name_start + 1..];
-                    return Some(name.to_string());
+    if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
+        for device in devices {
+            let role = device.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role == "dpdk" {
+                // Prefer PCI address as it's always present
+                if let Some(pci) = device.get("pci_address").and_then(|p| p.as_str()) {
+                    return Some(pci.to_string());
                 }
             }
-        }
-        if line.starts_with('{') && !line.contains("\"devices\"") {
-            in_dpdk_device = false;
         }
     }
 

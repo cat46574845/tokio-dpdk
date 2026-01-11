@@ -112,6 +112,39 @@ sudo ./setup.sh refresh-config
 | `/etc/default/grub` | GRUB 內核參數 |
 | `/etc/systemd/system/dpdk-low-latency.service` | 開機自動配置 |
 
+### env.json 格式
+
+```json
+{
+  "dpdk_cores": [1, 2, 3, 4],
+  "devices": [
+    {
+      "pci_address": "0000:28:00.0",
+      "role": "dpdk",
+      ...
+    }
+  ]
+}
+```
+
+**關鍵字段**：
+
+| 字段 | 說明 |
+|------|------|
+| `dpdk_cores` | **必填** — 可供 DPDK 使用的 CPU 核心列表 |
+| `devices[].role` | `dpdk` 或 `kernel`，標識設備用途 |
+
+**運行時忽略的字段**（用於人類閱讀或腳本內部使用）：
+
+| 字段 | 說明 |
+|------|------|
+| `version` | Schema 版本，腳本生成 |
+| `platform` | 平台標識 |
+| `generated_at` | 生成時間戳 |
+| `eal_args` | 不被運行時讀取，請使用 Builder API 的 `dpdk_eal_args()` |
+
+**注意**：version 2 格式下，配置腳本只標記可用資源（設備和核心），不配置具體的設備-核心對應關係。運行時會根據 `dpdk_devices()` 和 `dpdk_num_workers()` API 自動分配。
+
 ## 內核參數詳解
 
 ### GRUB 參數（需要重啟）

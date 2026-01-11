@@ -69,11 +69,8 @@ DPDK 裝置透過 `/etc/dpdk/env.json` 配置（由 `setup.sh` 自動生成）�
 ```rust
 // 頂層配置
 struct DpdkEnvConfig {
-    version: u32,                    // Schema 版本 (當前為 1)
-    generated_at: Option<String>,    // 生成時間
-    platform: String,                // 平台標識 (e.g., "aws-ec2")
     devices: Vec<DeviceConfig>,      // 裝置列表
-    eal_args: Vec<String>,           // 額外 EAL 參數
+    dpdk_cores: Vec<usize>,          // 可用核心列表（必填）
 }
 
 // 單一裝置配置
@@ -85,33 +82,33 @@ struct DeviceConfig {
     gateway_v6: Option<Ipv6Address>, // IPv6 閘道
     mtu: u16,                        // MTU (AWS ENA 支援 9001)
     role: DeviceRole,                // "dpdk" 或 "kernel"
-    core_affinity: Option<usize>,    // 綁定的 CPU 核心
     original_name: Option<String>,   // 原始介面名稱
 }
 ```
+
+> **注意**：配置文件中的 `version`、`platform`、`generated_at`、`eal_args` 字段會被忽略（用於人類閱讀或未來擴展）。EAL 參數應通過 Builder API 的 `dpdk_eal_args()` 方法指定。
 
 **JSON 範例**（完整範例見 `scripts/dpdk/templates/env.example.json`）：
 
 ```json
 {
-  "version": 1,
-  "platform": "aws-ec2",
+  "dpdk_cores": [1, 2, 3, 4],
   "devices": [
     {
       "pci_address": "0000:28:00.0",
       "mac": "02:04:3d:ba:a3:2f",
-      "addresses": ["172.31.1.40/20", "2406:da18:e99:5d00::10/64"],
+      "addresses": ["172.31.1.40/20", "172.31.1.41/20", "2406:da18:e99:5d00::10/64"],
       "gateway_v4": "172.31.0.1",
       "gateway_v6": "2406:da18:e99:5d00::1",
       "mtu": 9001,
       "role": "dpdk",
-      "core_affinity": 1,
       "original_name": "enp40s0"
     }
-  ],
-  "eal_args": ["--iova-mode=pa"]
+  ]
 }
 ```
+
+> **重要**：`dpdk_cores` 是必填字段，指定 DPDK 運行時可用的 CPU 核心。建議保留 CPU 0 給 kernel。
 
 ---
 
@@ -159,6 +156,14 @@ let rt = Builder::new_dpdk()
     .build()
     .expect("Multi-device DPDK runtime creation failed");
 
+// 多隊列模式 - 單網卡多 worker (版本 2 新功能)
+// 需要設備有多個 IP，每個 worker 分配一個 IP
+let rt = Builder::new_dpdk()
+    .dpdk_devices(&["0000:28:00.0"])
+    .dpdk_num_workers(4)  // 在一張網卡上使用 4 個隊列
+    .enable_all()
+    .build()?;
+
 // 自訂 EAL 參數
 let rt = Builder::new_dpdk()
     .dpdk_device("0000:28:00.0")
@@ -168,13 +173,22 @@ let rt = Builder::new_dpdk()
     .expect("DPDK runtime creation failed");
 ```
 
+### 多進程資源隔離
+
+當多個 DPDK 進程在同一機器上運行時，`tokio-dpdk` 使用檔案鎖機制（`/var/run/dpdk/*.lock`）確保資源互斥：
+
+- **裝置鎖定**：每個進程獲取 NIC PCI 地址的排他鎖
+- **核心鎖定**：從 `dpdk_cores` 列表中自動選取未被鎖定的核心
+- **自動釋放**：進程崩潰時 OS 自動釋放鎖，新進程可立即接管
+
 ### Builder 方法
 
 | 方法 | 說明 |
 |------|------|
 | `new_dpdk()` | 建立新的 DPDK runtime builder |
 | `dpdk_device(&str)` | 指定單一裝置（PCI 位址或原始介面名） |
-| `dpdk_devices(&[&str])` | 指定多個裝置（每個裝置一個 worker） |
+| `dpdk_devices(&[&str])` | 指定多個裝置（每個裝置一個或多個 worker） |
+| `dpdk_num_workers(usize)` | 指定 worker 數量（支援多隊列模式） |
 | `dpdk_eal_arg(&str)` | 添加單個 EAL 參數 |
 | `dpdk_eal_args(&[&str])` | 添加多個 EAL 參數 |
 | `enable_all()` | 啟用所有功能（I/O、time 等） |
@@ -187,6 +201,7 @@ let rt = Builder::new_dpdk()
 |------|------|
 | `DPDK_ENV_CONFIG` | 覆蓋配置文件路徑 |
 | `DPDK_DEVICE` | 測試用：指定預設 PCI 位址 |
+| `DPDK_DEBUG` | 啟用流量規則等調試輸出 |
 
 ---
 
@@ -194,22 +209,46 @@ let rt = Builder::new_dpdk()
 
 ### TCP 網路
 
-DPDK runtime 提供標準 Tokio 網路類型的替代：
+tokio-dpdk 提供兩種獨立的 TCP 實作：
+
+| API | 網路路徑 | 說明 |
+|-----|----------|------|
+| `tokio::net::TcpStream` | 內核網路 | 標準 mio/epoll，適用於一般用途 |
+| `tokio::net::TcpDpdkStream` | DPDK 用戶態 | 繞過內核，超低延遲 |
+
+**重要**：這兩個是**完全獨立的類型**。在 DPDK runtime 中使用 `TcpStream` 仍然會走內核網路。
+
+### 使用 DPDK 網路
 
 ```rust
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpDpdkStream;
 
-// 使用方式與標準 Tokio 相同
-let listener = TcpListener::bind("10.0.0.1:8080").await?;
-let (stream, addr) = listener.accept().await?;
+// 連接到遠程服務器（使用 DPDK 用戶態網路）
+let mut stream = TcpDpdkStream::connect("10.0.0.1:8080").await?;
+
+// 使用 AsyncRead/AsyncWrite trait
+stream.write_all(b"hello").await?;
+let mut buf = [0u8; 1024];
+let n = stream.read(&mut buf).await?;
 ```
 
-**注意：** 使用 DPDK runtime 時，`TcpListener` 和 `TcpStream` 會自動在內部使用 DPDK 實作。
+### 使用內核網路
 
-### DPDK 專用 API
+即使在 DPDK runtime 中，你仍然可以使用標準 `TcpStream` 走內核網路：
 
 ```rust
-use tokio::runtime::dpdk::TcpDpdkStream;
+use tokio::net::TcpStream;
+
+// 這會使用內核網路，不是 DPDK
+let stream = TcpStream::connect("127.0.0.1:8080").await?;
+```
+
+### DPDK Stream 特有方法
+
+```rust
+use tokio::net::TcpDpdkStream;
+
+let stream = TcpDpdkStream::connect("10.0.0.1:8080").await?;
 
 // 取得此 stream 綁定的 CPU 核心 ID
 let core_id = stream.core_id();
@@ -397,4 +436,4 @@ RUST_LOG=tokio::runtime::scheduler::dpdk=debug cargo test ...
 
 ---
 
-*最後更新：2026-01-10*
+*最後更新：2026-01-11*
