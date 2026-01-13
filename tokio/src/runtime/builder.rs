@@ -2007,7 +2007,7 @@ cfg_rt_multi_thread! {
             };
 
             // Initialize DPDK and create scheduler
-            let (mut scheduler, launch) = Dpdk::new(
+            let (mut scheduler, mut launch) = Dpdk::new(
                 dpdk_builder,
                 driver_handle,
                 blocking_spawner,
@@ -2019,9 +2019,12 @@ cfg_rt_multi_thread! {
                 inner: scheduler::Handle::Dpdk(scheduler.handle().clone()),
             };
 
-            // Launch worker threads
+            // Launch worker threads (skip worker 0 which is for main thread)
             let _enter = handle.enter();
-            launch.launch();
+            let worker_handles = launch.launch();
+
+            // Store worker handles for joining during shutdown
+            scheduler.set_worker_handles(worker_handles);
 
             // Create and spawn the I/O thread for standard I/O and timers
             // This thread handles file I/O, signals, and timer processing

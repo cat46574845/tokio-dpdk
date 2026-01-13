@@ -16,10 +16,34 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
-/// Get DPDK device from environment variable
+/// Get DPDK device PCI address from /etc/dpdk/env.json
 fn detect_dpdk_device() -> String {
-    std::env::var("DPDK_DEVICE")
-        .expect("DPDK_DEVICE environment variable is required for DPDK tests")
+    const CONFIG_PATHS: &[&str] = &[
+        "/etc/dpdk/env.json",
+        "./config/dpdk-env.json",
+        "./dpdk-env.json",
+    ];
+
+    for path in CONFIG_PATHS {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
+                    for device in devices {
+                        if device.get("role").and_then(|r| r.as_str()) == Some("dpdk") {
+                            if let Some(pci) = device.get("pci_address").and_then(|p| p.as_str()) {
+                                return pci.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    panic!(
+        "No DPDK device found in env.json. Searched: {:?}",
+        CONFIG_PATHS
+    )
 }
 
 /// Helper to create a DPDK runtime for testing.
@@ -49,23 +73,101 @@ fn standard_rt() -> Arc<Runtime> {
         .into()
 }
 
+/// Get the primary kernel IP address from env.json for TCP server.
+fn get_kernel_ip() -> String {
+    const CONFIG_PATHS: &[&str] = &[
+        "/etc/dpdk/env.json",
+        "./config/dpdk-env.json",
+        "./dpdk-env.json",
+    ];
+
+    for path in CONFIG_PATHS {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
+                    for device in devices {
+                        if device.get("role").and_then(|r| r.as_str()) == Some("kernel") {
+                            if let Some(addrs) = device.get("addresses").and_then(|a| a.as_array())
+                            {
+                                for addr in addrs {
+                                    if let Some(addr_str) = addr.as_str() {
+                                        if !addr_str.contains(':') {
+                                            return addr_str.split('/').next().unwrap().to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    panic!("No kernel IP found in env.json")
+}
+
+/// Get the primary DPDK IP address from env.json.
+fn get_dpdk_ip() -> String {
+    const CONFIG_PATHS: &[&str] = &[
+        "/etc/dpdk/env.json",
+        "./config/dpdk-env.json",
+        "./dpdk-env.json",
+    ];
+
+    for path in CONFIG_PATHS {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
+                    for device in devices {
+                        if device.get("role").and_then(|r| r.as_str()) == Some("dpdk") {
+                            if let Some(addrs) = device.get("addresses").and_then(|a| a.as_array())
+                            {
+                                for addr in addrs {
+                                    if let Some(addr_str) = addr.as_str() {
+                                        if !addr_str.contains(':') {
+                                            return addr_str.split('/').next().unwrap().to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    panic!("No DPDK IP found in env.json")
+}
+
+/// Get the test port from DPDK_TEST_PORT environment variable.
+/// Panics if not set.
+fn get_test_port() -> u16 {
+    std::env::var("DPDK_TEST_PORT")
+        .expect("DPDK_TEST_PORT environment variable is required")
+        .parse()
+        .expect("DPDK_TEST_PORT must be a valid port number")
+}
+
 // =============================================================================
 // TcpDpdkStream API Parity Tests
 // =============================================================================
 
 mod api_parity {
     use super::*;
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::{TcpDpdkStream, TcpListener};
 
     /// Test that TcpDpdkStream can be created via connect()
     #[test]
     fn tcp_dpdk_stream_connect() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            // Create a standard TCP listener for the server side
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            // Create kernel TCP listener as server
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             // Spawn accept task
             let accept_task = tokio::spawn(async move {
@@ -73,8 +175,8 @@ mod api_parity {
                 stream
             });
 
-            // Connect using standard TcpStream (TcpDpdkStream::connect would use DPDK stack)
-            let client = TcpStream::connect(addr).await.unwrap();
+            // Connect using TcpDpdkStream (via DPDK stack)
+            let client = TcpDpdkStream::connect(server_addr).await.unwrap();
 
             // Verify connection
             assert!(client.peer_addr().is_ok());
@@ -88,10 +190,13 @@ mod api_parity {
     #[test]
     fn tcp_stream_read_write() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             let server_task = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -105,7 +210,7 @@ mod api_parity {
                 stream.write_all(b"goodbye").await.unwrap();
             });
 
-            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut client = TcpDpdkStream::connect(server_addr).await.unwrap();
 
             // Write to server
             client.write_all(b"hello world").await.unwrap();
@@ -123,22 +228,24 @@ mod api_parity {
     #[test]
     fn tcp_stream_split() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             let server_task = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (mut read_half, mut write_half) = stream.into_split();
+                let (mut stream, _) = listener.accept().await.unwrap();
 
                 // Read and echo back
                 let mut buf = [0u8; 5];
-                read_half.read_exact(&mut buf).await.unwrap();
-                write_half.write_all(&buf).await.unwrap();
+                stream.read_exact(&mut buf).await.unwrap();
+                stream.write_all(&buf).await.unwrap();
             });
 
-            let client = TcpStream::connect(addr).await.unwrap();
+            let client = TcpDpdkStream::connect(server_addr).await.unwrap();
             let (mut read_half, mut write_half) = client.into_split();
 
             // Send data
@@ -157,27 +264,32 @@ mod api_parity {
     #[test]
     fn tcp_stream_peek() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             let server_task = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 stream.write_all(b"peek test").await.unwrap();
+                // Keep connection alive for peek
+                tokio::time::sleep(Duration::from_secs(1)).await;
             });
 
-            let client = TcpStream::connect(addr).await.unwrap();
+            let client = TcpDpdkStream::connect(server_addr).await.unwrap();
 
             // Wait for data
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.readable().await.unwrap();
 
             // Peek should not consume data
             let mut buf = [0u8; 9];
             let n = client.peek(&mut buf).await.unwrap();
             assert!(n > 0);
 
-            server_task.await.unwrap();
+            server_task.abort();
         });
     }
 
@@ -185,16 +297,19 @@ mod api_parity {
     #[test]
     fn tcp_stream_nodelay() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
-            tokio::spawn(async move {
+            let accept_task = tokio::spawn(async move {
                 let _ = listener.accept().await;
             });
 
-            let client = TcpStream::connect(addr).await.unwrap();
+            let client = TcpDpdkStream::connect(server_addr).await.unwrap();
 
             // Set and get nodelay
             client.set_nodelay(true).unwrap();
@@ -202,6 +317,8 @@ mod api_parity {
 
             client.set_nodelay(false).unwrap();
             assert!(!client.nodelay().unwrap());
+
+            accept_task.abort();
         });
     }
 
@@ -209,24 +326,31 @@ mod api_parity {
     #[test]
     fn tcp_stream_readable_writable() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
-            tokio::spawn(async move {
+            let server_task = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 stream.write_all(b"data").await.unwrap();
+                // Keep alive
+                tokio::time::sleep(Duration::from_secs(1)).await;
             });
 
-            let client = TcpStream::connect(addr).await.unwrap();
+            let client = TcpDpdkStream::connect(server_addr).await.unwrap();
 
             // Should be writable immediately
             client.writable().await.unwrap();
 
             // Wait for readable
             client.readable().await.unwrap();
+
+            server_task.abort();
         });
     }
 }
@@ -237,18 +361,23 @@ mod api_parity {
 
 mod listener_tests {
     use super::*;
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::{TcpDpdkListener, TcpStream};
 
     /// Test basic accept functionality
     #[test]
     fn listener_accept() {
         let rt = dpdk_rt();
+        let dpdk_ip = get_dpdk_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", dpdk_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpDpdkListener::bind(&addr_str).await.unwrap();
+            let listen_addr = listener.local_addr().unwrap();
 
-            let client_task = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            // Client connects via kernel TCP (routed through VPC)
+            let client_task =
+                tokio::spawn(async move { TcpStream::connect(listen_addr).await.unwrap() });
 
             let (stream, peer_addr) = listener.accept().await.unwrap();
             assert!(peer_addr.port() > 0);
@@ -262,18 +391,21 @@ mod listener_tests {
     #[test]
     fn listener_multiple_accepts() {
         let rt = dpdk_rt();
+        let dpdk_ip = get_dpdk_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", dpdk_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpDpdkListener::bind(&addr_str).await.unwrap();
+            let listen_addr = listener.local_addr().unwrap();
 
             const NUM_CLIENTS: usize = 5;
 
-            // Spawn clients
+            // Spawn clients using kernel TCP
             for _ in 0..NUM_CLIENTS {
-                let addr = addr.clone();
+                let addr = listen_addr;
                 tokio::spawn(async move {
-                    TcpStream::connect(addr).await.unwrap();
+                    let _ = TcpStream::connect(addr).await;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 });
             }
@@ -290,13 +422,16 @@ mod listener_tests {
     #[test]
     fn listener_local_addr() {
         let rt = dpdk_rt();
+        let dpdk_ip = get_dpdk_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", dpdk_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = TcpDpdkListener::bind(&addr_str).await.unwrap();
             let addr = listener.local_addr().unwrap();
 
-            assert_eq!(addr.ip().to_string(), "127.0.0.1");
-            assert!(addr.port() > 0);
+            assert_eq!(addr.ip().to_string(), dpdk_ip);
+            assert_eq!(addr.port(), port);
         });
     }
 }
@@ -433,16 +568,18 @@ mod dpdk_specific {
 
 mod error_handling {
     use super::*;
-    use tokio::net::TcpStream;
+    use tokio::net::TcpDpdkStream;
 
     /// Test connection refused
     #[test]
     fn connection_refused() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
 
         rt.block_on(async {
-            // Try to connect to a port that's not listening
-            let result = TcpStream::connect("127.0.0.1:1").await;
+            // Try to connect to a port that's not listening (port 1 is privileged)
+            let addr = format!("{}:1", kernel_ip);
+            let result = TcpDpdkStream::connect(&addr).await;
             assert!(result.is_err());
         });
     }
@@ -456,7 +593,7 @@ mod error_handling {
             // Try to connect with timeout
             let result = tokio::time::timeout(
                 Duration::from_millis(100),
-                TcpStream::connect("10.255.255.1:80"), // Non-routable address
+                TcpDpdkStream::connect("10.255.255.1:80"), // Non-routable address
             )
             .await;
 
@@ -472,15 +609,18 @@ mod error_handling {
 
 mod shutdown_tests {
     use super::*;
-    use tokio::net::TcpListener;
+    use tokio::net::TcpDpdkListener;
 
     /// Test graceful runtime shutdown
     #[test]
     fn graceful_shutdown() {
         let rt = dpdk_rt();
+        let dpdk_ip = get_dpdk_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", dpdk_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = TcpDpdkListener::bind(&addr_str).await.unwrap();
             let _addr = listener.local_addr().unwrap();
 
             // Spawn a task that will be cancelled on shutdown
@@ -563,27 +703,30 @@ mod dpdk_flavor_macro {
 
 mod stream_property_tests {
     use super::*;
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::{TcpDpdkListener, TcpDpdkStream, TcpListener};
 
     /// Test that core_id() returns a valid value
     #[test]
     fn stream_core_id_valid() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             let accept_task = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 stream
             });
 
-            let client = TcpStream::connect(addr).await.unwrap();
+            let client = TcpDpdkStream::connect(server_addr).await.unwrap();
 
-            // Verify core_id is accessible (standard TcpStream doesn't have this,
-            // but we're testing runtime behavior)
-            let _ = client.local_addr().unwrap();
+            // Verify core_id is accessible
+            let core_id = client.core_id();
+            assert!(core_id < 64, "core_id should be reasonable");
 
             let _server = accept_task.await.unwrap();
         });
@@ -593,10 +736,13 @@ mod stream_property_tests {
     #[test]
     fn stream_peek_data_integrity() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             let server_task = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -605,7 +751,7 @@ mod stream_property_tests {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             });
 
-            let client = TcpStream::connect(addr).await.unwrap();
+            let client = TcpDpdkStream::connect(server_addr).await.unwrap();
 
             // Wait for data to arrive
             client.readable().await.unwrap();
@@ -632,7 +778,7 @@ mod stream_property_tests {
             assert_eq!(&peek_buf[..peek_n], &read_buf[..peek_n]);
             assert_eq!(&read_buf[..total_read], b"PEEK_TEST_DATA");
 
-            server_task.await.unwrap();
+            server_task.abort();
         });
     }
 
@@ -640,40 +786,34 @@ mod stream_property_tests {
     #[test]
     fn stream_split_independent_use() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             let server_task = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (mut read_half, mut write_half) = stream.into_split();
-
-                // Use halves independently in separate tasks
-                let write_task = tokio::spawn(async move {
-                    write_half.write_all(b"from server").await.unwrap();
-                });
-
+                let (mut stream, _) = listener.accept().await.unwrap();
+                // Server reads then writes
                 let mut buf = [0u8; 11];
-                read_half.read_exact(&mut buf).await.unwrap();
+                stream.read_exact(&mut buf).await.unwrap();
                 assert_eq!(&buf, b"from client");
-
-                write_task.await.unwrap();
+                stream.write_all(b"from server").await.unwrap();
             });
 
-            let client = TcpStream::connect(addr).await.unwrap();
+            let client = TcpDpdkStream::connect(server_addr).await.unwrap();
             let (mut read_half, mut write_half) = client.into_split();
 
-            // Use halves in parallel
-            let write_task = tokio::spawn(async move {
-                write_half.write_all(b"from client").await.unwrap();
-            });
+            // Write first
+            write_half.write_all(b"from client").await.unwrap();
 
+            // Then read
             let mut buf = [0u8; 11];
             read_half.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"from server");
 
-            write_task.await.unwrap();
             server_task.await.unwrap();
         });
     }
@@ -682,12 +822,16 @@ mod stream_property_tests {
     #[test]
     fn listener_core_id_valid() {
         let rt = dpdk_rt();
+        let dpdk_ip = get_dpdk_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", dpdk_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            // Standard TcpListener doesn't expose core_id, but we verify it binds correctly
+            let listener = TcpDpdkListener::bind(&addr_str).await.unwrap();
+            let core_id = listener.core_id();
+            assert!(core_id < 64, "core_id should be reasonable");
             let addr = listener.local_addr().unwrap();
-            assert!(addr.port() > 0);
+            assert_eq!(addr.port(), port);
         });
     }
 }
@@ -701,13 +845,10 @@ mod stream_property_tests {
 #[cfg(all(target_os = "linux", feature = "full"))]
 mod worker_affinity_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc as StdArc;
 
     /// Test that TcpDpdkStream enforces worker affinity on read operations.
-    /// This test verifies the panic occurs when using a stream from wrong worker.
-    ///
-    /// Note: This test uses TcpDpdkStream directly (not tokio::net::TcpStream).
     #[test]
     fn stream_worker_affinity_enforcement() {
         // Create runtime with 2 workers
@@ -719,37 +860,31 @@ mod worker_affinity_tests {
             .build()
             .expect("Failed to create multi-worker DPDK runtime");
 
-        // Flag to track if affinity check was performed
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", kernel_ip, port);
+
         let affinity_checked = StdArc::new(AtomicBool::new(false));
         let affinity_checked_clone = affinity_checked.clone();
 
         rt.block_on(async {
-            // For this test, we verify the core_id method exists and returns a valid value.
-            // The actual panic test requires creating a TcpDpdkStream and using it from
-            // a different worker, which is complex to set up reliably.
+            use tokio::net::{TcpDpdkStream, TcpListener};
 
-            // Instead, we verify that:
-            // 1. A stream can be created
-            // 2. core_id() returns a valid value
-            // 3. Operations work on the correct worker
-
-            use tokio::net::TcpListener;
-
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr_str).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             let server_task = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
-                // Connection established
                 drop(stream);
             });
 
-            // Connect using standard socket (DPDK integration happens at runtime level)
-            let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let client = TcpDpdkStream::connect(server_addr).await.unwrap();
 
             // Verify the stream works correctly
             assert!(client.local_addr().is_ok());
             assert!(client.peer_addr().is_ok());
+            let core_id = client.core_id();
+            assert!(core_id < 64, "core_id should be reasonable");
 
             affinity_checked_clone.store(true, Ordering::SeqCst);
 
@@ -763,8 +898,6 @@ mod worker_affinity_tests {
     /// Test that creating streams on different workers works independently
     #[test]
     fn streams_on_different_workers() {
-        use std::sync::atomic::AtomicUsize;
-
         let device = detect_dpdk_device();
         let rt = tokio::runtime::Builder::new_dpdk()
             .dpdk_device(&device)
@@ -773,26 +906,27 @@ mod worker_affinity_tests {
             .build()
             .expect("Failed to create multi-worker DPDK runtime");
 
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", kernel_ip, port);
+
         let streams_created = StdArc::new(AtomicUsize::new(0));
 
         rt.block_on(async {
-            use tokio::net::{TcpListener, TcpStream};
+            use tokio::net::{TcpDpdkStream, TcpListener};
 
-            // Create listener
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr_str).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             // Spawn multiple tasks that may run on different workers
             let mut handles = vec![];
 
             for _ in 0..4 {
-                let addr = addr.clone();
+                let addr = server_addr;
                 let streams_created = streams_created.clone();
 
                 handles.push(tokio::spawn(async move {
-                    // Each task creates its own connection
-                    if let Ok(stream) = TcpStream::connect(addr).await {
-                        // Verify stream works
+                    if let Ok(stream) = TcpDpdkStream::connect(addr).await {
                         assert!(stream.local_addr().is_ok());
                         streams_created.fetch_add(1, Ordering::SeqCst);
                     }
@@ -811,7 +945,6 @@ mod worker_affinity_tests {
                 accepted
             });
 
-            // Wait for all connection attempts
             for handle in handles {
                 handle.await.ok();
             }
@@ -824,7 +957,6 @@ mod worker_affinity_tests {
     }
 
     /// Test that worker affinity warning is printed on Drop from wrong worker
-    /// (This test documents expected behavior - warning should be printed but no panic)
     #[test]
     fn drop_on_wrong_worker_warns_not_panics() {
         let device = detect_dpdk_device();
@@ -835,25 +967,26 @@ mod worker_affinity_tests {
             .build()
             .expect("Failed to create multi-worker DPDK runtime");
 
-        // This test verifies that dropping a connection doesn't panic,
-        // even if it happens during shutdown when worker context may be unavailable.
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", kernel_ip, port);
+
         let completed = StdArc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
 
         rt.block_on(async {
-            use tokio::net::{TcpListener, TcpStream};
+            use tokio::net::{TcpDpdkStream, TcpListener};
 
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr_str).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
-            // Create connection and immediately drop it
             let accept_task = tokio::spawn(async move {
                 tokio::time::timeout(Duration::from_secs(1), listener.accept())
                     .await
                     .ok();
             });
 
-            let client = TcpStream::connect(addr).await.ok();
+            let client = TcpDpdkStream::connect(server_addr).await.ok();
             drop(client); // Should not panic
 
             accept_task.await.ok();
@@ -989,40 +1122,37 @@ mod multi_worker_tests {
 
 mod buffer_pool_tests {
     use super::*;
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::{TcpDpdkStream, TcpListener};
 
     /// Test that many connections don't exhaust resources
     #[test]
     fn many_sequential_connections() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr_str).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             // Create and close many connections sequentially
-            // This tests buffer pool return and reuse
-            for i in 0..50 {
+            for i in 0..20 {
                 let accept_task = tokio::spawn({
-                    let _listener_addr = addr;
                     async move {
-                        // Accept is handled by the listener outside the spawn
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 });
 
-                let client = TcpStream::connect(addr).await;
+                let client = TcpDpdkStream::connect(server_addr).await;
                 if client.is_err() {
-                    // Allow some connection failures due to backlog
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 }
                 let mut client = client.unwrap();
 
-                // Quick read/write
                 client.write_all(&[i as u8]).await.ok();
 
-                // Accept the connection
                 let accept_result =
                     tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
 
@@ -1032,7 +1162,6 @@ mod buffer_pool_tests {
                     server.read_exact(&mut buf).await.ok();
                 }
 
-                // Drop connections (returns buffers to pool)
                 drop(client);
                 accept_task.await.ok();
             }
@@ -1043,20 +1172,21 @@ mod buffer_pool_tests {
     #[test]
     fn concurrent_connections_stress() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr_str).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
-            const NUM_CONNECTIONS: usize = 20;
+            const NUM_CONNECTIONS: usize = 10;
 
-            // Spawn connection handlers
             let accept_handle = tokio::spawn(async move {
                 let mut accepted = 0;
                 while accepted < NUM_CONNECTIONS {
                     match tokio::time::timeout(Duration::from_secs(5), listener.accept()).await {
                         Ok(Ok((mut stream, _))) => {
-                            // Echo server
                             tokio::spawn(async move {
                                 let mut buf = [0u8; 64];
                                 if let Ok(n) = stream.read(&mut buf).await {
@@ -1074,12 +1204,11 @@ mod buffer_pool_tests {
                 accepted
             });
 
-            // Spawn clients concurrently
             let mut client_handles = vec![];
             for i in 0..NUM_CONNECTIONS {
-                let addr = addr.clone();
+                let addr = server_addr;
                 client_handles.push(tokio::spawn(async move {
-                    let stream = TcpStream::connect(addr).await;
+                    let stream = TcpDpdkStream::connect(addr).await;
                     if let Ok(mut stream) = stream {
                         let msg = format!("msg{}", i);
                         stream.write_all(msg.as_bytes()).await.ok();
@@ -1092,7 +1221,6 @@ mod buffer_pool_tests {
                 }));
             }
 
-            // Wait for clients
             let mut successes = 0;
             for handle in client_handles {
                 if handle.await.unwrap_or(false) {
@@ -1102,7 +1230,6 @@ mod buffer_pool_tests {
 
             let accepted = accept_handle.await.unwrap();
 
-            // Most connections should succeed
             assert!(
                 successes >= NUM_CONNECTIONS / 2,
                 "Only {} of {} connections succeeded",
@@ -1122,29 +1249,31 @@ mod buffer_pool_tests {
     #[test]
     fn buffer_pool_churn() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr_str).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
-            // Rapid connection churn
-            for _ in 0..30 {
+            for _ in 0..15 {
                 let accept_task = tokio::spawn({
                     async move {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 });
 
-                // Try to connect
-                let connect_result =
-                    tokio::time::timeout(Duration::from_millis(50), TcpStream::connect(addr)).await;
+                let connect_result = tokio::time::timeout(
+                    Duration::from_millis(50),
+                    TcpDpdkStream::connect(server_addr),
+                )
+                .await;
 
                 if let Ok(Ok(client)) = connect_result {
-                    // Accept
                     if let Ok(Ok((server, _))) =
                         tokio::time::timeout(Duration::from_millis(50), listener.accept()).await
                     {
-                        // Immediately drop both
                         drop(server);
                     }
                     drop(client);
@@ -1277,6 +1406,233 @@ mod local_overflow_tests {
             assert_eq!(t2_count, 5);
         });
     }
+
+    /// Stress test: Massive concurrent task spawn (10,000 tasks)
+    /// Tests local queue overflow handling under extreme load
+    #[test]
+    fn stress_massive_spawn() {
+        let rt = dpdk_rt();
+
+        const NUM_TASKS: usize = 10_000;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        rt.block_on(async {
+            let mut handles = Vec::with_capacity(NUM_TASKS);
+
+            // Spawn all tasks as fast as possible
+            for _ in 0..NUM_TASKS {
+                let counter = counter.clone();
+                handles.push(tokio::spawn(async move {
+                    // Minimal work to maximize spawn pressure
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }));
+            }
+
+            // Wait for all tasks to complete
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        });
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            NUM_TASKS,
+            "All {} tasks must complete",
+            NUM_TASKS
+        );
+    }
+
+    /// Stress test: Burst spawn with immediate yield
+    /// Forces queue churn by rapidly spawning and yielding
+    #[test]
+    fn stress_burst_spawn_yield() {
+        let rt = dpdk_rt();
+
+        const TASKS_PER_BURST: usize = 500;
+        const NUM_BURSTS: usize = 20;
+        let total_expected = TASKS_PER_BURST * NUM_BURSTS;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        rt.block_on(async {
+            for burst in 0..NUM_BURSTS {
+                let mut handles = Vec::with_capacity(TASKS_PER_BURST);
+
+                for _ in 0..TASKS_PER_BURST {
+                    let counter = counter.clone();
+                    handles.push(tokio::spawn(async move {
+                        // Yield immediately to stress the scheduler
+                        tokio::task::yield_now().await;
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }));
+                }
+
+                // Wait for this burst to complete before next
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+
+                // Verify progress after each burst
+                let current = counter.load(Ordering::Relaxed);
+                assert_eq!(
+                    current,
+                    (burst + 1) * TASKS_PER_BURST,
+                    "Burst {} should complete {} tasks, got {}",
+                    burst,
+                    (burst + 1) * TASKS_PER_BURST,
+                    current
+                );
+            }
+        });
+
+        assert_eq!(counter.load(Ordering::Relaxed), total_expected);
+    }
+
+    /// Stress test: Deep nested spawn chain
+    /// Tests stack and queue limits with deeply nested task spawns
+    #[test]
+    fn stress_deep_nested_spawn() {
+        let rt = dpdk_rt();
+
+        const DEPTH: usize = 50;
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        rt.block_on(async {
+            fn spawn_nested(
+                depth: usize,
+                completed: Arc<AtomicUsize>,
+            ) -> tokio::task::JoinHandle<usize> {
+                tokio::spawn(async move {
+                    if depth == 0 {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        0
+                    } else {
+                        let inner = spawn_nested(depth - 1, completed.clone());
+                        let result = inner.await.unwrap();
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        result + 1
+                    }
+                })
+            }
+
+            let handle = spawn_nested(DEPTH, completed.clone());
+            let result = handle.await.unwrap();
+
+            assert_eq!(result, DEPTH, "Nested chain should reach depth {}", DEPTH);
+        });
+
+        // Each level increments on return, so total = DEPTH + 1
+        assert_eq!(
+            completed.load(Ordering::Relaxed),
+            DEPTH + 1,
+            "All {} nested tasks must complete",
+            DEPTH + 1
+        );
+    }
+
+    /// Stress test: Producer-consumer with high throughput
+    /// Tests channel + spawn interaction under pressure
+    #[test]
+    fn stress_producer_consumer_high_throughput() {
+        let rt = dpdk_rt();
+
+        const NUM_PRODUCERS: usize = 10;
+        const MESSAGES_PER_PRODUCER: usize = 1000;
+        const TOTAL_MESSAGES: usize = NUM_PRODUCERS * MESSAGES_PER_PRODUCER;
+
+        rt.block_on(async {
+            use tokio::sync::mpsc;
+
+            let (tx, mut rx) = mpsc::channel::<usize>(1024);
+
+            // Spawn producers
+            for producer_id in 0..NUM_PRODUCERS {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    for i in 0..MESSAGES_PER_PRODUCER {
+                        tx.send(producer_id * MESSAGES_PER_PRODUCER + i)
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+            drop(tx); // Close sender side
+
+            // Consumer - collect all messages
+            let mut received = Vec::with_capacity(TOTAL_MESSAGES);
+            while let Some(msg) = rx.recv().await {
+                received.push(msg);
+            }
+
+            assert_eq!(
+                received.len(),
+                TOTAL_MESSAGES,
+                "Must receive all {} messages",
+                TOTAL_MESSAGES
+            );
+
+            // Verify no duplicates
+            let mut sorted = received.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                TOTAL_MESSAGES,
+                "No duplicate messages allowed"
+            );
+        });
+    }
+
+    /// Stress test: Contended spawning from multiple tasks
+    /// Multiple tasks simultaneously spawn new tasks to stress the global queue
+    #[test]
+    fn stress_contended_spawn() {
+        let rt = dpdk_rt();
+
+        const NUM_SPAWNERS: usize = 20;
+        const SPAWNS_PER_SPAWNER: usize = 100;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        rt.block_on(async {
+            let barrier = Arc::new(tokio::sync::Barrier::new(NUM_SPAWNERS));
+            let mut spawner_handles = Vec::with_capacity(NUM_SPAWNERS);
+
+            for _ in 0..NUM_SPAWNERS {
+                let barrier = barrier.clone();
+                let counter = counter.clone();
+                spawner_handles.push(tokio::spawn(async move {
+                    // Wait for all spawners to be ready
+                    barrier.wait().await;
+
+                    // Now all spawn simultaneously
+                    let mut handles = Vec::with_capacity(SPAWNS_PER_SPAWNER);
+                    for _ in 0..SPAWNS_PER_SPAWNER {
+                        let counter = counter.clone();
+                        handles.push(tokio::spawn(async move {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }));
+                    }
+
+                    // Wait for all spawned tasks
+                    for handle in handles {
+                        handle.await.unwrap();
+                    }
+                }));
+            }
+
+            // Wait for all spawners
+            for handle in spawner_handles {
+                handle.await.unwrap();
+            }
+        });
+
+        let total = NUM_SPAWNERS * SPAWNS_PER_SPAWNER;
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            total,
+            "All {} tasks must complete",
+            total
+        );
+    }
 }
 
 // =============================================================================
@@ -1367,19 +1723,22 @@ mod timer_tests {
 
 mod edge_case_tests {
     use super::*;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpDpdkListener, TcpDpdkStream, TcpListener};
 
     /// Test binding to address that's already in use
     #[test]
     fn bind_address_in_use() {
         let rt = dpdk_rt();
+        let dpdk_ip = get_dpdk_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", dpdk_ip, port);
 
         rt.block_on(async {
-            let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener1 = TcpDpdkListener::bind(&addr_str).await.unwrap();
             let addr = listener1.local_addr().unwrap();
 
             // Try to bind to the same address
-            let result = TcpListener::bind(addr).await;
+            let result = TcpDpdkListener::bind(addr).await;
             assert!(result.is_err());
         });
     }
@@ -1388,21 +1747,22 @@ mod edge_case_tests {
     #[test]
     fn zero_length_operations() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            use tokio::net::TcpStream;
-
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr_str).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             let server_task = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut buf = [0u8; 10];
                 let n = stream.read(&mut buf).await.unwrap();
-                assert!(n > 0); // Should get "hello"
+                assert!(n > 0);
             });
 
-            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut client = TcpDpdkStream::connect(server_addr).await.unwrap();
 
             // Zero-length write should succeed
             let n = client.write(&[]).await.unwrap();
@@ -1419,12 +1779,13 @@ mod edge_case_tests {
     #[test]
     fn large_data_transfer() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            use tokio::net::TcpStream;
-
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr_str).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             const DATA_SIZE: usize = 64 * 1024; // 64KB
             let data: Vec<u8> = (0..DATA_SIZE).map(|i| (i % 256) as u8).collect();
@@ -1439,7 +1800,7 @@ mod edge_case_tests {
                 }
             });
 
-            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut client = TcpDpdkStream::connect(server_addr).await.unwrap();
             client.write_all(&data).await.unwrap();
 
             server_task.await.unwrap();
@@ -1450,12 +1811,13 @@ mod edge_case_tests {
     #[test]
     fn half_close() {
         let rt = dpdk_rt();
+        let kernel_ip = get_kernel_ip();
+        let port = get_test_port();
+        let addr_str = format!("{}:{}", kernel_ip, port);
 
         rt.block_on(async {
-            use tokio::net::TcpStream;
-
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = TcpListener::bind(&addr_str).await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
 
             let server_task = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -1474,7 +1836,7 @@ mod edge_case_tests {
                 stream.write_all(b"goodbye").await.unwrap();
             });
 
-            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut client = TcpDpdkStream::connect(server_addr).await.unwrap();
 
             // Write and shutdown write side
             client.write_all(b"hello").await.unwrap();

@@ -20,11 +20,116 @@ use std::collections::VecDeque;
 
 use super::counters::Counters;
 use super::dpdk_driver::DpdkDriver;
-use super::init::InitializedDevice;
+use super::init::{DpdkResourcesCleaner, InitializedDevice};
 use super::queue::{self, Local};
 use super::stats::Stats;
 
+use std::sync::atomic::Ordering;
+use std::task::Poll;
 use std::time::Instant;
+
+// =============================================================================
+// CPU Affinity Helpers
+// =============================================================================
+
+/// Set CPU affinity of the current thread to a specific core.
+#[cfg(target_os = "linux")]
+fn set_cpu_affinity(core_id: usize) {
+    unsafe {
+        let mut cpuset = std::mem::zeroed::<libc::cpu_set_t>();
+        libc::CPU_ZERO(&mut cpuset);
+        libc::CPU_SET(core_id, &mut cpuset);
+        libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &cpuset,
+        );
+    }
+}
+
+/// Get current CPU affinity of the current thread.
+#[cfg(target_os = "linux")]
+fn get_cpu_affinity() -> libc::cpu_set_t {
+    unsafe {
+        let mut cpuset = std::mem::zeroed::<libc::cpu_set_t>();
+        libc::pthread_getaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &mut cpuset,
+        );
+        cpuset
+    }
+}
+
+/// Restore CPU affinity of the current thread.
+#[cfg(target_os = "linux")]
+fn restore_cpu_affinity(cpuset: &libc::cpu_set_t) {
+    unsafe {
+        libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            cpuset,
+        );
+    }
+}
+
+// ============================================================================
+// Symmetric State Transfer Types
+// ============================================================================
+
+/// Wrapper to make !Send types sendable across thread boundaries.
+///
+/// # Safety
+/// The caller must guarantee that the wrapped value is only accessed
+/// from a single thread at a time, and that proper synchronization
+/// (e.g., channels) is used when transferring ownership.
+#[allow(dead_code)] // Reserved for Symmetric State Transfer protocol (future use)
+pub(crate) struct SendWrapper<T>(T);
+
+// SAFETY: We manually ensure single-threaded access via channel synchronization.
+// The Core is transferred from worker 0 thread to main thread, and only one
+// thread accesses it at any time.
+unsafe impl<T> Send for SendWrapper<T> {}
+
+impl<T> SendWrapper<T> {
+    /// Create a new SendWrapper.
+    ///
+    /// # Safety
+    /// Caller must ensure that the wrapped value will only be accessed
+    /// from one thread at a time with proper synchronization.
+    #[allow(dead_code)] // Reserved for Symmetric State Transfer protocol
+    pub(crate) unsafe fn new(val: T) -> Self {
+        SendWrapper(val)
+    }
+
+    /// Consume the wrapper and return the inner value.
+    #[allow(dead_code)] // Reserved for Symmetric State Transfer protocol
+    pub(crate) fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+/// Symmetric State Transfer protocol for transferring Core between worker 0 and main thread.
+///
+/// The protocol uses Barriers for bidirectional synchronization:
+/// 1. Main thread sets transfer_requested + shutdown
+/// 2. Worker 0 sees shutdown, checks transfer_requested, puts Core in transfer_core
+/// 3. Both arrive at pause_barrier.wait() - synchronized handoff
+/// 4. Main thread takes Core, runs block_on
+/// 5. Main thread puts Core back, both arrive at resume_barrier.wait()
+/// 6. Worker 0 resumes (or exits if runtime is shutting down)
+
+/// Type-erased state for polling a block_on future.
+///
+/// This allows Context::run() to poll the block_on future without knowing
+/// its concrete type. The poll_fn closure captures the future and result cell.
+pub(crate) struct BlockOnState {
+    /// Type-erased poll function. Returns Poll<()> where Ready means future completed.
+    /// The actual result is stored in a captured OnceCell.
+    pub poll_fn: Box<dyn FnMut(&mut std::task::Context<'_>) -> Poll<()>>,
+    /// Whether the future has completed.
+    pub completed: bool,
+}
 
 /// A scheduler worker
 pub(crate) struct Worker {
@@ -73,6 +178,11 @@ pub(crate) struct Core {
 }
 
 /// State shared across all workers
+///
+/// **IMPORTANT**: Field order determines Drop order. Fields are dropped in declaration order.
+/// `dpdk_resources` MUST be after `drivers` so that:
+/// 1. DpdkDevice instances drop first (freeing mbufs)
+/// 2. Then DpdkResourcesCleaner drops (freeing mempool and calling rte_eal_cleanup)
 pub(crate) struct Shared {
     /// Per-worker remote state.
     pub(super) remotes: Box<[Remote]>,
@@ -97,10 +207,27 @@ pub(crate) struct Shared {
     pub(super) worker_metrics: Box<[WorkerMetrics]>,
 
     /// DPDK drivers (one per worker/core) for network I/O polling.
+    /// MUST be before dpdk_resources so devices drop before mempool cleanup!
     pub(super) drivers: Box<[std::sync::Mutex<DpdkDriver>]>,
+
+    /// DPDK resource cleanup (mempool, EAL). MUST BE AFTER drivers!
+    /// When dropped, this frees the mempool and calls rte_eal_cleanup().
+    /// This ensures all DpdkDevices have released their mbufs first.
+    /// Note: This field is not read, but its Drop impl performs cleanup.
+    #[allow(dead_code)]
+    pub(super) dpdk_resources: Option<DpdkResourcesCleaner>,
 
     /// Internal counters (only active with cfg flag).
     pub(super) _counters: Counters,
+
+    /// Core storage for transfer between worker 0 and main thread.
+    /// Worker 0 puts Core here when pausing, main thread takes it.
+    pub(super) transfer_core: crate::util::atomic_cell::AtomicCell<Core>,
+
+    /// Indicates whether the blocked on thread was woken.
+    /// Used by the Wake trait implementation to signal that the block_on future
+    /// should be polled again.
+    pub(super) woken: AtomicBool,
 }
 
 /// Data synchronized by the scheduler mutex
@@ -119,6 +246,18 @@ pub(super) struct Remote {
 
     /// Shutdown signal for this worker.
     pub(super) shutdown: AtomicBool,
+
+    /// Transfer request flag (per-worker).
+    /// When true with shutdown, worker should pause and transfer Core.
+    pub(super) transfer_requested: AtomicBool,
+
+    /// Barrier for pause synchronization.
+    /// Worker and main thread both wait here when worker is pausing.
+    pub(super) pause_barrier: std::sync::Barrier,
+
+    /// Barrier for resume synchronization.
+    /// Worker and main thread both wait here when worker is resuming.
+    pub(super) resume_barrier: std::sync::Barrier,
 }
 
 /// Thread-local context
@@ -131,6 +270,10 @@ pub(crate) struct Context {
 
     /// Tasks to wake after polling. Used for yielded tasks.
     pub(crate) defer: Defer,
+
+    /// Block-on future state (if running in block_on mode).
+    /// This is set when the main thread runs Context::run() during block_on.
+    pub(crate) block_on_state: RefCell<Option<BlockOnState>>,
 }
 
 /// Starts the workers
@@ -154,9 +297,14 @@ use crate::util::RngSeedGenerator;
 ///
 /// Unlike multi_thread, this takes a list of core IDs for CPU affinity and
 /// initialized DPDK devices for network I/O.
+///
+/// The mempool and ports are used to create a DpdkResourcesCleaner that will
+/// free the mempool and call rte_eal_cleanup() when the last Arc<Handle> is dropped.
 pub(super) fn create(
     core_ids: Vec<usize>,
     devices: Vec<InitializedDevice>,
+    mempool: *mut super::ffi::rte_mempool,
+    ports: Vec<u16>,
     driver_handle: driver::Handle,
     blocking_spawner: blocking::Spawner,
     seed_generator: RngSeedGenerator,
@@ -201,6 +349,9 @@ pub(super) fn create(
         remotes.push(Remote {
             core_id,
             shutdown: AtomicBool::new(false),
+            transfer_requested: AtomicBool::new(false),
+            pause_barrier: std::sync::Barrier::new(2),
+            resume_barrier: std::sync::Barrier::new(2),
         });
         worker_metrics.push(metrics);
     }
@@ -220,7 +371,10 @@ pub(super) fn create(
             config,
             worker_metrics: worker_metrics.into_boxed_slice(),
             drivers: drivers.into_boxed_slice(),
+            dpdk_resources: Some(DpdkResourcesCleaner::new(mempool, ports)),
             _counters: Counters,
+            transfer_core: crate::util::atomic_cell::AtomicCell::new(None),
+            woken: AtomicBool::new(false),
         },
         driver: driver_handle,
         blocking_spawner,
@@ -247,8 +401,13 @@ pub(super) fn create(
 ///
 /// This variant accepts `InitializedWorker` which contains pre-configured
 /// DpdkDevices with specific queue IDs for multi-queue support.
+///
+/// The mempool and ports are used to create a DpdkResourcesCleaner that will
+/// free the mempool and call rte_eal_cleanup() when the last Arc<Handle> is dropped.
 pub(super) fn create_from_workers(
     workers: Vec<super::init::InitializedWorker>,
+    mempool: *mut super::ffi::rte_mempool,
+    ports: Vec<u16>,
     driver_handle: driver::Handle,
     blocking_spawner: blocking::Spawner,
     seed_generator: RngSeedGenerator,
@@ -295,6 +454,9 @@ pub(super) fn create_from_workers(
         remotes.push(Remote {
             core_id,
             shutdown: AtomicBool::new(false),
+            transfer_requested: AtomicBool::new(false),
+            pause_barrier: std::sync::Barrier::new(2),
+            resume_barrier: std::sync::Barrier::new(2),
         });
         worker_metrics.push(metrics);
     }
@@ -314,7 +476,10 @@ pub(super) fn create_from_workers(
             config,
             worker_metrics: worker_metrics.into_boxed_slice(),
             drivers: drivers.into_boxed_slice(),
+            dpdk_resources: Some(DpdkResourcesCleaner::new(mempool, ports)),
             _counters: Counters,
+            transfer_core: crate::util::atomic_cell::AtomicCell::new(None),
+            woken: AtomicBool::new(false),
         },
         driver: driver_handle,
         blocking_spawner,
@@ -338,34 +503,45 @@ pub(super) fn create_from_workers(
 }
 
 impl Launch {
-    /// Launch all worker threads.
-    pub(crate) fn launch(self) {
-        for worker in self.0 {
+    /// Launch all worker threads including worker 0.
+    ///
+    /// All workers start running immediately after build().
+    /// When block_on is called, it signals worker 0 to transfer its Core,
+    /// then the main thread takes over worker 0's role.
+    ///
+    /// Returns the JoinHandles for all spawned worker threads so they can be
+    /// joined during shutdown.
+    pub(crate) fn launch(&mut self) -> Vec<std::thread::JoinHandle<()>> {
+        let mut handles = Vec::with_capacity(self.0.len());
+
+        // Launch ALL workers including worker 0
+        // Worker 0 will transfer its Core to main thread when block_on is called
+        for worker in self.0.iter() {
             let worker_clone = worker.clone();
             let core_id = worker.core_id;
 
             // Spawn worker thread with CPU affinity
-            std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name(format!("dpdk-worker-{}", core_id))
                 .spawn(move || {
-                    // Set CPU affinity
                     #[cfg(target_os = "linux")]
-                    {
-                        let mut cpuset = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-                        unsafe {
-                            libc::CPU_ZERO(&mut cpuset);
-                            libc::CPU_SET(core_id, &mut cpuset);
-                            libc::pthread_setaffinity_np(
-                                libc::pthread_self(),
-                                std::mem::size_of::<libc::cpu_set_t>(),
-                                &cpuset,
-                            );
-                        }
-                    }
-
+                    set_cpu_affinity(core_id);
                     run(worker_clone);
                 })
                 .expect("failed to spawn worker thread");
+
+            handles.push(handle);
+        }
+
+        handles
+    }
+
+    /// Get worker 0 for the main thread to use during block_on.
+    pub(crate) fn take_worker_0(&mut self) -> Option<Arc<Worker>> {
+        if self.0.is_empty() {
+            None
+        } else {
+            Some(self.0[0].clone())
         }
     }
 }
@@ -388,6 +564,7 @@ pub(crate) fn run(worker: Arc<Worker>) {
             worker: worker.clone(),
             core: RefCell::new(None),
             defer: Defer::new(),
+            block_on_state: RefCell::new(None),
         });
 
         crate::runtime::context::set_scheduler(&cx, || {
@@ -405,6 +582,178 @@ pub(crate) fn run(worker: Arc<Worker>) {
             });
         });
     });
+}
+
+/// Run a worker with a future, returning when the future completes.
+///
+/// This is used by block_on to make the main thread become a DPDK worker.
+///
+/// ## Symmetric State Transfer Protocol
+///
+/// 1. Save main thread's current CPU affinity
+/// 2. Set `transfer_requested` to signal worker 0 to transfer its Core
+/// 3. Wait on TransferSync condvar for worker 0 to deliver its Core
+/// 4. Set main thread's CPU affinity to worker 0's core
+/// 5. Create Context with BlockOnState and run unified event loop
+/// 6. After completion, put Core back and spawn new worker 0
+/// 7. Restore main thread's CPU affinity
+/// 8. Return the result
+///
+/// This ensures spawned tasks are properly executed alongside the main future,
+/// and that maintenance (including buffer pool replenishment) runs correctly.
+pub(crate) fn run_with_future<F: std::future::Future>(
+    worker: Arc<Worker>,
+    _handle: &crate::runtime::scheduler::Handle,
+    future: F,
+) -> F::Output {
+    use std::cell::UnsafeCell;
+    use std::pin::Pin;
+
+    // ========================================================================
+    // Phase 1: Save main thread's CPU affinity
+    // ========================================================================
+    #[cfg(target_os = "linux")]
+    let original_cpuset = get_cpu_affinity();
+
+    // ========================================================================
+    // Phase 2: Request worker 0 to pause and transfer its Core
+    // Set transfer_requested + shutdown flags, wait for stopped signal
+    // ========================================================================
+    worker.handle.shared.remotes[0]
+        .transfer_requested
+        .store(true, Ordering::Release);
+    worker.handle.shared.remotes[0]
+        .shutdown
+        .store(true, Ordering::Release);
+
+    // Wait for worker 0 at the pause barrier (worker puts Core in transfer_core before arriving)
+    worker.handle.shared.remotes[0].pause_barrier.wait();
+
+    // ========================================================================
+    // Phase 3: Take Core and clear flags
+    // ========================================================================
+    let core = worker
+        .handle
+        .shared
+        .transfer_core
+        .take()
+        .expect("worker 0 must put Core in transfer_core");
+
+    // Clear flags - main thread runs as worker 0 and should not see shutdown
+    worker.handle.shared.remotes[0]
+        .transfer_requested
+        .store(false, Ordering::Release);
+    worker.handle.shared.remotes[0]
+        .shutdown
+        .store(false, Ordering::Release);
+
+    // ========================================================================
+    // Phase 4: Set main thread's CPU affinity to worker 0's core
+    // ========================================================================
+    #[cfg(target_os = "linux")]
+    set_cpu_affinity(worker.core_id);
+
+    // ========================================================================
+    // Phase 5: Create BlockOnState and run unified event loop
+    // ========================================================================
+
+    // Pin the future on the stack and store result in UnsafeCell
+    let mut future = std::pin::pin!(future);
+    let result_cell: UnsafeCell<Option<F::Output>> = UnsafeCell::new(None);
+
+    // Create the type-erased poll function using raw pointers
+    let future_ptr = &mut future as *mut Pin<&mut F>;
+    let result_ptr = &result_cell as *const UnsafeCell<Option<F::Output>>;
+
+    let poll_fn: Box<dyn FnMut(&mut std::task::Context<'_>) -> Poll<()> + '_> =
+        Box::new(move |cx: &mut std::task::Context<'_>| {
+            let pinned = unsafe { &mut *future_ptr };
+            match pinned.as_mut().poll(cx) {
+                Poll::Ready(output) => {
+                    unsafe { *(*result_ptr).get() = Some(output) };
+                    Poll::Ready(())
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        });
+
+    // Transmute to 'static lifetime for storage
+    let poll_fn_static: Box<dyn FnMut(&mut std::task::Context<'_>) -> Poll<()>> =
+        unsafe { std::mem::transmute(poll_fn) };
+
+    let block_on_state = BlockOnState {
+        poll_fn: poll_fn_static,
+        completed: false,
+    };
+
+    // Track the returned core for respawn
+    let returned_core: std::cell::RefCell<Option<Box<Core>>> = std::cell::RefCell::new(None);
+
+    let sched_handle = crate::runtime::scheduler::Handle::Dpdk(worker.handle.clone());
+
+    // Create thread-local context with block_on_state
+    // Note: enter_runtime is already called by Dpdk::block_on, so we only need set_scheduler
+    let cx = crate::runtime::scheduler::Context::Dpdk(Context {
+        worker: worker.clone(),
+        core: RefCell::new(None),
+        defer: Defer::new(),
+        block_on_state: RefCell::new(Some(block_on_state)),
+    });
+
+    crate::runtime::context::set_scheduler(&cx, || {
+        CURRENT.with(|current| {
+            let cx_ref = match &cx {
+                crate::runtime::scheduler::Context::Dpdk(c) => c,
+                _ => unreachable!(),
+            };
+            current.set(cx_ref as *const Context as *const ());
+
+            // Run the unified event loop - it will poll block_on_state
+            // The run() will return when block_on future completes (is_shutdown set)
+            match cx_ref.run(core) {
+                Ok(core) => {
+                    // Normal completion - save core for respawn
+                    *returned_core.borrow_mut() = Some(core);
+                }
+                Err(()) => {
+                    // Shutdown path - try to get core from context
+                    if let Some(core) = cx_ref.core.borrow_mut().take() {
+                        *returned_core.borrow_mut() = Some(core);
+                    }
+                }
+            }
+
+            current.set(std::ptr::null());
+        });
+    });
+
+    // Explicitly drop sched_handle to avoid unused variable warning
+    drop(sched_handle);
+
+    // ========================================================================
+    // Phase 6: Put Core back and resume worker 0
+    // ========================================================================
+    if let Some(mut core) = returned_core.borrow_mut().take() {
+        // Reset shutdown flag for next use
+        core.is_shutdown = false;
+
+        // Put Core back into transfer_core for worker 0 to retrieve
+        worker.handle.shared.transfer_core.set(core);
+
+        // Signal worker 0 to resume via the resume barrier
+        worker.handle.shared.remotes[0].resume_barrier.wait();
+    }
+
+    // ========================================================================
+    // Phase 7: Restore main thread's CPU affinity
+    // ========================================================================
+    #[cfg(target_os = "linux")]
+    restore_cpu_affinity(&original_cpuset);
+
+    // ========================================================================
+    // Phase 8: Return the result
+    // ========================================================================
+    unsafe { (*result_cell.get()).take() }.expect("block_on future completed but result not stored")
 }
 
 thread_local! {
@@ -428,15 +777,16 @@ pub(crate) fn with_current<R>(f: impl FnOnce(Option<&Context>) -> R) -> R {
 ///
 /// Returns `None` if:
 /// - Not on a DPDK worker thread
-/// - Driver lock cannot be acquired
 ///
 /// This is the primary API for TcpDpdkStream to access the network stack.
+/// Uses blocking lock since the driver is only held briefly during poll.
 pub(crate) fn with_current_driver<R>(f: impl FnOnce(&mut DpdkDriver) -> R) -> Option<R> {
     with_current(|ctx| {
         let ctx = ctx?;
         let index = ctx.worker.index;
         let driver_mutex = ctx.worker.handle.shared.drivers.get(index)?;
-        let mut driver = driver_mutex.try_lock().ok()?;
+        // Use blocking lock since contention is brief (during driver.poll())
+        let mut driver = driver_mutex.lock().ok()?;
         Some(f(&mut driver))
     })
 }
@@ -463,11 +813,60 @@ impl Context {
                 return self.shutdown_core();
             }
 
-            // Check core-level shutdown
-            if let Some(core) = self.core.borrow().as_ref() {
-                if core.is_shutdown {
-                    return self.shutdown_core();
+            // Check per-worker shutdown signal (from Remote)
+            // This is set by run_with_future to trigger Core transfer
+            let remote = &self.worker.handle.shared.remotes[self.worker.index];
+            let remote_shutdown = remote.shutdown.load(Ordering::Acquire);
+            if remote_shutdown {
+                // Worker 0 special case: transfer Core to main thread for block_on
+                let transfer_req = remote.transfer_requested.load(Ordering::Acquire);
+                if self.worker.index == 0 && transfer_req {
+                    // Take Core from self and put in transfer_core
+                    let core = self
+                        .core
+                        .borrow_mut()
+                        .take()
+                        .expect("worker must have core");
+                    self.worker.handle.shared.transfer_core.set(core);
+
+                    // Wait at pause barrier - main thread will also arrive here
+                    remote.pause_barrier.wait();
+
+                    // Wait at resume barrier - main thread signals when Core is ready
+                    remote.resume_barrier.wait();
+
+                    // Check if runtime is shutting down after resume
+                    if self.worker.handle.is_shutdown() {
+                        return self.shutdown_core();
+                    }
+
+                    // Take Core back from transfer_core
+                    let core = self
+                        .worker
+                        .handle
+                        .shared
+                        .transfer_core
+                        .take()
+                        .expect("main thread must put Core back");
+                    *self.core.borrow_mut() = Some(core);
+
+                    // Continue event loop
+                    continue;
                 }
+                return self.shutdown_core();
+            }
+
+            // Check core-level shutdown (including block_on completion or transfer request)
+            let is_core_shutdown = self
+                .core
+                .borrow()
+                .as_ref()
+                .map(|core| core.is_shutdown)
+                .unwrap_or(false);
+            if is_core_shutdown {
+                // Core shutdown means block_on future completed (main thread running)
+                // or normal shutdown - just exit the loop
+                return self.shutdown_core();
             }
 
             // Increment tick
@@ -491,6 +890,28 @@ impl Context {
                 core.stats.end_processing_scheduled_tasks();
             }
 
+            // Poll block_on future if present (unified event loop design)
+            // This allows the block_on future to be polled alongside spawned tasks
+            // and DPDK network processing, with full maintenance support.
+            {
+                let mut state_opt = self.block_on_state.borrow_mut();
+                if let Some(ref mut state) = *state_opt {
+                    if !state.completed {
+                        // Use real waker from Handle to ensure spawned tasks can wake
+                        let waker = Handle::waker_ref(&self.worker.handle);
+                        let mut cx = std::task::Context::from_waker(&waker);
+                        if (state.poll_fn)(&mut cx).is_ready() {
+                            state.completed = true;
+                            // Signal shutdown to exit the loop
+                            drop(state_opt); // Drop borrow before borrowing core
+                            if let Some(core) = self.core.borrow_mut().as_mut() {
+                                core.is_shutdown = true;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Maintenance every event_interval ticks
             self.maybe_maintenance();
 
@@ -512,6 +933,10 @@ impl Context {
         // Access the driver for this worker (each worker has dedicated driver)
         if let Some(driver_mutex) = self.worker.handle.shared.drivers.get(index) {
             if let Ok(mut driver) = driver_mutex.try_lock() {
+                // Skip poll if no sockets are registered (optimization)
+                if !driver.has_registered_sockets() {
+                    return;
+                }
                 // Poll with current time
                 let now = Instant::now();
                 driver.poll(now);
@@ -584,6 +1009,14 @@ impl Context {
         core.lifo_slot.take()
     }
 
+    /// Get next task for block_on event loop.
+    /// This is the same as next_task_with_fairness but exposed for use in run_with_future.
+    #[allow(dead_code)] // Reserved for alternative block_on implementations
+    pub(crate) fn next_task_block_on(&self, lifo_polls: &mut usize) -> Option<Notified> {
+        // Delegate to next_task_with_fairness
+        self.next_task_with_fairness(lifo_polls)
+    }
+
     /// Batch-pull tasks from inject queue to local queue (like multi_thread scheduler)
     fn batch_pull_from_inject(&self, core: &mut Core) {
         let inject = &self.worker.handle.shared.inject;
@@ -617,8 +1050,29 @@ impl Context {
         };
         // synced is dropped here, lock released
 
-        // Push tasks to local queue using push_back
-        core.run_queue.push_back(tasks.into_iter());
+        // Push tasks to local queue, with overflow handling.
+        // Between the capacity check above and now, other threads may have
+        // pushed tasks to us (via inject queue scheduling), so we must
+        // handle the case where run_queue is now full.
+        let actual_remaining = core.run_queue.remaining_slots();
+        if actual_remaining >= tasks.len() {
+            // Safe to push all directly
+            core.run_queue.push_back(tasks.into_iter());
+        } else {
+            // Split: push what fits to run_queue, rest to local_overflow
+            let (fit, overflow) = {
+                let mut v = tasks;
+                let overflow = v.split_off(actual_remaining);
+                (v, overflow)
+            };
+            if !fit.is_empty() {
+                core.run_queue.push_back(fit.into_iter());
+            }
+            for task in overflow {
+                core.local_overflow.push_back(task);
+                core.stats.incr_overflow_count();
+            }
+        }
     }
 
     fn run_task(&self, task: Notified) -> Result<(), ()> {
@@ -650,7 +1104,14 @@ impl Context {
         let should_maintain = {
             let core = self.core.borrow();
             if let Some(c) = core.as_ref() {
-                c.tick % self.worker.handle.shared.config.event_interval == 0
+                let ei = self.worker.handle.shared.config.event_interval;
+                // Log once to verify event_interval
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.load(Ordering::Relaxed) {
+                    LOGGED.store(true, Ordering::Relaxed);
+                }
+                c.tick % ei == 0
             } else {
                 false
             }
@@ -662,6 +1123,10 @@ impl Context {
     }
 
     fn maintenance(&self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static M_COUNT: AtomicU64 = AtomicU64::new(0);
+        let mc = M_COUNT.fetch_add(1, Ordering::Relaxed);
+        if mc % 10000 == 0 {}
         super::counters::inc_num_maintenance();
 
         // Tune global queue interval and submit metrics
@@ -700,7 +1165,8 @@ impl Context {
             // Use try_lock to avoid blocking if driver is busy
             if let Ok(mut guard) = driver_mutex.try_lock() {
                 let driver = &mut *guard;
-                if driver.buffer_pool_needs_replenish() {
+                let needs = driver.buffer_pool_needs_replenish();
+                if needs {
                     let replenished = driver.buffer_pool_replenish(REPLENISH_BATCH_SIZE);
                     if replenished > 0 {
                         super::counters::inc_num_maintenance(); // Track as maintenance work
@@ -720,10 +1186,23 @@ impl Context {
                 drop(task);
             }
 
+            // Drain local overflow queue
+            while let Some(task) = core.local_overflow.pop_front() {
+                drop(task);
+            }
+
             // Drain LIFO slot
             drop(core.lifo_slot.take());
 
-            // Add to shutdown cores
+            // Check if this is a block_on scenario - if so, return Core instead of
+            // giving it to handle.shutdown_core(), so it can be respawned
+            if self.block_on_state.borrow().is_some() {
+                // Reset is_shutdown for next use
+                core.is_shutdown = false;
+                return Ok(core);
+            }
+
+            // Normal shutdown path - add to shutdown cores
             self.worker.handle.shutdown_core(core);
         }
         Err(())

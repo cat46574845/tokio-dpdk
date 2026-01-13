@@ -138,12 +138,15 @@ fn log_flow_rule_creation(port_id: u16, ip: &IpCidr, queue_id: u16) {
     }
 }
 
-/// Checks if the device supports rte_flow.
+/// Checks if the device supports rte_flow rules.
 ///
-/// Returns true if rte_flow is supported, false otherwise.
-#[allow(dead_code)]
+/// This function attempts to validate a minimal flow rule to determine
+/// if the driver supports rte_flow. Some drivers (e.g., AWS ENA) have
+/// limited or no rte_flow support.
+///
+/// Returns true if rte_flow is likely supported, false otherwise.
 pub(crate) fn check_flow_support(port_id: u16) -> bool {
-    // Get device info to check capabilities
+    // First check if we can get device info
     let mut dev_info: ffi::rte_eth_dev_info = unsafe { std::mem::zeroed() };
     let ret = unsafe { ffi::rte_eth_dev_info_get(port_id, &mut dev_info) };
 
@@ -151,49 +154,66 @@ pub(crate) fn check_flow_support(port_id: u16) -> bool {
         return false;
     }
 
-    // If we can get device info, assume flow support is available
-    // The actual creation will fail gracefully if not supported
-    true
-}
+    // Try to validate a minimal flow rule to test rte_flow support
+    // This is a lightweight check - actual rule creation may still fail
+    // for specific patterns not supported by the driver.
+    //
+    // We create a simple IPv4 destination match rule as a probe.
+    let test_ip: smoltcp::wire::IpCidr = "0.0.0.0/0".parse().unwrap();
+    let builder = FlowPatternBuilder::new(&test_ip);
+    let is_ipv4 = builder.is_ipv4();
+    let dst_addr = builder.dst_addr();
+    let mask = builder.create_mask();
 
-/// Destroys all flow rules for a port.
-///
-/// This should be called during port cleanup.
-#[allow(dead_code)]
-pub(crate) fn destroy_all_flow_rules(port_id: u16) -> io::Result<()> {
     let mut error: ffi::rte_flow_error = unsafe { std::mem::zeroed() };
-    let ret = unsafe { ffi::dpdk_wrap_rte_flow_flush(port_id, &mut error) };
 
+    // Use validate (not create) to test support without side effects
+    let ret = unsafe {
+        ffi::dpdk_wrap_rte_flow_validate_queue_rule(
+            port_id,
+            0, // priority
+            if is_ipv4 { 1 } else { 0 },
+            dst_addr.as_ptr(),
+            mask.as_ptr(),
+            0, // queue_id (doesn't matter for validation)
+            &mut error,
+        )
+    };
+
+    // ret == 0 means validation passed (rte_flow is supported)
+    // ret != 0 means the driver doesn't support this flow pattern
     if ret != 0 {
-        let error_msg = if error.message.is_null() {
-            "Unknown error".to_string()
-        } else {
-            unsafe {
-                std::ffi::CStr::from_ptr(error.message)
-                    .to_string_lossy()
-                    .into_owned()
-            }
-        };
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("rte_flow_flush failed: {}", error_msg),
-        ));
+        // Log the specific error if debug is enabled
+        if std::env::var("DPDK_DEBUG").is_ok() {
+            let error_msg = if error.message.is_null() {
+                "Unknown error".to_string()
+            } else {
+                unsafe {
+                    std::ffi::CStr::from_ptr(error.message)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            };
+            eprintln!(
+                "[DPDK] Port {} does not support rte_flow: {}",
+                port_id, error_msg
+            );
+        }
+        return false;
     }
 
-    Ok(())
+    true
 }
 
 /// Builder for constructing flow rule patterns.
 ///
 /// This is used internally to create the match patterns for rte_flow.
-#[allow(dead_code)]
 pub(crate) struct FlowPatternBuilder {
     is_ipv4: bool,
     dst_addr: [u8; 16],
     prefix_len: u8,
 }
 
-#[allow(dead_code)]
 impl FlowPatternBuilder {
     /// Creates a new pattern builder for the given IP.
     pub(crate) fn new(ip: &IpCidr) -> Self {
@@ -232,6 +252,7 @@ impl FlowPatternBuilder {
     }
 
     /// Returns the prefix length.
+    #[allow(dead_code)] // Used in tests
     pub(crate) fn prefix_len(&self) -> u8 {
         self.prefix_len
     }

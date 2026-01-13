@@ -11,6 +11,7 @@ use smoltcp::iface::SocketHandle;
 
 use crate::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::runtime::scheduler::dpdk::with_current_driver;
+use std::net::Shutdown;
 
 use super::stream::TcpDpdkStream;
 
@@ -176,11 +177,7 @@ impl AsyncWrite for WriteHalf<'_> {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let handle = self.handle();
-        with_current_driver(|driver| {
-            let socket = driver.get_tcp_socket_mut(handle);
-            socket.close();
-        });
+        self.stream.shutdown_std(Shutdown::Write)?;
         Poll::Ready(Ok(()))
     }
 }
@@ -347,11 +344,7 @@ impl AsyncWrite for OwnedWriteHalf {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let handle = self.handle();
-        with_current_driver(|driver| {
-            let socket = driver.get_tcp_socket_mut(handle);
-            socket.close();
-        });
+        self.stream.shutdown_std(Shutdown::Write)?;
         Poll::Ready(Ok(()))
     }
 }

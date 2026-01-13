@@ -259,6 +259,66 @@ if stream.is_connected() {
 }
 ```
 
+### TcpDpdkSocket - 連接前配置
+
+`TcpDpdkSocket` 允許在建立連接前配置 socket 選項：
+
+```rust
+use tokio::net::TcpDpdkSocket;
+use std::net::SocketAddr;
+
+// 創建 socket 並配置選項
+let socket = TcpDpdkSocket::new_v4()?;
+socket.set_nodelay(true)?;
+socket.set_send_buffer_size(128 * 1024)?;
+socket.set_recv_buffer_size(128 * 1024)?;
+
+// 可選：綁定到特定本地地址
+let local_addr: SocketAddr = "172.31.1.40:12345".parse()?;
+socket.bind(local_addr)?;
+
+// 連接
+let stream = socket.connect("10.0.0.1:8080".parse()?).await?;
+
+// 驗證本地地址
+assert_eq!(stream.local_addr()?.port(), 12345);
+```
+
+### TcpDpdkListener - 服務端監聽
+
+```rust
+use tokio::net::TcpDpdkListener;
+
+// 綁定到 DPDK 接口的 IP（必須是 env.json 中配置的 IP）
+let listener = TcpDpdkListener::bind("172.31.1.40:8080").await?;
+
+// 設置 TTL
+listener.set_ttl(64)?;
+
+loop {
+    let (stream, peer_addr) = listener.accept().await?;
+    // 處理連接...
+}
+```
+
+### API 對比表
+
+| 方法 | TcpStream (kernel) | TcpDpdkStream | 說明 |
+|------|-------------------|---------------|------|
+| `connect()` | ✅ | ✅ | 支援 ToSocketAddrs (DNS 解析) |
+| `read()`/`write()` | ✅ | ✅ | AsyncRead/AsyncWrite trait |
+| `readable()`/`writable()` | ✅ | ✅ | 等待就緒狀態 |
+| `try_read()`/`try_write()` | ✅ | ✅ | 非阻塞讀寫 |
+| `peek()` | ✅ | ✅ | 讀取但不消費數據 |
+| `set_nodelay()`/`nodelay()` | ✅ | ✅ | 禁用 Nagle 算法 |
+| `set_ttl()`/`ttl()` | ✅ | ✅ | IP 封包 TTL |
+| `local_addr()`/`peer_addr()` | ✅ | ✅ | 地址查詢 |
+| `split()`/`into_split()` | ✅ | ✅ | 分割讀寫半 |
+| `shutdown()` | ✅ | ✅ | 關閉寫端 |
+| `core_id()` | ❌ | ✅ | **DPDK 專用：worker 核心 ID** |
+| `from_std()`/`into_std()` | ✅ | ❌ | 無用戶態 socket 概念 |
+| `linger()`/`set_linger()` | ✅ | ❌ | smoltcp 不支援 |
+
 ### 阻塞操作
 
 阻塞操作正常運作，但在獨立的（非 DPDK）執行緒上執行：

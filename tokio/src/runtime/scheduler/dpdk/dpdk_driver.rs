@@ -7,7 +7,7 @@
 //! The DpdkDriver is the central component that bridges DPDK packet I/O with
 //! the smoltcp TCP/IP stack, enabling async socket operations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -179,60 +179,60 @@ impl ScheduledIo {
     }
 
     /// Wake waiters based on readiness flags.
+    ///
+    /// Uses clone instead of take to keep waker available for subsequent wakes.
     pub(crate) fn wake(&self, ready: usize) {
-        let mut waiters = self.waiters.lock().unwrap();
+        let waiters = self.waiters.lock().unwrap();
 
         if ready & READABLE != 0 {
-            if let Some(waker) = waiters.reader.take() {
-                waker.wake();
+            if let Some(waker) = &waiters.reader {
+                waker.wake_by_ref();
             }
         }
 
         if ready & WRITABLE != 0 {
-            if let Some(waker) = waiters.writer.take() {
-                waker.wake();
+            if let Some(waker) = &waiters.writer {
+                waker.wake_by_ref();
             }
         }
     }
 
     /// Poll for read readiness.
     ///
-    /// Returns `Poll::Ready(())` if readable, otherwise registers waker.
+    /// ALWAYS registers waker before returning, even if already ready.
+    /// This ensures the driver can wake the task when readiness changes.
     pub(crate) fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
-        let ready = self.readiness.load(Ordering::Acquire);
+        // ALWAYS register waker first - this is critical!
+        // Even if we're already ready, we need the waker for future wakeups
+        // after the caller clears readiness.
+        {
+            let mut waiters = self.waiters.lock().unwrap();
+            waiters.reader = Some(cx.waker().clone());
+        }
 
+        let ready = self.readiness.load(Ordering::Acquire);
         if ready & READABLE != 0 {
             Poll::Ready(())
         } else {
-            let mut waiters = self.waiters.lock().unwrap();
-            // Double-check after acquiring lock
-            let ready = self.readiness.load(Ordering::Acquire);
-            if ready & READABLE != 0 {
-                return Poll::Ready(());
-            }
-            // Register waker
-            waiters.reader = Some(cx.waker().clone());
             Poll::Pending
         }
     }
 
     /// Poll for write readiness.
     ///
-    /// Returns `Poll::Ready(())` if writable, otherwise registers waker.
+    /// ALWAYS registers waker before returning, even if already ready.
+    /// This ensures the driver can wake the task when readiness changes.
     pub(crate) fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
-        let ready = self.readiness.load(Ordering::Acquire);
+        // ALWAYS register waker first - this is critical!
+        {
+            let mut waiters = self.waiters.lock().unwrap();
+            waiters.writer = Some(cx.waker().clone());
+        }
 
+        let ready = self.readiness.load(Ordering::Acquire);
         if ready & WRITABLE != 0 {
             Poll::Ready(())
         } else {
-            let mut waiters = self.waiters.lock().unwrap();
-            // Double-check after acquiring lock
-            let ready = self.readiness.load(Ordering::Acquire);
-            if ready & WRITABLE != 0 {
-                return Poll::Ready(());
-            }
-            // Register waker
-            waiters.writer = Some(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -282,10 +282,13 @@ pub(crate) struct DpdkDriver {
     sockets: SocketSet<'static>,
     /// Start time for timestamp calculation
     start_time: Instant,
-    /// Mapping from socket handle to ScheduledIo for async wakeups
-    registered_sockets: HashMap<SocketHandle, Arc<ScheduledIo>>,
+    /// Mapping from socket handle to (ScheduledIo, is_listen_socket)
+    /// is_listen_socket: true for sockets that were created via listen() (server side)
+    registered_sockets: HashMap<SocketHandle, (Arc<ScheduledIo>, bool)>,
     /// Pre-allocated buffer pool for TCP sockets (zero-allocation at runtime)
     buffer_pool: TcpBufferPool,
+    /// Set of bound ports to track address-in-use (since smoltcp doesn't expose this)
+    bound_ports: HashSet<u16>,
 }
 
 impl DpdkDriver {
@@ -307,6 +310,12 @@ impl DpdkDriver {
         let start_time = Instant::now();
         let now = SmolInstant::from_millis(0);
 
+        // Log the MAC address being configured
+        eprintln!(
+            "[DpdkDriver] Configuring interface with MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        );
+
         // Create smoltcp interface config
         let config = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
 
@@ -316,6 +325,13 @@ impl DpdkDriver {
         // Configure all IP addresses (IPv4 and IPv6)
         // Note: smoltcp limit is configured via SMOLTCP_IFACE_MAX_ADDR_COUNT in .cargo/config.toml
         const MAX_IP_ADDRS: usize = 128;
+        eprintln!(
+            "[DpdkDriver] Configuring {} IP address(es)",
+            addresses.len()
+        );
+        for addr in &addresses {
+            eprintln!("[DpdkDriver]   - {}", addr);
+        }
         iface.update_ip_addrs(|addrs| {
             for (i, addr) in addresses.iter().enumerate() {
                 if i >= MAX_IP_ADDRS {
@@ -334,6 +350,7 @@ impl DpdkDriver {
 
         // Configure IPv4 default gateway
         if let Some(gw) = gateway_v4 {
+            eprintln!("[DpdkDriver] IPv4 gateway: {}", gw);
             iface
                 .routes_mut()
                 .add_default_ipv4_route(gw)
@@ -342,6 +359,7 @@ impl DpdkDriver {
 
         // Configure IPv6 default gateway
         if let Some(gw) = gateway_v6 {
+            eprintln!("[DpdkDriver] IPv6 gateway: {}", gw);
             iface
                 .routes_mut()
                 .add_default_ipv6_route(gw)
@@ -358,6 +376,7 @@ impl DpdkDriver {
             start_time,
             registered_sockets: HashMap::new(),
             buffer_pool: TcpBufferPool::with_defaults(),
+            bound_ports: HashSet::new(),
         }
     }
 
@@ -392,7 +411,7 @@ impl DpdkDriver {
 
     /// Update readiness state for all registered sockets and wake waiters.
     pub(crate) fn dispatch_wakers(&mut self) {
-        for (handle, scheduled_io) in &self.registered_sockets {
+        for (handle, (scheduled_io, is_listen_socket)) in &self.registered_sockets {
             let socket = self.sockets.get::<TcpSocket<'_>>(*handle);
 
             let mut ready = 0;
@@ -405,6 +424,21 @@ impl DpdkDriver {
             // Check if socket can send data
             if socket.can_send() {
                 ready |= WRITABLE;
+            }
+
+            // For LISTEN sockets (server-side), also check if connection is established.
+            // In smoltcp's model, a listen socket directly transitions to Established
+            // when a client connects. We need to wake accept() waiters even if there's
+            // no application data yet (can_recv() is false).
+            //
+            // For CONNECT sockets (client-side), we should NOT set READABLE just
+            // because the socket is Established - that would cause false positives
+            // where readable() returns but try_read() gets WouldBlock.
+            if *is_listen_socket {
+                if socket.is_active() && socket.state() == smoltcp::socket::tcp::State::Established
+                {
+                    ready |= READABLE; // Wake accept() waiters
+                }
             }
 
             // Update readiness and wake waiters
@@ -433,12 +467,25 @@ impl DpdkDriver {
         Some(self.sockets.add(socket))
     }
 
-    /// Register a socket for async readiness tracking.
+    /// Register a connect socket for async readiness tracking.
     ///
     /// Returns the ScheduledIo for this socket.
+    /// Use this for client-side sockets created via connect().
     pub(crate) fn register_socket(&mut self, handle: SocketHandle) -> Arc<ScheduledIo> {
         let scheduled_io = Arc::new(ScheduledIo::new());
-        self.registered_sockets.insert(handle, scheduled_io.clone());
+        self.registered_sockets
+            .insert(handle, (scheduled_io.clone(), false));
+        scheduled_io
+    }
+
+    /// Register a listen socket for async readiness tracking.
+    ///
+    /// Returns the ScheduledIo for this socket.
+    /// Use this for server-side sockets created via listen().
+    pub(crate) fn register_listen_socket(&mut self, handle: SocketHandle) -> Arc<ScheduledIo> {
+        let scheduled_io = Arc::new(ScheduledIo::new());
+        self.registered_sockets
+            .insert(handle, (scheduled_io.clone(), true));
         scheduled_io
     }
 
@@ -491,9 +538,100 @@ impl DpdkDriver {
         self.buffer_pool.needs_replenish()
     }
 
+    /// Get available buffer count.
+    #[allow(dead_code)] // Reserved for monitoring/diagnostics
+    pub(crate) fn buffer_pool_available(&self) -> usize {
+        self.buffer_pool.available()
+    }
+
     /// Replenish the buffer pool.
     /// Returns the number of buffer pairs added.
     pub(crate) fn buffer_pool_replenish(&mut self, count: usize) -> usize {
         self.buffer_pool.replenish(count)
+    }
+
+    /// Check if there are any registered sockets.
+    /// Used to skip polling when no sockets need service.
+    pub(crate) fn has_registered_sockets(&self) -> bool {
+        !self.registered_sockets.is_empty()
+    }
+
+    /// Get the first IPv4 address configured on this interface.
+    ///
+    /// This is used as the source address for outgoing connections.
+    pub(crate) fn get_ipv4_address(&self) -> Option<smoltcp::wire::Ipv4Address> {
+        for cidr in self.iface.ip_addrs() {
+            if let smoltcp::wire::IpAddress::Ipv4(addr) = cidr.address() {
+                // Skip unspecified address
+                if !addr.is_unspecified() {
+                    return Some(addr);
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the first global unicast IPv6 address configured on this interface.
+    ///
+    /// This is used as the source address for outgoing IPv6 connections.
+    /// Link-local addresses (fe80::) are excluded as they're not routable.
+    pub(crate) fn get_ipv6_address(&self) -> Option<smoltcp::wire::Ipv6Address> {
+        for cidr in self.iface.ip_addrs() {
+            if let smoltcp::wire::IpAddress::Ipv6(addr) = cidr.address() {
+                // Skip unspecified and link-local addresses
+                if !addr.is_unspecified() && !addr.is_link_local() {
+                    return Some(addr);
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if a port is already in use.
+    ///
+    /// This uses the internal bound_ports set since smoltcp doesn't reliably expose
+    /// listening port information.
+    pub(crate) fn is_port_in_use(&self, port: u16) -> bool {
+        self.bound_ports.contains(&port)
+    }
+
+    /// Mark a port as bound (in use).
+    /// Should be called when a socket binds to a port.
+    pub(crate) fn bind_port(&mut self, port: u16) {
+        self.bound_ports.insert(port);
+    }
+
+    /// Release a port (mark as no longer in use).
+    /// Should be called when a socket is closed.
+    pub(crate) fn release_port(&mut self, port: u16) {
+        self.bound_ports.remove(&port);
+    }
+
+    /// Allocate an ephemeral port that is not currently in use.
+    ///
+    /// Uses time-based randomization with collision avoidance.
+    /// Returns None if no port is available after max attempts.
+    pub(crate) fn allocate_ephemeral_port(&mut self) -> Option<u16> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Ephemeral port range: 49152-65535 (16384 ports)
+        const EPHEMERAL_START: u16 = 49152;
+        const EPHEMERAL_RANGE: u16 = 16384;
+        const MAX_ATTEMPTS: u16 = 100;
+
+        let base = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u16)
+            .unwrap_or(12345);
+
+        for i in 0..MAX_ATTEMPTS {
+            let port = EPHEMERAL_START + ((base.wrapping_add(i)) % EPHEMERAL_RANGE);
+            if !self.is_port_in_use(port) {
+                self.bind_port(port); // Mark it as used immediately
+                return Some(port);
+            }
+        }
+
+        None
     }
 }

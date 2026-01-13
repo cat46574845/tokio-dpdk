@@ -42,6 +42,14 @@ struct rte_flow *dpdk_wrap_rte_flow_create_queue_rule(
     const uint8_t *dst_mask,
     uint16_t queue_id,
     struct rte_flow_error *error);
+int dpdk_wrap_rte_flow_validate_queue_rule(
+    uint16_t port_id,
+    uint32_t priority,
+    int is_ipv4,
+    const uint8_t *dst_ip,
+    const uint8_t *dst_mask,
+    uint16_t queue_id,
+    struct rte_flow_error *error);
 int dpdk_wrap_rte_flow_destroy(uint16_t port_id, struct rte_flow *flow, struct rte_flow_error *error);
 int dpdk_wrap_rte_flow_flush(uint16_t port_id, struct rte_flow_error *error);
 EOF

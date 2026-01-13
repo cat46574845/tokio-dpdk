@@ -33,22 +33,18 @@ print(','.join(pci))
     fi
 }
 
-# Default device(s) - read from env.json if not provided
-# DPDK_DEVICE is used for single-worker tests
-# DPDK_DEVICES is used for multi-worker tests (comma-separated)
-if [[ -z "${DPDK_DEVICE:-}" ]]; then
-    ALL_DEVICES=$(get_dpdk_devices_from_config)
-    DPDK_DEVICE="${ALL_DEVICES%%,*}"  # First device
-    DPDK_DEVICES="${ALL_DEVICES}"
-else
-    DPDK_DEVICE="${DPDK_DEVICE}"
-    DPDK_DEVICES="${DPDK_DEVICES:-$DPDK_DEVICE}"
-fi
-
-if [[ -z "$DPDK_DEVICE" ]]; then
-    echo "Error: No DPDK devices found. Set DPDK_DEVICE or configure /etc/dpdk/env.json"
+# Tests read device config from env.json directly
+# DPDK_TEST_PORT is required for tests that need kernel<->DPDK communication
+if [[ -z "${DPDK_TEST_PORT:-}" ]]; then
+    echo "Error: DPDK_TEST_PORT environment variable is required"
+    echo "Set it to a port allowed in your AWS security group (e.g., 8192)"
     exit 1
 fi
+
+DPDK_TEST_PORT="${DPDK_TEST_PORT}"
+
+# For display purposes, extract device from env.json
+DPDK_DEVICE=$(get_dpdk_devices_from_config | cut -d, -f1)
 
 # Test results
 PASSED=0
@@ -59,25 +55,9 @@ declare -a FAILED_TESTS
 # =============================================================================
 # DPDK-Incompatible Tests
 # =============================================================================
-# These tests are skipped because they are incompatible with DPDK's architecture:
-#
-# EAL Re-initialization:
-#   - create_rt_in_block_on: nested runtime
-#   - runtime_in_thread_local: multiple runtimes in thread_local
-#   - shutdown_concurrent_spawn: loop creates 5 runtimes
-#   - io_notify_while_shutting_down: loop creates 9 runtimes
-#
-# Park Semantics (DPDK uses busy-polling, no park phase):
-#   - yield_defers_until_park
-#   - coop_yield_defers_until_park
+# All tests should pass. If a test fails, it needs to be fixed, not skipped.
 # =============================================================================
 DPDK_INCOMPATIBLE_TESTS=(
-    "dpdk_scheduler::create_rt_in_block_on"
-    "dpdk_scheduler::runtime_in_thread_local"
-    "dpdk_scheduler::shutdown_concurrent_spawn"
-    "dpdk_scheduler::io_notify_while_shutting_down"
-    "dpdk_scheduler::yield_defers_until_park"
-    "dpdk_scheduler::coop_yield_defers_until_park"
 )
 
 log_header() {
@@ -91,7 +71,7 @@ log_header() {
 }
 
 # All DPDK test files in the repository
-DPDK_TEST_FILES=("tcp_dpdk" "tcp_dpdk_real" "dpdk_multi_process" "rt_common" "time_sleep")
+DPDK_TEST_FILES=("tcp_dpdk" "tcp_dpdk_real" "dpdk_multi_process" "dpdk_worker_isolation" "unified_event_loop_test" "rt_common" "time_sleep")
 
 # Check if a test is in the incompatible list
 is_incompatible_test() {
@@ -127,6 +107,12 @@ get_test_list() {
                 | sed 's/: test$//' \
                 | sed 's/^/dpdk_multi_process:/'
             
+            # dpdk_worker_isolation tests (worker isolation tests)
+            cargo test --package tokio --test dpdk_worker_isolation --features full -- --list 2>/dev/null \
+                | grep ': test$' \
+                | sed 's/: test$//' \
+                | sed 's/^/dpdk_worker_isolation:/'
+            
             # rt_common dpdk_scheduler tests
             cargo test --package tokio --test rt_common --features full -- dpdk_scheduler --list 2>/dev/null \
                 | grep ': test$' \
@@ -138,6 +124,12 @@ get_test_list() {
                 | grep ': test$' \
                 | sed 's/: test$//' \
                 | sed 's/^/time_sleep:/'
+            
+            # unified_event_loop_test tests
+            cargo test --package tokio --test unified_event_loop_test --features full -- --list 2>/dev/null \
+                | grep ': test$' \
+                | sed 's/: test$//' \
+                | sed 's/^/unified_event_loop_test:/'
         } | sort | uniq
     )
     
@@ -162,8 +154,8 @@ run_single_test() {
     
     printf "[%2d/%2d] %-60s " "$test_num" "$total" "$test_name"
     
-    # All tests use DPDK_DEVICE (multi-device tests use worker_threads instead)
-    local env_vars="DPDK_DEVICE=$DPDK_DEVICE"
+    # Tests read config from env.json; only pass DPDK_TEST_PORT for kernel<->DPDK tests
+    local env_vars="DPDK_TEST_PORT=$DPDK_TEST_PORT"
     
     # Run test in separate process, capture output (with 60s timeout)
     local output
@@ -293,11 +285,11 @@ run_specific_test() {
     fi
     
     echo -e "${CYAN}Running test:${NC} $test_name"
-    echo -e "${GRAY}Device:${NC} $DPDK_DEVICE"
     echo -e "${GRAY}Test file:${NC} $test_file"
+    echo -e "${GRAY}Port:${NC} $DPDK_TEST_PORT"
     echo ""
     
-    env DPDK_DEVICE="$DPDK_DEVICE" \
+    env DPDK_TEST_PORT="$DPDK_TEST_PORT" \
         cargo test --package tokio --test "$test_file" --features full \
         -- "$test_name" --exact --nocapture
 }
@@ -342,14 +334,13 @@ show_help() {
     echo "  TEST_NAME       Run specific test only (e.g., dpdk_specific::dpdk_runtime_spawn)"
     echo ""
     echo "Environment:"
-    echo "  DPDK_DEVICE     Device to use for DPDK tests (default: enp40s0)"
+    echo "  DPDK_TEST_PORT   Port for kernel<->DPDK tests (required, e.g., 8192)"
     echo ""
     echo "Examples:"
-    echo "  $0                                    # Run all DPDK tests"
-    echo "  $0 dpdk_specific::dpdk_runtime_spawn  # Run specific DPDK test"
+    echo "  DPDK_TEST_PORT=8192 $0                # Run all DPDK tests"
+    echo "  DPDK_TEST_PORT=8192 $0 dpdk_specific::dpdk_runtime_spawn  # Run specific test"
     echo "  $0 -t                                 # Run original Tokio tests"
     echo "  $0 -a                                 # Run both Tokio and DPDK tests"
-    echo "  DPDK_DEVICE=enp41s0 $0                # Use different device"
     echo ""
 }
 

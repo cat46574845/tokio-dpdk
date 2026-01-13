@@ -60,39 +60,52 @@ pub(crate) struct InitializedWorker {
     pub port_id: u16,
 }
 
-impl DpdkResources {
-    /// Clean up DPDK resources.
-    ///
-    /// This must be called during runtime shutdown to properly release:
-    /// - Ethernet devices (stop and close)
-    /// - Memory pool
-    ///
-    /// # Safety
-    /// After calling cleanup(), no mbufs from this pool should be accessed.
-    pub(crate) fn cleanup(&mut self) {
-        // Stop and close all ethernet devices
-        for device in &self.devices {
-            let port_id = device.device.port_id();
+/// Holds DPDK resources for cleanup when the last Arc<Handle> is dropped.
+///
+/// This struct is stored in `Shared` and is dropped AFTER `drivers` (due to field order),
+/// ensuring all DpdkDevice instances have released their mbufs before mempool is freed.
+///
+/// Drop order in Shared:
+/// 1. drivers (DpdkDriver -> DpdkDevice::drop() frees mbufs)
+/// 2. dpdk_resources (this struct - frees mempool and calls rte_eal_cleanup())
+pub(crate) struct DpdkResourcesCleaner {
+    /// Memory pool pointer to free
+    mempool: *mut ffi::rte_mempool,
+    /// Port IDs to stop and close
+    ports: Vec<u16>,
+}
+
+// Safety: mempool is only accessed during Drop, which happens after all workers have stopped.
+unsafe impl Send for DpdkResourcesCleaner {}
+unsafe impl Sync for DpdkResourcesCleaner {}
+
+impl DpdkResourcesCleaner {
+    /// Creates a new cleaner that will free the mempool and cleanup EAL when dropped.
+    pub(crate) fn new(mempool: *mut ffi::rte_mempool, ports: Vec<u16>) -> Self {
+        Self { mempool, ports }
+    }
+}
+
+impl Drop for DpdkResourcesCleaner {
+    fn drop(&mut self) {
+        // 1. Stop and close all ports
+        for &port_id in &self.ports {
             unsafe {
-                // Stop the port (no more RX/TX)
-                let ret = ffi::rte_eth_dev_stop(port_id);
-                if ret != 0 {
-                    eprintln!("Warning: rte_eth_dev_stop({}) failed: {}", port_id, ret);
-                }
-                // Close the port (release resources)
-                let ret = ffi::rte_eth_dev_close(port_id);
-                if ret != 0 {
-                    eprintln!("Warning: rte_eth_dev_close({}) failed: {}", port_id, ret);
-                }
+                let _ = ffi::rte_eth_dev_stop(port_id);
+                let _ = ffi::rte_eth_dev_close(port_id);
             }
         }
 
-        // Free the memory pool
+        // 2. Free mempool
         if !self.mempool.is_null() {
             unsafe {
                 ffi::rte_mempool_free(self.mempool);
             }
-            self.mempool = std::ptr::null_mut();
+        }
+
+        // 3. Clean up EAL
+        unsafe {
+            let _ = ffi::rte_eal_cleanup();
         }
     }
 }
@@ -501,30 +514,3 @@ pub(crate) struct DpdkResourcesMultiQueue {
 // Safety: DPDK mempools are thread-safe
 unsafe impl Send for DpdkResourcesMultiQueue {}
 unsafe impl Sync for DpdkResourcesMultiQueue {}
-
-impl DpdkResourcesMultiQueue {
-    /// Clean up DPDK resources.
-    pub(crate) fn cleanup(&mut self) {
-        // Stop and close all ports
-        for &port_id in &self.ports {
-            unsafe {
-                let ret = ffi::rte_eth_dev_stop(port_id);
-                if ret != 0 {
-                    eprintln!("Warning: rte_eth_dev_stop({}) failed: {}", port_id, ret);
-                }
-                let ret = ffi::rte_eth_dev_close(port_id);
-                if ret != 0 {
-                    eprintln!("Warning: rte_eth_dev_close({}) failed: {}", port_id, ret);
-                }
-            }
-        }
-
-        // Free the memory pool
-        if !self.mempool.is_null() {
-            unsafe {
-                ffi::rte_mempool_free(self.mempool);
-            }
-            self.mempool = std::ptr::null_mut();
-        }
-    }
-}

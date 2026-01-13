@@ -63,11 +63,30 @@ macro_rules! rt_test {
 
             const NUM_WORKERS: usize = 1;
 
-            /// Get DPDK device from environment variable
+            /// Get DPDK device PCI address from /etc/dpdk/env.json
             fn detect_dpdk_device() -> String {
-                // Environment variable is required for tests
-                std::env::var("DPDK_DEVICE")
-                    .expect("DPDK_DEVICE environment variable is required for DPDK tests")
+                const CONFIG_PATHS: &[&str] = &[
+                    "/etc/dpdk/env.json",
+                    "./config/dpdk-env.json",
+                    "./dpdk-env.json",
+                ];
+
+                for path in CONFIG_PATHS {
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
+                                for device in devices {
+                                    if device.get("role").and_then(|r| r.as_str()) == Some("dpdk") {
+                                        if let Some(pci) = device.get("pci_address").and_then(|p| p.as_str()) {
+                                            return pci.to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                panic!("No DPDK device found in env.json. Searched: {:?}", CONFIG_PATHS)
             }
 
             fn rt() -> Arc<Runtime> {

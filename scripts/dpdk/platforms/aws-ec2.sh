@@ -201,14 +201,45 @@ generate_config() {
         echo "      \"mac\": \"$mac\","
         
         # Build addresses array (IPv4 + IPv6)
+        # IMPORTANT: Put IPs with EIP associations FIRST so DPDK uses them for external connectivity
         echo "      \"addresses\": ["
         local addr_first=true
+        
+        # Get EIP associations for this interface
+        local eip_associations=$(fetch_metadata "/network/interfaces/macs/$mac/ipv4-associations/" 2>/dev/null || echo "")
+        local ips_with_eip=""
+        local ips_without_eip=""
+        
+        # Categorize IPs by EIP association
         for ip in $local_ipv4s; do
-            if [[ "$addr_first" != "true" ]]; then
-                echo ","
+            local has_eip=false
+            for eip_with_slash in $eip_associations; do
+                local eip="${eip_with_slash%/}"
+                # Check if this EIP is associated with this private IP
+                local associated_private=$(fetch_metadata "/network/interfaces/macs/$mac/ipv4-associations/$eip" 2>/dev/null || echo "")
+                if [[ "$associated_private" == "$ip" ]]; then
+                    has_eip=true
+                    break
+                fi
+            done
+            
+            if [[ "$has_eip" == "true" ]]; then
+                ips_with_eip="$ips_with_eip $ip"
+            else
+                ips_without_eip="$ips_without_eip $ip"
             fi
-            addr_first=false
-            echo -n "        \"$ip/$prefix\""
+        done
+        
+        # Output ONLY IPs with public IP associations (EIP or auto-assigned)
+        # Private IPs without public IP mapping cannot be used for external connectivity
+        for ip in $ips_with_eip; do
+            if [[ -n "$ip" ]]; then
+                if [[ "$addr_first" != "true" ]]; then
+                    echo ","
+                fi
+                addr_first=false
+                echo -n "        \"$ip/$prefix\""
+            fi
         done
         # Add IPv6 addresses
         for ip in $local_ipv6s; do

@@ -25,13 +25,20 @@
 //! # Regenerating Bindings
 //!
 //! To regenerate bindings (requires DPDK and bindgen installed):
+//!
 //! ```sh
-//! # Linux (WSL):
-//! ./tools/generate_dpdk_bindings.sh
+//! # Linux:
+//! # May need to set LIBCLANG_PATH if bindgen cannot find libclang
+//! LIBCLANG_PATH=/usr/lib/llvm-18/lib ./tools/generate_dpdk_bindings.sh
 //!
 //! # Windows:
 //! tools\generate_dpdk_bindings_windows.bat
 //! ```
+//!
+//! The script generates bindings for both DPDK library functions and our
+//! custom wrapper functions defined in `dpdk_wrappers.c`. The wrapper
+//! declarations are embedded in the script, so adding new wrappers requires
+//! updating both `dpdk_wrappers.c` and `generate_dpdk_bindings.sh`.
 
 // Suppress warnings from auto-generated code
 #![allow(non_upper_case_globals)]

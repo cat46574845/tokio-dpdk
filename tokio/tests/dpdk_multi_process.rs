@@ -37,31 +37,50 @@ enum SubtestResult {
 // Helper Functions - Using REAL configuration
 // =============================================================================
 
-/// Get first DPDK device from real env.json
+/// Get first DPDK device from env.json.
 fn get_first_dpdk_device() -> String {
-    if let Ok(device) = std::env::var("DPDK_DEVICE") {
-        return device;
+    const CONFIG_PATHS: &[&str] = &[
+        "/etc/dpdk/env.json",
+        "./config/dpdk-env.json",
+        "./dpdk-env.json",
+    ];
+
+    for path in CONFIG_PATHS {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let devices = extract_dpdk_devices_from_json(&content);
+            if let Some(first) = devices.into_iter().next() {
+                return first;
+            }
+        }
     }
 
-    let content = std::fs::read_to_string("/etc/dpdk/env.json")
-        .expect("env.json not found - DPDK not configured");
-
-    extract_dpdk_devices_from_json(&content)
-        .into_iter()
-        .next()
-        .expect("No DPDK devices in env.json")
+    panic!(
+        "No DPDK device found in env.json. Searched: {:?}",
+        CONFIG_PATHS
+    )
 }
 
-/// Get all DPDK devices from real env.json
+/// Get all DPDK devices from env.json.
 fn get_all_dpdk_devices() -> Vec<String> {
-    if let Ok(devices) = std::env::var("DPDK_DEVICES") {
-        return devices.split(',').map(|s| s.trim().to_string()).collect();
+    const CONFIG_PATHS: &[&str] = &[
+        "/etc/dpdk/env.json",
+        "./config/dpdk-env.json",
+        "./dpdk-env.json",
+    ];
+
+    for path in CONFIG_PATHS {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let devices = extract_dpdk_devices_from_json(&content);
+            if !devices.is_empty() {
+                return devices;
+            }
+        }
     }
 
-    let content = std::fs::read_to_string("/etc/dpdk/env.json")
-        .expect("env.json not found - DPDK not configured");
-
-    extract_dpdk_devices_from_json(&content)
+    panic!(
+        "No DPDK devices found in env.json. Searched: {:?}",
+        CONFIG_PATHS
+    )
 }
 
 /// Parse DPDK devices from env.json content using serde_json
@@ -312,9 +331,9 @@ fn subtest_different_device_lock_available(all_devices: &[String]) -> SubtestRes
 fn subtest_single_queue_real_traffic(rt: &Runtime) -> SubtestResult {
     rt.block_on(async {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
+        use tokio::net::TcpDpdkStream;
 
-        let mut stream = TcpStream::connect("1.1.1.1:80")
+        let mut stream = TcpDpdkStream::connect("1.1.1.1:80")
             .await
             .expect("Should connect to Cloudflare");
 
@@ -341,9 +360,9 @@ fn subtest_multi_task_real_traffic(rt: &Runtime) -> SubtestResult {
         for i in 0..4 {
             handles.push(tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                use tokio::net::TcpStream;
+                use tokio::net::TcpDpdkStream;
 
-                if let Ok(mut stream) = TcpStream::connect("1.1.1.1:80").await {
+                if let Ok(mut stream) = TcpDpdkStream::connect("1.1.1.1:80").await {
                     let request = format!("GET /{} HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n", i);
                     stream.write_all(request.as_bytes()).await.ok();
                     let mut buf = [0u8; 64];
@@ -375,10 +394,10 @@ fn subtest_multi_task_real_traffic(rt: &Runtime) -> SubtestResult {
 fn subtest_real_network_http(rt: &Runtime) -> SubtestResult {
     rt.block_on(async {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
+        use tokio::net::TcpDpdkStream;
 
         for _ in 0..3 {
-            let mut stream = TcpStream::connect("1.1.1.1:80")
+            let mut stream = TcpDpdkStream::connect("1.1.1.1:80")
                 .await
                 .expect("Should connect");
 
@@ -405,9 +424,9 @@ fn subtest_multiple_connections(rt: &Runtime) -> SubtestResult {
             let counter = success_count.clone();
             handles.push(tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                use tokio::net::TcpStream;
+                use tokio::net::TcpDpdkStream;
 
-                if let Ok(mut stream) = TcpStream::connect("1.1.1.1:80").await {
+                if let Ok(mut stream) = TcpDpdkStream::connect("1.1.1.1:80").await {
                     if stream
                         .write_all(b"GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n")
                         .await
@@ -448,12 +467,12 @@ fn subtest_concurrent_workers_traffic(rt: &Runtime) -> SubtestResult {
             let thread_ids = thread_ids.clone();
             handles.push(tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                use tokio::net::TcpStream;
+                use tokio::net::TcpDpdkStream;
 
                 let tid = std::thread::current().id();
                 thread_ids.lock().unwrap().insert(format!("{:?}", tid));
 
-                if let Ok(mut stream) = TcpStream::connect("1.1.1.1:80").await {
+                if let Ok(mut stream) = TcpDpdkStream::connect("1.1.1.1:80").await {
                     stream
                         .write_all(b"GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n")
                         .await
@@ -487,9 +506,9 @@ fn subtest_traffic_distribution(rt: &Runtime) -> SubtestResult {
 
             handles.push(tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                use tokio::net::TcpStream;
+                use tokio::net::TcpDpdkStream;
 
-                if let Ok(mut stream) = TcpStream::connect("1.1.1.1:80").await {
+                if let Ok(mut stream) = TcpDpdkStream::connect("1.1.1.1:80").await {
                     if stream
                         .write_all(b"GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n")
                         .await

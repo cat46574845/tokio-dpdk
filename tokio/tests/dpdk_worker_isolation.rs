@@ -22,19 +22,102 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpDpdkStream;
+// Standard TCP types for the echo server (runs in separate non-DPDK runtime)
+use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::Barrier;
+
+// Debug flag - set to true to enable debug output
+const DEBUG_ISOLATION_TEST: bool = false;
+
+// Debug macro with file:line and timestamp - compiles to nothing when DEBUG_ISOLATION_TEST is false
+macro_rules! dbg_print {
+    ($start:expr, $($arg:tt)*) => {
+        if DEBUG_ISOLATION_TEST {
+            let elapsed = $start.elapsed();
+            eprintln!("[{:>12.3?}] {}:{} - {}", elapsed, file!(), line!(), format!($($arg)*));
+        }
+    };
+}
 
 // =============================================================================
 // Test Configuration
 // =============================================================================
 
-/// Server bind address (localhost, random port)
-const SERVER_BIND: &str = "127.0.0.1:0";
+/// Get the server bind address from env.json (kernel IP) and DPDK_TEST_PORT env var.
+/// Panics if DPDK_TEST_PORT is not set.
+fn get_server_bind_addr() -> String {
+    let kernel_ip = get_kernel_ip();
+    let port: u16 = std::env::var("DPDK_TEST_PORT")
+        .expect("DPDK_TEST_PORT environment variable is required for tests")
+        .parse()
+        .expect("DPDK_TEST_PORT must be a valid port number");
+    format!("{}:{}", kernel_ip, port)
+}
+
+/// Get the primary kernel IP address from env.json.
+/// Selects the kernel interface with the most IPv4 addresses.
+fn get_kernel_ip() -> String {
+    const CONFIG_PATHS: &[&str] = &[
+        "/etc/dpdk/env.json",
+        "./config/dpdk-env.json",
+        "./dpdk-env.json",
+    ];
+
+    for path in CONFIG_PATHS {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
+                    let mut best_ip: Option<String> = None;
+                    let mut best_count = 0;
+
+                    for device in devices {
+                        if device.get("role").and_then(|r| r.as_str()) == Some("kernel") {
+                            if let Some(addrs) = device.get("addresses").and_then(|a| a.as_array())
+                            {
+                                let ipv4_count = addrs
+                                    .iter()
+                                    .filter(|a| {
+                                        a.as_str().map(|s| !s.contains(':')).unwrap_or(false)
+                                    })
+                                    .count();
+                                if ipv4_count > best_count {
+                                    if let Some(first_v4) = addrs
+                                        .iter()
+                                        .filter_map(|a| a.as_str())
+                                        .find(|a| !a.contains(':'))
+                                    {
+                                        best_ip = Some(
+                                            first_v4
+                                                .split('/')
+                                                .next()
+                                                .unwrap_or(first_v4)
+                                                .to_string(),
+                                        );
+                                        best_count = ipv4_count;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(ip) = best_ip {
+                        return ip;
+                    }
+                }
+            }
+        }
+    }
+
+    panic!(
+        "No kernel device found in env.json. Searched: {:?}",
+        CONFIG_PATHS
+    )
+}
 
 // =============================================================================
 // Echo Server Implementation
@@ -58,7 +141,8 @@ fn start_echo_server() -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<
             .expect("Failed to create server runtime");
 
         rt.block_on(async {
-            let listener = TcpListener::bind(SERVER_BIND)
+            let bind_addr = get_server_bind_addr();
+            let listener = TcpListener::bind(&bind_addr)
                 .await
                 .expect("Failed to bind server");
 
@@ -115,6 +199,10 @@ async fn handle_client(socket: tokio::net::TcpStream, _peer: SocketAddr, conn_id
                 if writer.write_all(response.as_bytes()).await.is_err() {
                     break;
                 }
+                // Flush immediately to ensure response is sent
+                if writer.flush().await.is_err() {
+                    break;
+                }
                 seq += 1;
             }
             Ok(Err(_)) | Err(_) => break,
@@ -127,43 +215,35 @@ async fn handle_client(socket: tokio::net::TcpStream, _peer: SocketAddr, conn_id
 // =============================================================================
 
 fn detect_dpdk_device() -> String {
-    if let Ok(dev) = std::env::var("DPDK_DEVICE") {
-        return dev;
-    }
-
-    let config_paths = [
+    const CONFIG_PATHS: &[&str] = &[
         "/etc/dpdk/env.json",
         "./config/dpdk-env.json",
         "./dpdk-env.json",
     ];
 
-    for path in &config_paths {
+    for path in CONFIG_PATHS {
         if let Ok(content) = std::fs::read_to_string(path) {
-            if let Some(device) = find_dpdk_device_in_json(&content) {
-                return device;
-            }
-        }
-    }
-
-    panic!("No DPDK device found. Set DPDK_DEVICE or configure /etc/dpdk/env.json");
-}
-
-fn find_dpdk_device_in_json(content: &str) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_str(content).ok()?;
-
-    if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
-        for device in devices {
-            let role = device.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            if role == "dpdk" {
-                if let Some(pci) = device.get("pci_address").and_then(|p| p.as_str()) {
-                    return Some(pci.to_string());
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
+                    for device in devices {
+                        if device.get("role").and_then(|r| r.as_str()) == Some("dpdk") {
+                            if let Some(pci) = device.get("pci_address").and_then(|p| p.as_str()) {
+                                return pci.to_string();
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    None
+    panic!(
+        "No DPDK device found in env.json. Searched: {:?}",
+        CONFIG_PATHS
+    )
 }
+
+// find_dpdk_device_in_json is no longer needed
 
 fn dpdk_rt() -> Runtime {
     let device = detect_dpdk_device();
@@ -401,30 +481,70 @@ async fn run_isolation_test(
     num_clients: usize,
     messages_per_client: usize,
 ) -> Vec<ClientResult> {
+    let test_start = Instant::now();
+    dbg_print!(
+        test_start,
+        "run_isolation_test: spawning {} clients",
+        num_clients
+    );
     let results = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(num_clients)));
     let barrier = Arc::new(Barrier::new(num_clients));
+    let arrived = Arc::new(AtomicUsize::new(0));
 
     let mut handles = Vec::with_capacity(num_clients);
 
     for client_id in 0..num_clients {
         let results = results.clone();
         let barrier = barrier.clone();
+        let arrived = arrived.clone();
 
         let handle = tokio::spawn(async move {
+            let task_start = Instant::now();
+            dbg_print!(
+                task_start,
+                "Client {} spawned, waiting on barrier",
+                client_id
+            );
             // Wait for all clients to be ready
+            let count = arrived.fetch_add(1, Ordering::SeqCst) + 1;
+            dbg_print!(
+                task_start,
+                "Client {} at barrier, arrived={}/{}",
+                client_id,
+                count,
+                num_clients
+            );
             barrier.wait().await;
+            dbg_print!(
+                task_start,
+                "Client {} passed barrier, starting work",
+                client_id
+            );
 
             let result = run_client_n_messages(client_id, server_addr, messages_per_client).await;
+            dbg_print!(task_start, "Client {} finished work", client_id);
             results.lock().await.push(result);
         });
 
         handles.push(handle);
     }
 
+    dbg_print!(
+        test_start,
+        "All {} clients spawned, waiting for completion",
+        num_clients
+    );
+
     // Wait for all clients to complete
-    for handle in handles {
-        let _ = tokio::time::timeout(Duration::from_secs(60), handle).await;
+    for (i, handle) in handles.into_iter().enumerate() {
+        match tokio::time::timeout(Duration::from_secs(60), handle).await {
+            Ok(Ok(())) => dbg_print!(test_start, "Handle {} completed", i),
+            Ok(Err(e)) => dbg_print!(test_start, "Handle {} panicked: {:?}", i, e),
+            Err(_) => dbg_print!(test_start, "Handle {} timed out", i),
+        }
     }
+
+    dbg_print!(test_start, "All handles processed");
 
     Arc::try_unwrap(results)
         .expect("Arc still has references")
@@ -437,24 +557,34 @@ async fn run_client_n_messages(
     num_messages: usize,
 ) -> ClientResult {
     let mut result = ClientResult::new();
+    let msg_start = Instant::now();
 
+    dbg_print!(
+        msg_start,
+        "Client {} connecting to {}",
+        client_id,
+        server_addr
+    );
     // Connect to server
-    let stream = match tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect(server_addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            result.errors.push(format!("Connect failed: {}", e));
-            return result;
-        }
-        Err(_) => {
-            result.errors.push("Connect timeout".to_string());
-            return result;
-        }
-    };
+    let stream =
+        match tokio::time::timeout(Duration::from_secs(10), TcpDpdkStream::connect(server_addr))
+            .await
+        {
+            Ok(Ok(s)) => {
+                dbg_print!(msg_start, "Client {} connected", client_id);
+                s
+            }
+            Ok(Err(e)) => {
+                dbg_print!(msg_start, "Client {} connect failed: {}", client_id, e);
+                result.errors.push(format!("Connect failed: {}", e));
+                return result;
+            }
+            Err(_) => {
+                dbg_print!(msg_start, "Client {} connect timeout", client_id);
+                result.errors.push("Connect timeout".to_string());
+                return result;
+            }
+        };
 
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -465,23 +595,62 @@ async fn run_client_n_messages(
         let random_data = format!("{:016x}", rand_u64());
         let message = format!("CLIENT:{}:{}:{}\n", client_id, seq, random_data);
 
+        let t0 = Instant::now();
         // Send message
         if writer.write_all(message.as_bytes()).await.is_err() {
+            dbg_print!(
+                msg_start,
+                "Client {} write failed at seq {} after {:?}",
+                client_id,
+                seq,
+                t0.elapsed()
+            );
             result.errors.push(format!("Write failed at seq {}", seq));
             return result;
         }
+        let t1 = Instant::now();
+        // Flush to ensure immediate send
+        if writer.flush().await.is_err() {
+            dbg_print!(
+                msg_start,
+                "Client {} flush failed at seq {} after {:?}",
+                client_id,
+                seq,
+                t0.elapsed()
+            );
+            result.errors.push(format!("Flush failed at seq {}", seq));
+            return result;
+        }
+        let t2 = Instant::now();
         result.messages_sent += 1;
 
         // Read response
         let mut response = String::new();
         match tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut response)).await {
             Ok(Ok(0)) => {
+                dbg_print!(
+                    msg_start,
+                    "Client {} connection closed at seq {}",
+                    client_id,
+                    seq
+                );
                 result
                     .errors
                     .push(format!("Connection closed at seq {}", seq));
                 return result;
             }
             Ok(Ok(_)) => {
+                let t3 = Instant::now();
+                dbg_print!(
+                    msg_start,
+                    "Client {} msg {} write={:?} flush={:?} read={:?} RTT={:?}",
+                    client_id,
+                    seq,
+                    t1 - t0,
+                    t2 - t1,
+                    t3 - t2,
+                    t3 - t0
+                );
                 result.messages_received += 1;
 
                 // Verify response contains our data

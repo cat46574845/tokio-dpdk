@@ -366,7 +366,7 @@ async fn drop_from_wake() {
 }
 
 /// DPDK flavor tests - these run the same tests on the DPDK runtime
-/// Use: DPDK_DEVICE=enp40s0 cargo test --test time_sleep dpdk_flavor
+/// Uses env.json configuration: cargo test --test time_sleep dpdk_flavor
 #[cfg(all(target_os = "linux", feature = "full"))]
 mod dpdk_flavor {
     use tokio::time::{self, Duration, Instant};

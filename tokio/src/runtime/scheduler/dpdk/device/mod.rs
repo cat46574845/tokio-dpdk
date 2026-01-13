@@ -90,6 +90,14 @@ mod dpdk_wrappers {
         // SAFETY: Caller guarantees valid mbuf pointer
         unsafe { ffi::dpdk_wrap_rte_pktmbuf_pkt_len(mbuf) }
     }
+
+    /// Append data to mbuf and return pointer to the appended area.
+    /// This properly sets pkt_len and data_len on the mbuf.
+    #[inline(always)]
+    pub(crate) unsafe fn pktmbuf_append(mbuf: *mut ffi::rte_mbuf, len: u16) -> *mut u8 {
+        // SAFETY: Caller guarantees valid mbuf pointer
+        unsafe { ffi::dpdk_wrap_rte_pktmbuf_append(mbuf, len) as *mut u8 }
+    }
 }
 
 // =============================================================================
@@ -258,6 +266,7 @@ impl smoltcp::phy::RxToken for DpdkRxToken {
         };
 
         let data = unsafe { std::slice::from_raw_parts_mut(data_ptr, data_len) };
+
         let result = f(data);
 
         // Free the mbuf after consumption
@@ -281,12 +290,17 @@ impl<'a> smoltcp::phy::TxToken for DpdkTxToken<'a> {
             panic!("Failed to allocate mbuf for transmission");
         }
 
-        // Get data pointer and set the packet length
+        // Use pktmbuf_append to properly allocate space and set pkt_len/data_len
+        // This is the correct DPDK way to prepare an mbuf for transmission
         let data = unsafe {
-            let ptr = dpdk_wrappers::pktmbuf_mtod(mbuf);
-            // Note: We need to set pkt_len and data_len on the mbuf
-            // This assumes the mbuf struct has these accessible fields
-            // In real implementation, this would use proper DPDK APIs
+            let ptr = dpdk_wrappers::pktmbuf_append(mbuf, len as u16);
+            if ptr.is_null() {
+                dpdk_wrappers::pktmbuf_free(mbuf);
+                panic!(
+                    "Failed to append {} bytes to mbuf (insufficient space)",
+                    len
+                );
+            }
             std::slice::from_raw_parts_mut(ptr, len)
         };
 
@@ -335,11 +349,15 @@ impl Device for DpdkDevice {
         caps.max_burst_size = Some(RX_BURST_SIZE as usize);
         caps.medium = Medium::Ethernet;
 
-        // Enable hardware checksum offload
+        // Configure smoltcp to calculate checksums for TX packets in software
+        // Checksum::Tx = smoltcp calculates checksums for outgoing packets
+        // Checksum::Rx = smoltcp verifies checksums for incoming packets
+        // Checksum::Both = smoltcp does both
+        // Checksum::None = smoltcp ignores checksums completely (DANGEROUS!)
         caps.checksum = ChecksumCapabilities::default();
-        caps.checksum.ipv4 = Checksum::Both;
-        caps.checksum.udp = Checksum::Both;
-        caps.checksum.tcp = Checksum::Both;
+        caps.checksum.ipv4 = Checksum::Tx; // smoltcp calculates TX, hardware may strip RX
+        caps.checksum.udp = Checksum::Tx; // smoltcp calculates TX
+        caps.checksum.tcp = Checksum::Tx; // smoltcp calculates TX
 
         caps
     }

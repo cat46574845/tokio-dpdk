@@ -423,7 +423,32 @@ fn parse_knobs(mut input: ItemFn, is_test: bool, config: FinalConfig) -> TokenSt
         },
         RuntimeFlavor::Dpdk => quote_spanned! {last_stmt_start_span=>
             #crate_path::runtime::Builder::new_dpdk()
-                .dpdk_device(&::std::env::var("DPDK_DEVICE").unwrap_or_else(|_| "eth0".to_string()))
+                .dpdk_device(&{
+                    const CONFIG_PATHS: &[&str] = &[
+                        "/etc/dpdk/env.json",
+                        "./config/dpdk-env.json",
+                        "./dpdk-env.json",
+                    ];
+                    let mut result: Option<String> = None;
+                    for path in CONFIG_PATHS {
+                        if let Ok(content) = ::std::fs::read_to_string(path) {
+                            if let Ok(json) = ::serde_json::from_str::<::serde_json::Value>(&content) {
+                                if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
+                                    for device in devices {
+                                        if device.get("role").and_then(|r| r.as_str()) == Some("dpdk") {
+                                            if let Some(pci) = device.get("pci_address").and_then(|p| p.as_str()) {
+                                                result = Some(pci.to_string());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if result.is_some() { break; }
+                    }
+                    result.expect("No DPDK device found in env.json. Searched: /etc/dpdk/env.json, ./config/dpdk-env.json, ./dpdk-env.json")
+                })
         },
     };
 
