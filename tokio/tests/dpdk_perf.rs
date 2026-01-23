@@ -74,7 +74,9 @@ fn report_result(name: &str, ticks: u64, duration: Duration) {
 // Baseline Test
 // =============================================================================
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_baseline() {
     let rt = dpdk_rt();
     rt.block_on(async {
@@ -142,37 +144,49 @@ async fn run_dpdk_io_benchmark(num_connections: usize) {
     report_result(&name, ticks, BENCH_DURATION);
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_dpdk_io_10() {
     let rt = dpdk_rt();
     rt.block_on(run_dpdk_io_benchmark(10));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_dpdk_io_50() {
     let rt = dpdk_rt();
     rt.block_on(run_dpdk_io_benchmark(50));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_dpdk_io_100() {
     let rt = dpdk_rt();
     rt.block_on(run_dpdk_io_benchmark(100));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_dpdk_io_200() {
     let rt = dpdk_rt();
     rt.block_on(run_dpdk_io_benchmark(200));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_dpdk_io_500() {
     let rt = dpdk_rt();
     rt.block_on(run_dpdk_io_benchmark(500));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_dpdk_io_1000() {
     let rt = dpdk_rt();
     rt.block_on(run_dpdk_io_benchmark(1000));
@@ -232,37 +246,49 @@ async fn run_kernel_io_benchmark(num_connections: usize) {
     report_result(&name, ticks, BENCH_DURATION);
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_kernel_io_10() {
     let rt = dpdk_rt();
     rt.block_on(run_kernel_io_benchmark(10));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_kernel_io_50() {
     let rt = dpdk_rt();
     rt.block_on(run_kernel_io_benchmark(50));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_kernel_io_100() {
     let rt = dpdk_rt();
     rt.block_on(run_kernel_io_benchmark(100));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_kernel_io_200() {
     let rt = dpdk_rt();
     rt.block_on(run_kernel_io_benchmark(200));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_kernel_io_500() {
     let rt = dpdk_rt();
     rt.block_on(run_kernel_io_benchmark(500));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_kernel_io_1000() {
     let rt = dpdk_rt();
     rt.block_on(run_kernel_io_benchmark(1000));
@@ -301,31 +327,41 @@ async fn run_sync_benchmark(num_tasks: usize) {
     report_result(&name, ticks, BENCH_DURATION);
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_sync_100() {
     let rt = dpdk_rt();
     rt.block_on(run_sync_benchmark(100));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_sync_500() {
     let rt = dpdk_rt();
     rt.block_on(run_sync_benchmark(500));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_sync_1000() {
     let rt = dpdk_rt();
     rt.block_on(run_sync_benchmark(1000));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_sync_2000() {
     let rt = dpdk_rt();
     rt.block_on(run_sync_benchmark(2000));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_sync_5000() {
     let rt = dpdk_rt();
     rt.block_on(run_sync_benchmark(5000));
@@ -559,8 +595,6 @@ async fn run_mixed_interleaved_benchmark(
     let dpdk_counter = Arc::new(AtomicU64::new(0));
     let kernel_counter = Arc::new(AtomicU64::new(0));
     let sync_counter = Arc::new(AtomicU64::new(0));
-    let dpdk_connected = Arc::new(AtomicU64::new(0));
-    let kernel_connected = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut handles = Vec::new();
 
@@ -572,7 +606,6 @@ async fn run_mixed_interleaved_benchmark(
         if i < dpdk_conns {
             let counter = dpdk_counter.clone();
             let stop = stop.clone();
-            let connected = dpdk_connected.clone();
             handles.push(tokio::spawn(async move {
                 let stream = match tokio::time::timeout(
                     Duration::from_secs(5),
@@ -580,10 +613,7 @@ async fn run_mixed_interleaved_benchmark(
                 )
                 .await
                 {
-                    Ok(Ok(s)) => {
-                        connected.fetch_add(1, Ordering::Relaxed);
-                        s
-                    }
+                    Ok(Ok(s)) => s,
                     _ => return,
                 };
                 let mut stream = stream;
@@ -605,7 +635,6 @@ async fn run_mixed_interleaved_benchmark(
         if i < kernel_conns {
             let counter = kernel_counter.clone();
             let stop = stop.clone();
-            let connected = kernel_connected.clone();
             handles.push(tokio::spawn(async move {
                 let stream = match tokio::time::timeout(
                     Duration::from_secs(5),
@@ -613,10 +642,7 @@ async fn run_mixed_interleaved_benchmark(
                 )
                 .await
                 {
-                    Ok(Ok(s)) => {
-                        connected.fetch_add(1, Ordering::Relaxed);
-                        s
-                    }
+                    Ok(Ok(s)) => s,
                     _ => return,
                 };
                 let mut stream = stream;
@@ -649,7 +675,6 @@ async fn run_mixed_interleaved_benchmark(
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     let ticks = count_ticks(BENCH_DURATION).await;
-
     stop.store(true, Ordering::Relaxed);
     for handle in handles {
         let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
@@ -660,14 +685,6 @@ async fn run_mixed_interleaved_benchmark(
     let kernel_ops = kernel_counter.load(Ordering::Relaxed);
     let sync_ops = sync_counter.load(Ordering::Relaxed);
 
-    eprintln!(
-        "[CONN] dpdk: {}/{} ok, kernel: {}/{} ok",
-        dpdk_connected.load(Ordering::Relaxed),
-        dpdk_conns,
-        kernel_connected.load(Ordering::Relaxed),
-        kernel_conns
-    );
-
     let name = format!(
         "interleaved_d{}_k{}_s{} (dpdk:{} kern:{} sync:{})",
         dpdk_conns, kernel_conns, sync_tasks, dpdk_ops, kernel_ops, sync_ops
@@ -675,25 +692,33 @@ async fn run_mixed_interleaved_benchmark(
     report_result(&name, ticks, BENCH_DURATION);
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_mixed_dpdk_kernel_100() {
     let rt = dpdk_rt();
     rt.block_on(run_mixed_benchmark(50, 50, 0));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_mixed_dpdk_kernel_500() {
     let rt = dpdk_rt();
     rt.block_on(run_mixed_benchmark(250, 250, 0));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_mixed_all_light() {
     let rt = dpdk_rt();
     rt.block_on(run_mixed_benchmark(50, 50, 500));
 }
 
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_mixed_all_heavy() {
     let rt = dpdk_rt();
     rt.block_on(run_mixed_benchmark(200, 200, 2000));
@@ -704,7 +729,9 @@ fn perf_mixed_all_heavy() {
 // =============================================================================
 
 /// Run all performance benchmarks in sequence (single process to avoid EAL issues)
+#[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore = "Long-running benchmark test"]
 fn perf_all_benchmarks() {
     println!("\n========================================");
     println!("  DPDK Event Loop Performance Benchmarks");

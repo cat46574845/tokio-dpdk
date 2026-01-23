@@ -375,54 +375,76 @@ mod dpdk_flavor {
         Duration::from_millis(n)
     }
 
-    #[tokio::test(flavor = "dpdk")]
-    async fn dpdk_short_sleeps() {
-        for _ in 0..10 {
-            tokio::time::sleep(std::time::Duration::from_millis(0)).await;
-        }
+    #[serial_isolation_test::serial_isolation_test]
+    #[test]
+    fn dpdk_short_sleeps() {
+        let rt = tokio::runtime::Builder::new_dpdk()
+            .enable_all()
+            .build()
+            .expect("Failed building the Runtime");
+        rt.block_on(async {
+            for _ in 0..10 {
+                tokio::time::sleep(std::time::Duration::from_millis(0)).await;
+            }
+        });
     }
 
-    #[tokio::test(flavor = "dpdk")]
-    async fn dpdk_delayed_sleep() {
-        let now = Instant::now();
-        let dur = ms(50);
+    #[serial_isolation_test::serial_isolation_test]
+    #[test]
+    fn dpdk_delayed_sleep() {
+        let rt = tokio::runtime::Builder::new_dpdk()
+            .enable_all()
+            .build()
+            .expect("Failed building the Runtime");
+        rt.block_on(async {
+            let now = Instant::now();
+            let dur = ms(50);
 
-        time::sleep(dur).await;
+            time::sleep(dur).await;
 
-        // Allow some tolerance (DPDK busy-poll may be slightly faster or slower)
-        let elapsed = now.elapsed();
-        assert!(elapsed >= ms(40), "elapsed {:?} < 40ms", elapsed);
+            // Allow some tolerance (DPDK busy-poll may be slightly faster or slower)
+            let elapsed = now.elapsed();
+            assert!(elapsed >= ms(40), "elapsed {:?} < 40ms", elapsed);
+        });
     }
 
-    #[tokio::test(flavor = "dpdk")]
-    async fn dpdk_concurrent_sleeps() {
-        let start = Instant::now();
+    #[serial_isolation_test::serial_isolation_test]
+    #[test]
+    fn dpdk_concurrent_sleeps() {
+        let rt = tokio::runtime::Builder::new_dpdk()
+            .enable_all()
+            .build()
+            .expect("Failed building the Runtime");
+        rt.block_on(async {
+            let start = Instant::now();
 
-        let h1 = tokio::spawn(async {
-            time::sleep(ms(50)).await;
-            1
+            let h1 = tokio::spawn(async {
+                time::sleep(ms(50)).await;
+                1
+            });
+            let h2 = tokio::spawn(async {
+                time::sleep(ms(50)).await;
+                2
+            });
+            let h3 = tokio::spawn(async {
+                time::sleep(ms(50)).await;
+                3
+            });
+
+            let (r1, r2, r3) = tokio::join!(h1, h2, h3);
+
+            assert_eq!(r1.unwrap(), 1);
+            assert_eq!(r2.unwrap(), 2);
+            assert_eq!(r3.unwrap(), 3);
+
+            // All three should have completed in ~50ms (concurrent), not 150ms (sequential)
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < ms(150),
+                "elapsed {:?} >= 150ms - not concurrent!",
+                elapsed
+            );
         });
-        let h2 = tokio::spawn(async {
-            time::sleep(ms(50)).await;
-            2
-        });
-        let h3 = tokio::spawn(async {
-            time::sleep(ms(50)).await;
-            3
-        });
-
-        let (r1, r2, r3) = tokio::join!(h1, h2, h3);
-
-        assert_eq!(r1.unwrap(), 1);
-        assert_eq!(r2.unwrap(), 2);
-        assert_eq!(r3.unwrap(), 3);
-
-        // All three should have completed in ~50ms (concurrent), not 150ms (sequential)
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < ms(150),
-            "elapsed {:?} >= 150ms - not concurrent!",
-            elapsed
-        );
     }
 }
+

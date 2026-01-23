@@ -8,14 +8,12 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use smoltcp::iface::SocketHandle;
 
 use super::stream::TcpDpdkStream;
 use crate::net::{to_socket_addrs, ToSocketAddrs};
-use crate::runtime::scheduler::dpdk::dpdk_driver::ScheduledIo;
 use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver};
 
 /// Default number of listening sockets in the pool.
@@ -24,7 +22,6 @@ const DEFAULT_BACKLOG: usize = 128;
 /// A listening socket in the pool.
 struct ListenSocket {
     handle: SocketHandle,
-    scheduled_io: Arc<ScheduledIo>,
 }
 
 /// Internal state for the listener (uses interior mutability).
@@ -192,8 +189,8 @@ impl TcpDpdkListener {
                 )
             })?;
 
-            // Register socket for readiness tracking (as a listen socket)
-            let scheduled_io = driver.register_listen_socket(handle);
+            // Register socket for tracking (waker management is by smoltcp)
+            driver.register_listen_socket(handle);
 
             // Configure and listen
             let socket = driver.get_tcp_socket_mut(handle);
@@ -224,10 +221,7 @@ impl TcpDpdkListener {
                 .listen(endpoint)
                 .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, format!("{:?}", e)))?;
 
-            Ok::<_, io::Error>(ListenSocket {
-                handle,
-                scheduled_io,
-            })
+            Ok::<_, io::Error>(ListenSocket { handle })
         })
         .ok_or_else(|| {
             io::Error::new(
@@ -275,29 +269,24 @@ impl TcpDpdkListener {
 
         // Check each socket in the pool for an established connection
         let mut found_idx = None;
+        let waker = cx.waker();
 
         {
             let inner = self.inner.borrow();
             for (idx, listen_socket) in inner.listen_pool.iter().enumerate() {
-                // First, check/register waker
-                match listen_socket.scheduled_io.poll_read_ready(cx) {
-                    Poll::Pending => continue,
-                    Poll::Ready(()) => {}
-                }
-
-                // Check socket state
+                // Check socket state and register waker
                 let is_established = with_current_driver(|driver| {
                     let socket = driver.get_tcp_socket_mut(listen_socket.handle);
+
+                    // Register waker with smoltcp - will be woken when connection established
+                    socket.register_recv_waker(waker);
+
                     socket.is_active() && socket.state() == smoltcp::socket::tcp::State::Established
                 });
 
                 if is_established == Some(true) {
                     found_idx = Some(idx);
                     break;
-                } else {
-                    // Not ready, clear and re-register waker
-                    listen_socket.scheduled_io.clear_read_ready();
-                    let _ = listen_socket.scheduled_io.poll_read_ready(cx);
                 }
             }
         }
@@ -329,7 +318,6 @@ impl TcpDpdkListener {
             // Create stream from accepted connection
             let stream = TcpDpdkStream::from_handle(
                 connected.handle,
-                connected.scheduled_io,
                 self.core_id,
                 Some(self.local_addr),
                 Some(peer_addr),
@@ -341,7 +329,7 @@ impl TcpDpdkListener {
             Poll::Ready(Ok((stream, peer_addr)))
         } else {
             // No connection ready, return Pending
-            // Wakers were registered above for each socket
+            // Wakers were registered with smoltcp above
             Poll::Pending
         }
     }

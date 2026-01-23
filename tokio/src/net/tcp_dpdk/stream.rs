@@ -17,8 +17,7 @@ use smoltcp::iface::SocketHandle;
 use crate::io::{AsyncRead, AsyncWrite, Interest, ReadBuf, Ready};
 use crate::net::{to_socket_addrs, ToSocketAddrs};
 
-// Import ScheduledIo and worker context from dpdk scheduler
-use crate::runtime::scheduler::dpdk::dpdk_driver::ScheduledIo;
+// Import worker context from dpdk scheduler
 use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver};
 
 // =============================================================================
@@ -54,8 +53,6 @@ use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver}
 pub struct TcpDpdkStream {
     /// smoltcp socket handle
     handle: SocketHandle,
-    /// Readiness tracking for async wakeups
-    scheduled_io: Arc<ScheduledIo>,
     /// Worker core this stream is bound to
     core_id: usize,
     /// Local address (cached)
@@ -74,14 +71,12 @@ impl TcpDpdkStream {
     /// This is typically called internally after connection establishment.
     pub(crate) fn from_handle(
         handle: SocketHandle,
-        scheduled_io: Arc<ScheduledIo>,
         core_id: usize,
         local_addr: Option<SocketAddr>,
         peer_addr: Option<SocketAddr>,
     ) -> Self {
         Self {
             handle,
-            scheduled_io,
             core_id,
             local_addr,
             peer_addr,
@@ -135,7 +130,7 @@ impl TcpDpdkStream {
         })?;
 
         // Create socket and initiate connection via worker's DpdkDriver
-        let (handle, scheduled_io, local_endpoint) = with_current_driver(|driver| {
+        let (handle, local_endpoint) = with_current_driver(|driver| {
             // Create new TCP socket from pool
             let handle = driver.create_tcp_socket().ok_or_else(|| {
                 io::Error::new(
@@ -144,8 +139,8 @@ impl TcpDpdkStream {
                 )
             })?;
 
-            // Register socket for readiness tracking
-            let scheduled_io = driver.register_socket(handle);
+            // Register socket for tracking
+            driver.register_socket(handle);
 
             // Pick a local ephemeral port that's not in use
             let local_port = driver.allocate_ephemeral_port().ok_or_else(|| {
@@ -204,7 +199,7 @@ impl TcpDpdkStream {
                     io::Error::new(io::ErrorKind::ConnectionRefused, format!("{:?}", e))
                 })?;
 
-            Ok::<_, io::Error>((handle, scheduled_io, local_endpoint))
+            Ok::<_, io::Error>((handle, local_endpoint))
         })
         .ok_or_else(|| {
             io::Error::new(
@@ -289,7 +284,6 @@ impl TcpDpdkStream {
 
         Ok(Self {
             handle,
-            scheduled_io,
             core_id,
             local_addr,
             peer_addr: Some(addr),
@@ -314,7 +308,7 @@ impl TcpDpdkStream {
         })?;
 
         // Create socket and initiate connection via worker's DpdkDriver
-        let (handle, scheduled_io, local_endpoint) = with_current_driver(|driver| {
+        let (handle, local_endpoint) = with_current_driver(|driver| {
             // Create new TCP socket from pool
             let handle = driver.create_tcp_socket().ok_or_else(|| {
                 io::Error::new(
@@ -323,8 +317,8 @@ impl TcpDpdkStream {
                 )
             })?;
 
-            // Register socket for readiness tracking
-            let scheduled_io = driver.register_socket(handle);
+            // Register socket for tracking
+            driver.register_socket(handle);
 
             // Use the provided local address
             let local_port = if local_addr.port() == 0 {
@@ -414,7 +408,7 @@ impl TcpDpdkStream {
                     io::Error::new(io::ErrorKind::ConnectionRefused, format!("{:?}", e))
                 })?;
 
-            Ok::<_, io::Error>((handle, scheduled_io, local_endpoint))
+            Ok::<_, io::Error>((handle, local_endpoint))
         })
         .ok_or_else(|| {
             io::Error::new(
@@ -471,7 +465,6 @@ impl TcpDpdkStream {
 
         Ok(Self {
             handle,
-            scheduled_io,
             core_id,
             local_addr: result_local_addr,
             peer_addr: Some(remote_addr),
@@ -579,28 +572,58 @@ impl TcpDpdkStream {
 
     /// Poll for read readiness.
     pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.scheduled_io.poll_read_ready(cx) {
-            Poll::Ready(()) => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
+        let handle = self.handle;
+        let waker = cx.waker();
+
+        let result = with_current_driver(|driver| {
+            let socket = driver.get_tcp_socket_mut(handle);
+            socket.register_recv_waker(waker);
+            socket.can_recv()
+                || socket.state() == smoltcp::socket::tcp::State::CloseWait
+                || socket.state() == smoltcp::socket::tcp::State::Closed
+        });
+
+        match result {
+            Some(true) => Poll::Ready(Ok(())),
+            Some(false) => Poll::Pending,
+            None => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Cannot access DPDK driver",
+            ))),
         }
     }
 
     /// Poll for write readiness.
     pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.scheduled_io.poll_write_ready(cx) {
-            Poll::Ready(()) => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
+        let handle = self.handle;
+        let waker = cx.waker();
+
+        let result = with_current_driver(|driver| {
+            let socket = driver.get_tcp_socket_mut(handle);
+            socket.register_send_waker(waker);
+            socket.can_send()
+        });
+
+        match result {
+            Some(true) => Poll::Ready(Ok(())),
+            Some(false) => Poll::Pending,
+            None => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Cannot access DPDK driver",
+            ))),
         }
     }
 
     /// Clear read readiness (for use after WouldBlock).
+    /// Note: With smoltcp native wakers, this is now a no-op.
     pub(crate) fn clear_read_ready(&self) {
-        self.scheduled_io.clear_read_ready();
+        // No-op with smoltcp native wakers
     }
 
     /// Clear write readiness (for use after WouldBlock).
+    /// Note: With smoltcp native wakers, this is now a no-op.
     pub(crate) fn clear_write_ready(&self) {
-        self.scheduled_io.clear_write_ready();
+        // No-op with smoltcp native wakers
     }
 
     // =========================================================================
@@ -852,9 +875,11 @@ impl TcpDpdkStream {
             return Poll::Ready(Ok(0));
         }
 
-        match self.scheduled_io.poll_read_ready(cx) {
+        // Register waker and check readiness via poll_read_ready
+        match self.poll_read_ready(cx) {
             Poll::Pending => return Poll::Pending,
-            Poll::Ready(()) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
         }
 
         match self.try_peek(buf.initialize_unfilled()) {
@@ -863,9 +888,7 @@ impl TcpDpdkStream {
                 Poll::Ready(Ok(n))
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Clear readiness and re-register waker before returning Pending
-                self.scheduled_io.clear_read_ready();
-                let _ = self.scheduled_io.poll_read_ready(cx); // Re-register waker
+                // Waker already registered via poll_read_ready
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e)),
@@ -1035,16 +1058,16 @@ impl AsyncRead for TcpDpdkStream {
         // Verify worker affinity
         self.assert_on_correct_worker();
 
-        // Wait for read readiness
-        match self.scheduled_io.poll_read_ready(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(()) => {}
-        }
-
         // Read from smoltcp socket via worker context
         let handle = self.handle;
+        let waker = cx.waker();
+
         let result = with_current_driver(|driver| {
             let socket = driver.get_tcp_socket_mut(handle);
+
+            // Register waker with smoltcp BEFORE checking state
+            // smoltcp will call wake() when socket becomes readable
+            socket.register_recv_waker(waker);
 
             // Check if socket can receive
             if !socket.can_recv() {
@@ -1054,7 +1077,7 @@ impl AsyncRead for TcpDpdkStream {
                     // Connection closed
                     return Ok(0);
                 }
-                // Not ready yet
+                // Not ready yet - waker is registered, smoltcp will wake us
                 return Err(io::ErrorKind::WouldBlock);
             }
 
@@ -1072,9 +1095,7 @@ impl AsyncRead for TcpDpdkStream {
             Some(Ok(0)) => Poll::Ready(Ok(())), // EOF
             Some(Ok(_n)) => Poll::Ready(Ok(())),
             Some(Err(io::ErrorKind::WouldBlock)) => {
-                // Not ready, clear readiness and re-register waker
-                self.scheduled_io.clear_read_ready();
-                let _ = self.scheduled_io.poll_read_ready(cx); // Re-register waker
+                // Not ready - waker already registered with smoltcp
                 Poll::Pending
             }
             Some(Err(kind)) => Poll::Ready(Err(io::Error::new(kind, "socket read error"))),
@@ -1102,24 +1123,26 @@ impl AsyncWrite for TcpDpdkStream {
         // Verify worker affinity
         self.assert_on_correct_worker();
 
-        // Wait for write readiness
-        match self.scheduled_io.poll_write_ready(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(()) => {}
-        }
-
         // Write to smoltcp socket via worker context
         let handle = self.handle;
+        let waker = cx.waker();
+
         let result = with_current_driver(|driver| {
             let socket = driver.get_tcp_socket_mut(handle);
 
+            // Register waker with smoltcp BEFORE checking state
+            // smoltcp will call wake() when socket becomes writable
+            socket.register_send_waker(waker);
+
             // Check if socket can send
             if !socket.can_send() {
-                if socket.state() == smoltcp::socket::tcp::State::Closed
-                    || socket.state() == smoltcp::socket::tcp::State::Closing
+                let state = socket.state();
+                if state == smoltcp::socket::tcp::State::Closed
+                    || state == smoltcp::socket::tcp::State::Closing
                 {
                     return Err(io::ErrorKind::BrokenPipe);
                 }
+                // Not ready yet - waker is registered, smoltcp will wake us
                 return Err(io::ErrorKind::WouldBlock);
             }
 
@@ -1133,9 +1156,7 @@ impl AsyncWrite for TcpDpdkStream {
         match result {
             Some(Ok(n)) => Poll::Ready(Ok(n)),
             Some(Err(io::ErrorKind::WouldBlock)) => {
-                // Not ready, clear readiness and re-register waker
-                self.scheduled_io.clear_write_ready();
-                let _ = self.scheduled_io.poll_write_ready(cx); // Re-register waker
+                // Not ready - waker already registered with smoltcp
                 Poll::Pending
             }
             Some(Err(kind)) => Poll::Ready(Err(io::Error::new(kind, "socket write error"))),

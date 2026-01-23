@@ -912,11 +912,8 @@ impl Context {
                 }
             }
 
-            // Maintenance every event_interval ticks
+            // Maintenance every event_interval ticks (includes defer.wake())
             self.maybe_maintenance();
-
-            // Wake deferred tasks
-            self.defer.wake();
         }
     }
 
@@ -995,13 +992,13 @@ impl Context {
             *lifo_polls = 0;
         }
 
-        // Check local overflow queue (lock-free, single-threaded access)
-        if let Some(task) = core.local_overflow.pop_front() {
+        // Check local run queue first (primary source)
+        if let Some(task) = core.run_queue.pop() {
             return Some(task);
         }
 
-        // Check local run queue
-        if let Some(task) = core.run_queue.pop() {
+        // Check local overflow queue (tasks pushed when run_queue was full)
+        if let Some(task) = core.local_overflow.pop_front() {
             return Some(task);
         }
 
@@ -1105,12 +1102,6 @@ impl Context {
             let core = self.core.borrow();
             if let Some(c) = core.as_ref() {
                 let ei = self.worker.handle.shared.config.event_interval;
-                // Log once to verify event_interval
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static LOGGED: AtomicBool = AtomicBool::new(false);
-                if !LOGGED.load(Ordering::Relaxed) {
-                    LOGGED.store(true, Ordering::Relaxed);
-                }
                 c.tick % ei == 0
             } else {
                 false
@@ -1123,10 +1114,6 @@ impl Context {
     }
 
     fn maintenance(&self) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static M_COUNT: AtomicU64 = AtomicU64::new(0);
-        let mc = M_COUNT.fetch_add(1, Ordering::Relaxed);
-        if mc % 10000 == 0 {}
         super::counters::inc_num_maintenance();
 
         // Tune global queue interval and submit metrics
@@ -1153,6 +1140,11 @@ impl Context {
 
         // Reset LIFO enabled state
         self.reset_lifo_enabled();
+
+        // Wake deferred tasks (yield_now) - only during maintenance to prevent starvation
+        // This matches original tokio behavior: defer.wake() is called in park_internal,
+        // which is triggered during maintenance (event_interval ticks).
+        self.defer.wake();
     }
 
     /// Replenish buffer pool if below low watermark.

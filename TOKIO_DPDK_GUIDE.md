@@ -88,6 +88,25 @@ struct DeviceConfig {
 
 > **注意**：配置文件中的 `version`、`platform`、`generated_at`、`eal_args` 字段會被忽略（用於人類閱讀或未來擴展）。EAL 參數應通過 Builder API 的 `dpdk_eal_args()` 方法指定。
 
+### smoltcp 環境變量（必須！）
+
+依賴 tokio-dpdk 的項目**必須**在項目根目錄創建 `.cargo/config.toml`，設置 smoltcp 的 IP 地址限制：
+
+```toml
+[env]
+# 允許 smoltcp 接口最多配置 128 個 IP 地址
+# 這是 AWS ENI 多 IP 配置所必需的
+SMOLTCP_IFACE_MAX_ADDR_COUNT = "128"
+
+[build]
+rustflags = ["-C", "target-cpu=native"]
+```
+
+> **警告**：如果缺少此配置，smoltcp 將使用默認限制（約 8 個 IP），導致多餘的 IP 地址添加失敗並產生大量警告：
+> ```
+> Warning: Failed to add IP address 172.31.1.42/24: ...
+> ```
+
 **JSON 範例**（完整範例見 `scripts/dpdk/templates/env.example.json`）：
 
 ```json
@@ -369,45 +388,104 @@ let result = tokio::task::spawn_blocking(|| {
 
 **重要：** `TcpDpdkStream` 有 worker 親和性 - 必須在建立它的同一個 worker 上使用。
 
----
 
 ## 測試
 
 ### 執行 DPDK 測試
 
-```bash
-# 執行所有 DPDK 測試（需要 root 和 DPDK 環境）
-sudo -i bash -c 'source ~/.cargo/env && cd /path/to/tokio-dpdk && ./run_dpdk_tests.sh'
+DPDK 測試使用 `#[serial_isolation_test]` 宏實現進程隔離，確保每個測試在獨立進程中執行，避免 EAL 重複初始化問題。
 
-# 執行特定測試
-sudo -i bash -c 'source ~/.cargo/env && cd /path/to/tokio-dpdk && \
-    DPDK_DEVICE="0000:28:00.0" cargo test --package tokio --test tcp_dpdk \
-    --features full -- api_parity::tcp_stream_read_write --exact --nocapture'
+**1. 設置環境變數**
+
+在 `.env` 文件中配置（此文件不應提交到 git）：
+```bash
+# .env
+DPDK_TEST_PORT=8192
+```
+
+**2. 運行所有測試**
+
+```bash
+source .env && export DPDK_TEST_PORT
+SERIAL_ISOLATION_SUDO=1 cargo test --features "full,test-util"
+```
+
+**3. 運行特定測試**
+
+```bash
+source .env && export DPDK_TEST_PORT
+SERIAL_ISOLATION_SUDO=1 cargo test --manifest-path tokio/Cargo.toml \
+    --test tcp_dpdk --features full -- api_parity::tcp_stream_read_write
+```
+
+### 編寫 DPDK 測試
+
+DPDK 測試有兩種模式：
+
+**模式 1：使用 `#[tokio::test(flavor = "dpdk")]` 宏**（推薦）
+
+> ⚠️ **宏順序很重要**：`#[tokio::test(flavor = "dpdk")]` **必須**在 `#[serial_isolation_test]` **之前**。Rust proc-macro 從上到下展開，順序錯誤會導致 EAL 初始化失敗。
+
+```rust
+// ✅ 正確順序
+#[tokio::test(flavor = "dpdk")]
+#[serial_isolation_test::serial_isolation_test]
+async fn my_dpdk_test() {
+    // 直接使用 async 代碼
+    let stream = TcpDpdkStream::connect("1.1.1.1:80").await.unwrap();
+}
+```
+
+**模式 2：手動創建 runtime**（⭐ **推薦：最穩定**）
+
+```rust
+#[tokio::test]
+#[serial_isolation_test::serial_isolation_test]
+fn my_dpdk_test() {
+    let rt = dpdk_rt();  // 從 support/dpdk_runtime.rs
+    rt.block_on(async {
+        // 測試代碼
+    });
+}
+```
+
+**重要**：
+- 所有 DPDK 測試**必須**使用 `#[serial_isolation_test]` 確保進程隔離
+- 不要使用 `#[should_panic]` — 使用 `std::panic::catch_unwind` 代替
+
+### Panic 測試模式
+
+由於 `#[should_panic]` 與子進程隔離不兼容，使用以下模式：
+
+```rust
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_expected_panic() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 預期會 panic 的代碼
+    }));
+    assert!(result.is_err(), "Expected panic but test passed");
+}
 ```
 
 ### 測試類別
 
 | 類別 | 說明 |
 |------|------|
-| `rt_common::dpdk_scheduler::*` | 核心 runtime 相容性測試 |
+| `dpdk_rt_common::*` | 核心 runtime 相容性測試 (45 個) |
 | `tcp_dpdk::*` | TCP/網路 API 相容性測試 |
 | `tcp_dpdk_real::*` | 真實網路連接測試 |
 | `time_sleep::dpdk_flavor::*` | 計時器功能測試 |
 | `cpu_affinity_tests::*` | CPU 核心綁定驗證 |
+| `dpdk_multi_process::*` | 多進程資源鎖定驗證 |
 
-### 跳過的測試
+### 環境變數
 
-以下測試因 DPDK 架構限制而被刻意跳過：
-
-**EAL 重複初始化：**
-- `create_rt_in_block_on` - 嵌套 runtime 建立
-- `runtime_in_thread_local` - thread_local 中的多個 runtime
-- `shutdown_concurrent_spawn` - 迴圈建立多個 runtime
-- `io_notify_while_shutting_down` - 迴圈建立多個 runtime
-
-**Park 語義：**
-- `yield_defers_until_park` - DPDK 使用 busy-poll（無 park 階段）
-- `coop_yield_defers_until_park` - DPDK 使用 busy-poll（無 park 階段）
+| 變數 | 說明 |
+|------|------|
+| `DPDK_TEST_PORT` | 測試用監聽端口（必須設置，建議 8192） |
+| `SERIAL_ISOLATION_SUDO` | 設為 `1` 允許測試自動提權到 root |
+| `DPDK_DEVICE` | 覆蓋預設 PCI 位址（可選） |
 
 ---
 
@@ -418,7 +496,7 @@ sudo -i bash -c 'source ~/.cargo/env && cd /path/to/tokio-dpdk && \
 DPDK 的 EAL **每個進程只能初始化一次**。這意味著：
 - 無法依序建立多個 DPDK runtime
 - 嵌套 runtime 建立會失敗
-- 測試必須在獨立進程中執行（由 `run_dpdk_tests.sh` 處理）
+- 測試必須在獨立進程中執行（由 `#[serial_isolation_test]` 宏自動處理）
 
 ### 2. Busy-Poll 語義
 
@@ -489,11 +567,11 @@ RUST_LOG=tokio::runtime::scheduler::dpdk=debug cargo test ...
 
 修改 DPDK 相關程式碼時：
 
-1. 執行 `./run_dpdk_tests.sh` 驗證所有測試通過
-2. 盡可能在真實硬體上測試
+1. 運行 `SERIAL_ISOLATION_SUDO=1 cargo test --features "full,test-util"` 驗證所有測試通過
+2. 在真實硬體上測試
 3. 記錄任何新的架構限制
 4. 為 API 變更更新此指南
 
 ---
 
-*最後更新：2026-01-11*
+*最後更新：2026-01-20*

@@ -42,6 +42,7 @@ use crate::loom::sync::Arc;
 use crate::runtime::scheduler;
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// DPDK scheduler top-level struct (similar to MultiThread)
 ///
@@ -61,6 +62,8 @@ pub(crate) struct Dpdk {
     /// Scheduler handle - contains Shared which holds DpdkDrivers/DpdkDevices
     /// and the DpdkResourcesCleaner for mempool/EAL cleanup.
     handle: Arc<Handle>,
+    /// Flag to detect concurrent block_on calls (not supported by DPDK scheduler)
+    block_on_in_progress: AtomicBool,
 }
 
 // Manual Debug implementation since IoThreadHandle is not Debug by default
@@ -196,6 +199,7 @@ impl Dpdk {
                 io_thread_handle: None,
                 resource_lock,
                 handle,
+                block_on_in_progress: AtomicBool::new(false),
             },
             launch,
         ))
@@ -327,6 +331,7 @@ impl Dpdk {
                 io_thread_handle: None,
                 resource_lock,
                 handle,
+                block_on_in_progress: AtomicBool::new(false),
             },
             launch,
         ))
@@ -372,6 +377,23 @@ impl Dpdk {
     /// });
     /// ```
     pub(crate) fn block_on<F: Future>(&self, handle: &scheduler::Handle, future: F) -> F::Output {
+        // Check for concurrent block_on calls - DPDK scheduler only supports single block_on
+        if self.block_on_in_progress.swap(true, Ordering::SeqCst) {
+            panic!(
+                "DPDK scheduler does not support concurrent block_on calls. \
+                 Only one thread may call block_on at a time."
+            );
+        }
+
+        // Ensure we clear the flag when we're done (even on panic)
+        struct ClearOnDrop<'a>(&'a AtomicBool);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = ClearOnDrop(&self.block_on_in_progress);
+
         // Get worker 0 for main thread
         let worker_0 = self
             .worker_0

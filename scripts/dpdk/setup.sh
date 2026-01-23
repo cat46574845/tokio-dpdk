@@ -512,6 +512,7 @@ After=network.target
 [Service]
 Type=oneshot
 ExecStart=$SCRIPT_DIR/setup.sh apply
+ExecStart=$SCRIPT_DIR/setup.sh dpdk-bind
 RemainAfterExit=yes
 
 [Install]
@@ -710,18 +711,95 @@ cmd_verify() {
     fi
     echo ""
     
-    # Kernel parameters
+    # Kernel parameters - compare against expected values from low-latency.conf
     echo -e "${BOLD}${ICON_CPU} Kernel Parameters${NC}"
     local cmdline=$(cat /proc/cmdline)
+    
+    # Load expected values from config if available
+    local ll_config="/etc/dpdk/low-latency.conf"
+    local expected_isolcpus=""
+    local expected_irqaffinity=""
+    
+    if [[ -f "$ll_config" ]]; then
+        source "$ll_config"
+        expected_isolcpus="$ISOLCPUS"
+        expected_irqaffinity="$IRQAFFINITY"
+    fi
     
     for param in isolcpus nohz_full rcu_nocbs irqaffinity; do
         if echo "$cmdline" | grep -q "$param="; then
             local val=$(echo "$cmdline" | grep -o "$param=[^ ]*" | cut -d= -f2)
-            echo -e "  ${ICON_OK}  ${param}: ${GREEN}${val}${NC}"
+            
+            # Determine expected value for comparison
+            local expected=""
+            case "$param" in
+                isolcpus|nohz_full|rcu_nocbs)
+                    expected="$expected_isolcpus"
+                    ;;
+                irqaffinity)
+                    expected="$expected_irqaffinity"
+                    ;;
+            esac
+            
+            # Compare and show appropriate status
+            if [[ -n "$expected" && "$val" != "$expected" ]]; then
+                echo -e "  ${ICON_FAIL}  ${param}: ${RED}${val}${NC} (expected: ${expected}, REBOOT REQUIRED)"
+            elif [[ -n "$expected" && "$val" == "$expected" ]]; then
+                echo -e "  ${ICON_OK}  ${param}: ${GREEN}${val}${NC}"
+            else
+                echo -e "  ${ICON_WARN}  ${param}: ${YELLOW}${val}${NC} (no expected value configured)"
+            fi
         else
-            echo -e "  ${ICON_WARN}  ${param}: ${YELLOW}not set${NC}"
+            if [[ -n "$expected_isolcpus" ]]; then
+                echo -e "  ${ICON_FAIL}  ${param}: ${RED}not set${NC} (expected: configured, REBOOT REQUIRED)"
+            else
+                echo -e "  ${ICON_WARN}  ${param}: ${YELLOW}not set${NC}"
+            fi
         fi
     done
+    echo ""
+    
+    # env.json validation
+    echo -e "${BOLD}${ICON_GEAR} DPDK Environment (env.json)${NC}"
+    local env_json="/etc/dpdk/env.json"
+    
+    if [[ ! -f "$env_json" ]]; then
+        echo -e "  ${ICON_FAIL}  ${RED}env.json not found!${NC}"
+        echo -e "      Run: ${CYAN}sudo ./setup.sh dpdk-bind${NC} or ${CYAN}sudo ./setup.sh refresh-config${NC}"
+    else
+        echo -e "  ${ICON_OK}  File: ${GREEN}$env_json${NC}"
+        
+        # Check dpdk_cores
+        if command -v jq &>/dev/null; then
+            local dpdk_cores=$(jq -r '.dpdk_cores // empty' "$env_json" 2>/dev/null)
+            if [[ -z "$dpdk_cores" || "$dpdk_cores" == "null" ]]; then
+                echo -e "  ${ICON_FAIL}  dpdk_cores: ${RED}missing!${NC} (required field)"
+                echo -e "      Run: ${CYAN}sudo ./setup.sh refresh-config${NC}"
+            else
+                local cores_list=$(jq -r '.dpdk_cores | @csv' "$env_json" 2>/dev/null | tr -d '"')
+                
+                # Compare with low-latency.conf
+                if [[ -n "$DPDK_CPUS" ]]; then
+                    # Convert DPDK_CPUS "1 3" to comparable format
+                    local expected_cores=$(echo "$DPDK_CPUS" | tr ' ' ',' )
+                    if [[ "$cores_list" == "$expected_cores" ]]; then
+                        echo -e "  ${ICON_OK}  dpdk_cores: ${GREEN}[$cores_list]${NC}"
+                    else
+                        echo -e "  ${ICON_FAIL}  dpdk_cores: ${RED}[$cores_list]${NC} (expected: [$expected_cores])"
+                        echo -e "      Run: ${CYAN}sudo ./setup.sh refresh-config${NC}"
+                    fi
+                else
+                    echo -e "  ${ICON_OK}  dpdk_cores: ${GREEN}[$cores_list]${NC}"
+                fi
+            fi
+            
+            # Check devices with role=dpdk count
+            local dpdk_devices=$(jq '[.devices[] | select(.role=="dpdk")] | length' "$env_json" 2>/dev/null)
+            echo -e "      DPDK devices: ${dpdk_devices:-0}"
+        else
+            echo -e "  ${ICON_WARN}  ${YELLOW}jq not installed, cannot validate contents${NC}"
+        fi
+    fi
     echo ""
     
     # Device bindings

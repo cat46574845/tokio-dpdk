@@ -3,4 +3,4 @@ Cargo.lock
 
 .cargo/config.toml
 .cargo/config
-dpdk-*/
+dpdk-*/.env

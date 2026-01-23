@@ -1,16 +1,15 @@
 //! DPDK Driver for smoltcp integration.
 //!
 //! This module provides:
-//! - `ScheduledIo`: Readiness tracking and waker management for DPDK sockets
 //! - `DpdkDriver`: Network stack driver managing DpdkDevice + smoltcp Interface + SocketSet
 //!
 //! The DpdkDriver is the central component that bridges DPDK packet I/O with
 //! the smoltcp TCP/IP stack, enabling async socket operations.
+//!
+//! Note: Waker management is handled by smoltcp's native waker mechanism
+//! (`register_recv_waker`/`register_send_waker`), not by a separate ScheduledIo.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::collections::HashSet;
 use std::time::Instant;
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
@@ -32,10 +31,6 @@ const TCP_TX_BUFFER_SIZE: usize = 65536;
 
 /// Default buffer pool size (number of connections)
 const DEFAULT_BUFFER_POOL_SIZE: usize = 256;
-
-/// Readiness flags
-const READABLE: usize = 1 << 0;
-const WRITABLE: usize = 1 << 1;
 
 // =============================================================================
 // TcpBufferPool - Pre-allocated buffer management
@@ -136,130 +131,6 @@ impl TcpBufferPool {
 }
 
 // =============================================================================
-// ScheduledIo - Readiness tracking for DPDK sockets
-// =============================================================================
-
-/// Waiters for read/write readiness.
-#[derive(Default)]
-pub(crate) struct Waiters {
-    /// Waker to notify when socket becomes readable
-    pub reader: Option<Waker>,
-    /// Waker to notify when socket becomes writable
-    pub writer: Option<Waker>,
-}
-
-/// Tracks readiness state and pending wakers for a DPDK-backed socket.
-///
-/// This is analogous to tokio's ScheduledIo but simplified for smoltcp sockets.
-/// Each TcpDpdkStream holds an Arc<ScheduledIo>.
-pub(crate) struct ScheduledIo {
-    /// Current readiness flags (READABLE | WRITABLE)
-    readiness: AtomicUsize,
-    /// Pending wakers
-    waiters: Mutex<Waiters>,
-}
-
-impl ScheduledIo {
-    /// Create a new ScheduledIo with no readiness.
-    pub(crate) fn new() -> Self {
-        Self {
-            readiness: AtomicUsize::new(0),
-            waiters: Mutex::new(Waiters::default()),
-        }
-    }
-
-    /// Set readiness flags and wake appropriate waiters.
-    pub(crate) fn set_readiness(&self, ready: usize) {
-        let old = self.readiness.fetch_or(ready, Ordering::AcqRel);
-        let new_bits = ready & !old;
-
-        if new_bits != 0 {
-            self.wake(new_bits);
-        }
-    }
-
-    /// Wake waiters based on readiness flags.
-    ///
-    /// Uses clone instead of take to keep waker available for subsequent wakes.
-    pub(crate) fn wake(&self, ready: usize) {
-        let waiters = self.waiters.lock().unwrap();
-
-        if ready & READABLE != 0 {
-            if let Some(waker) = &waiters.reader {
-                waker.wake_by_ref();
-            }
-        }
-
-        if ready & WRITABLE != 0 {
-            if let Some(waker) = &waiters.writer {
-                waker.wake_by_ref();
-            }
-        }
-    }
-
-    /// Poll for read readiness.
-    ///
-    /// ALWAYS registers waker before returning, even if already ready.
-    /// This ensures the driver can wake the task when readiness changes.
-    pub(crate) fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
-        // ALWAYS register waker first - this is critical!
-        // Even if we're already ready, we need the waker for future wakeups
-        // after the caller clears readiness.
-        {
-            let mut waiters = self.waiters.lock().unwrap();
-            waiters.reader = Some(cx.waker().clone());
-        }
-
-        let ready = self.readiness.load(Ordering::Acquire);
-        if ready & READABLE != 0 {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-
-    /// Poll for write readiness.
-    ///
-    /// ALWAYS registers waker before returning, even if already ready.
-    /// This ensures the driver can wake the task when readiness changes.
-    pub(crate) fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
-        // ALWAYS register waker first - this is critical!
-        {
-            let mut waiters = self.waiters.lock().unwrap();
-            waiters.writer = Some(cx.waker().clone());
-        }
-
-        let ready = self.readiness.load(Ordering::Acquire);
-        if ready & WRITABLE != 0 {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-
-    /// Clear readiness flags.
-    pub(crate) fn clear_readiness(&self, flags: usize) {
-        self.readiness.fetch_and(!flags, Ordering::AcqRel);
-    }
-
-    /// Clear read readiness.
-    pub(crate) fn clear_read_ready(&self) {
-        self.clear_readiness(READABLE);
-    }
-
-    /// Clear write readiness.
-    pub(crate) fn clear_write_ready(&self) {
-        self.clear_readiness(WRITABLE);
-    }
-}
-
-impl Default for ScheduledIo {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// =============================================================================
 // DpdkDriver - Network stack driver
 // =============================================================================
 
@@ -269,10 +140,9 @@ impl Default for ScheduledIo {
 /// - `DpdkDevice`: DPDK packet I/O
 /// - `smoltcp::Interface`: IP layer processing
 /// - `smoltcp::SocketSet`: TCP/UDP sockets
-/// - Socket-to-ScheduledIo mapping for async wakeups
 ///
-/// The driver is polled in the worker event loop to process packets and
-/// update socket readiness states.
+/// Waker management is handled by smoltcp's native `register_recv_waker`/`register_send_waker`.
+/// The driver is polled in the worker event loop to process packets.
 pub(crate) struct DpdkDriver {
     /// DPDK device for packet I/O
     device: DpdkDevice,
@@ -282,9 +152,8 @@ pub(crate) struct DpdkDriver {
     sockets: SocketSet<'static>,
     /// Start time for timestamp calculation
     start_time: Instant,
-    /// Mapping from socket handle to (ScheduledIo, is_listen_socket)
-    /// is_listen_socket: true for sockets that were created via listen() (server side)
-    registered_sockets: HashMap<SocketHandle, (Arc<ScheduledIo>, bool)>,
+    /// Set of registered socket handles (for has_registered_sockets check)
+    registered_sockets: HashSet<SocketHandle>,
     /// Pre-allocated buffer pool for TCP sockets (zero-allocation at runtime)
     buffer_pool: TcpBufferPool,
     /// Set of bound ports to track address-in-use (since smoltcp doesn't expose this)
@@ -310,12 +179,6 @@ impl DpdkDriver {
         let start_time = Instant::now();
         let now = SmolInstant::from_millis(0);
 
-        // Log the MAC address being configured
-        eprintln!(
-            "[DpdkDriver] Configuring interface with MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-        );
-
         // Create smoltcp interface config
         let config = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
 
@@ -325,13 +188,6 @@ impl DpdkDriver {
         // Configure all IP addresses (IPv4 and IPv6)
         // Note: smoltcp limit is configured via SMOLTCP_IFACE_MAX_ADDR_COUNT in .cargo/config.toml
         const MAX_IP_ADDRS: usize = 128;
-        eprintln!(
-            "[DpdkDriver] Configuring {} IP address(es)",
-            addresses.len()
-        );
-        for addr in &addresses {
-            eprintln!("[DpdkDriver]   - {}", addr);
-        }
         iface.update_ip_addrs(|addrs| {
             for (i, addr) in addresses.iter().enumerate() {
                 if i >= MAX_IP_ADDRS {
@@ -350,7 +206,6 @@ impl DpdkDriver {
 
         // Configure IPv4 default gateway
         if let Some(gw) = gateway_v4 {
-            eprintln!("[DpdkDriver] IPv4 gateway: {}", gw);
             iface
                 .routes_mut()
                 .add_default_ipv4_route(gw)
@@ -359,7 +214,6 @@ impl DpdkDriver {
 
         // Configure IPv6 default gateway
         if let Some(gw) = gateway_v6 {
-            eprintln!("[DpdkDriver] IPv6 gateway: {}", gw);
             iface
                 .routes_mut()
                 .add_default_ipv6_route(gw)
@@ -374,7 +228,7 @@ impl DpdkDriver {
             iface,
             sockets,
             start_time,
-            registered_sockets: HashMap::new(),
+            registered_sockets: HashSet::new(),
             buffer_pool: TcpBufferPool::with_defaults(),
             bound_ports: HashSet::new(),
         }
@@ -385,7 +239,7 @@ impl DpdkDriver {
     /// This should be called in the worker event loop. It:
     /// 1. Flushes pending TX packets
     /// 2. Processes incoming packets through smoltcp
-    /// 3. Updates socket readiness and wakes async tasks
+    /// 3. smoltcp internally wakes registered wakers on socket state changes
     ///
     /// Returns `true` if there was network activity.
     pub(crate) fn poll(&mut self, now: Instant) -> bool {
@@ -396,6 +250,10 @@ impl DpdkDriver {
         self.device.flush_tx();
 
         // Poll smoltcp (processes RX, generates TX)
+        // smoltcp will automatically call wake() on registered wakers when:
+        // - rx_buffer has new data (register_recv_waker)
+        // - tx_buffer has new space (register_send_waker)
+        // - connection state changes (both wakers)
         let result = self
             .iface
             .poll(smol_now, &mut self.device, &mut self.sockets);
@@ -403,49 +261,10 @@ impl DpdkDriver {
         // Flush any new TX packets (e.g., ACKs, SYN-ACK)
         self.device.flush_tx();
 
-        // Dispatch wakers based on socket state changes
-        self.dispatch_wakers();
+        // Note: dispatch_wakers() is no longer needed!
+        // smoltcp's native waker mechanism handles wakeups internally.
 
         result
-    }
-
-    /// Update readiness state for all registered sockets and wake waiters.
-    pub(crate) fn dispatch_wakers(&mut self) {
-        for (handle, (scheduled_io, is_listen_socket)) in &self.registered_sockets {
-            let socket = self.sockets.get::<TcpSocket<'_>>(*handle);
-
-            let mut ready = 0;
-
-            // Check if socket can receive data
-            if socket.can_recv() {
-                ready |= READABLE;
-            }
-
-            // Check if socket can send data
-            if socket.can_send() {
-                ready |= WRITABLE;
-            }
-
-            // For LISTEN sockets (server-side), also check if connection is established.
-            // In smoltcp's model, a listen socket directly transitions to Established
-            // when a client connects. We need to wake accept() waiters even if there's
-            // no application data yet (can_recv() is false).
-            //
-            // For CONNECT sockets (client-side), we should NOT set READABLE just
-            // because the socket is Established - that would cause false positives
-            // where readable() returns but try_read() gets WouldBlock.
-            if *is_listen_socket {
-                if socket.is_active() && socket.state() == smoltcp::socket::tcp::State::Established
-                {
-                    ready |= READABLE; // Wake accept() waiters
-                }
-            }
-
-            // Update readiness and wake waiters
-            if ready != 0 {
-                scheduled_io.set_readiness(ready);
-            }
-        }
     }
 
     /// Create a new TCP socket using pre-allocated buffers from the pool.
@@ -467,26 +286,20 @@ impl DpdkDriver {
         Some(self.sockets.add(socket))
     }
 
-    /// Register a connect socket for async readiness tracking.
+    /// Register a connect socket for tracking.
     ///
-    /// Returns the ScheduledIo for this socket.
-    /// Use this for client-side sockets created via connect().
-    pub(crate) fn register_socket(&mut self, handle: SocketHandle) -> Arc<ScheduledIo> {
-        let scheduled_io = Arc::new(ScheduledIo::new());
-        self.registered_sockets
-            .insert(handle, (scheduled_io.clone(), false));
-        scheduled_io
+    /// This adds the socket handle to the registered set so has_registered_sockets() works.
+    /// Waker management is now handled by smoltcp's native mechanism.
+    pub(crate) fn register_socket(&mut self, handle: SocketHandle) {
+        self.registered_sockets.insert(handle);
     }
 
-    /// Register a listen socket for async readiness tracking.
+    /// Register a listen socket for tracking.
     ///
-    /// Returns the ScheduledIo for this socket.
-    /// Use this for server-side sockets created via listen().
-    pub(crate) fn register_listen_socket(&mut self, handle: SocketHandle) -> Arc<ScheduledIo> {
-        let scheduled_io = Arc::new(ScheduledIo::new());
-        self.registered_sockets
-            .insert(handle, (scheduled_io.clone(), true));
-        scheduled_io
+    /// This adds the socket handle to the registered set so has_registered_sockets() works.
+    /// Waker management is now handled by smoltcp's native mechanism.
+    pub(crate) fn register_listen_socket(&mut self, handle: SocketHandle) {
+        self.registered_sockets.insert(handle);
     }
 
     /// Unregister a socket from readiness tracking.

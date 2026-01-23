@@ -102,7 +102,7 @@ parking_lot = { version = "0.12.0", optional = true }
 
 # DPDK scheduler dependencies (always enabled)
 # Note: SMOLTCP_IFACE_MAX_ADDR_COUNT=128 is set in .cargo/config.toml
-smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "log"] }
+smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "log", "async"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -155,8 +155,11 @@ mockall = "0.13.0"
 async-stream = "0.3"
 futures-concurrency = "7.6.3"
 serde_json = "1.0"
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+futures-util = "0.3"
 env_logger = "0.11"
 rusty-fork = "0.3"
+serial_isolation_test = { path = "../../serial_isolation_test" }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 socket2 = "0.6.0"

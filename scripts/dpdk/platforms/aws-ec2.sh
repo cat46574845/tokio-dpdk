@@ -75,18 +75,39 @@ generate_config() {
     echo "    \"instance_type\": \"$instance_type\""
     echo "  },"
     
-    # Generate dpdk_cores array based on available CPUs
-    # Reserve CPU 0 for kernel, use remaining cores for DPDK
-    local num_cpus=$(nproc --all)
+    # Generate dpdk_cores array from low-latency.conf if available
+    # Otherwise fallback to all cores except 0
+    local ll_config="/etc/dpdk/low-latency.conf"
+    local dpdk_cpus=""
+    
+    if [[ -f "$ll_config" ]]; then
+        source "$ll_config"
+        dpdk_cpus="$DPDK_CPUS"
+    fi
+    
     echo "  \"dpdk_cores\": ["
     local cores_first=true
-    for ((i=1; i<num_cpus; i++)); do
-        if [[ "$cores_first" != "true" ]]; then
-            echo ","
-        fi
-        cores_first=false
-        echo -n "    $i"
-    done
+    
+    if [[ -n "$dpdk_cpus" ]]; then
+        # Use configured DPDK CPUs from low-latency.conf
+        for cpu in $dpdk_cpus; do
+            if [[ "$cores_first" != "true" ]]; then
+                echo ","
+            fi
+            cores_first=false
+            echo -n "    $cpu"
+        done
+    else
+        # Fallback: use all cores except 0
+        local num_cpus=$(nproc --all)
+        for ((i=1; i<num_cpus; i++)); do
+            if [[ "$cores_first" != "true" ]]; then
+                echo ","
+            fi
+            cores_first=false
+            echo -n "    $i"
+        done
+    fi
     echo ""
     echo "  ],"
     

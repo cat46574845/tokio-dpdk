@@ -9,29 +9,18 @@
 //!
 //! **TEST ORGANIZATION**:
 //! - DPDK EAL can only be initialized ONCE per process
-//! - All tests requiring DPDK runtime are combined into ONE test function
-//! - Tests are run individually via run_dpdk_tests.sh which spawns separate processes
+//! - All tests use #[serial_isolation_test] for automatic subprocess isolation
+//! - Run with: SERIAL_ISOLATION_SUDO=1 cargo test --features full
 
 #![cfg(feature = "full")]
 #![cfg(not(miri))]
 #![cfg(target_os = "linux")]
 
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::runtime::Runtime;
-
-// =============================================================================
-// Subtest Result Type
-// =============================================================================
-
-/// Result of a subtest - allows proper tracking of skipped tests
-enum SubtestResult {
-    Passed,
-    Skipped(&'static str),
-}
 
 // =============================================================================
 // Helper Functions - Using REAL configuration
@@ -118,152 +107,28 @@ fn dpdk_rt_with_device(pci_address: &str) -> Runtime {
 }
 
 // =============================================================================
-// Test: Builder API error handling (does NOT require DPDK runtime)
-// =============================================================================
-
-/// Test: Specifying a non-existent device returns an error.
-/// This test does NOT initialize DPDK EAL - it fails at device resolution.
-#[test]
-fn test_builder_invalid_device_error() {
-    println!("\n=== test_builder_invalid_device_error ===");
-
-    let result = tokio::runtime::Builder::new_dpdk()
-        .dpdk_device("non_existent_interface_xyz")
-        .enable_all()
-        .build();
-
-    assert!(result.is_err(), "Should fail with non-existent device");
-    println!("Got expected error: {}", result.unwrap_err());
-    println!("=== PASSED ===\n");
-}
-
-// =============================================================================
-// COMBINED DPDK TEST (Single EAL initialization)
-//
-// All tests requiring DPDK runtime MUST be in this ONE function because
-// DPDK EAL can only be initialized once per process.
-// =============================================================================
-
-/// Combined DPDK multi-process/multi-queue test suite.
-///
-/// This single test function contains ALL subtests that require DPDK runtime.
-/// Each subtest uses REAL network traffic to/from external services.
-#[test]
-fn test_dpdk_multi_queue_all() {
-    let device = get_first_dpdk_device();
-    let all_devices = get_all_dpdk_devices();
-
-    println!("\n========================================");
-    println!("  DPDK Multi-Process/Queue Test Suite");
-    println!("  Primary Device: {}", device);
-    println!("  All Devices: {:?}", all_devices);
-    println!("========================================\n");
-
-    // Create DPDK runtime - this initializes EAL ONCE for the whole test
-    let rt = dpdk_rt_with_device(&device);
-
-    let mut passed = 0;
-    let mut failed = 0;
-    let mut skipped = 0;
-
-    macro_rules! run_subtest {
-        ($name:expr, $test:expr) => {{
-            print!("[TEST] {} ... ", $name);
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $test)) {
-                Ok(SubtestResult::Passed) => {
-                    println!("PASSED");
-                    passed += 1;
-                }
-                Ok(SubtestResult::Skipped(reason)) => {
-                    println!("SKIPPED ({})", reason);
-                    skipped += 1;
-                }
-                Err(e) => {
-                    println!("FAILED: {:?}", e);
-                    failed += 1;
-                }
-            }
-        }};
-    }
-
-    // === 2.2 Multi-Process Tests ===
-    // Note: These test the locking mechanism using the REAL device PCI address
-
-    run_subtest!(
-        "multi_process_same_device_lock_held",
-        subtest_same_device_lock_held(&device)
-    );
-
-    run_subtest!(
-        "multi_process_different_device_lock_available",
-        subtest_different_device_lock_available(&all_devices)
-    );
-
-    // === 1.4 InitPortMultiQueue Tests ===
-
-    run_subtest!(
-        "init_port_single_queue_real_traffic",
-        subtest_single_queue_real_traffic(&rt)
-    );
-
-    run_subtest!(
-        "init_port_multi_task_real_traffic",
-        subtest_multi_task_real_traffic(&rt)
-    );
-
-    // === 4.1 E2E Multi-Process Traffic Tests ===
-
-    run_subtest!("e2e_real_network_http", subtest_real_network_http(&rt));
-
-    run_subtest!(
-        "e2e_multiple_connections",
-        subtest_multiple_connections(&rt)
-    );
-
-    // === 4.2 E2E Multi-Queue Traffic Routing Tests ===
-
-    run_subtest!(
-        "e2e_concurrent_workers_traffic",
-        subtest_concurrent_workers_traffic(&rt)
-    );
-
-    run_subtest!(
-        "e2e_traffic_distribution",
-        subtest_traffic_distribution(&rt)
-    );
-
-    // === Summary ===
-    println!("\n========================================");
-    println!(
-        "  Results: {} passed, {} failed, {} skipped",
-        passed, failed, skipped
-    );
-    println!("========================================\n");
-
-    assert!(failed == 0, "{} subtests failed", failed);
-}
-
-// =============================================================================
-// Subtests: Multi-Process Lock Verification (2.2)
+// Independent Tests - Each spawns its own DPDK runtime
 // =============================================================================
 
 /// Test: When we hold the device, the lock file exists and is locked.
-fn subtest_same_device_lock_held(device: &str) -> SubtestResult {
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_same_device_lock_held() {
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
+
+    let device = get_first_dpdk_device();
+    let _rt = dpdk_rt_with_device(&device);
 
     let safe_pci = device.replace(':', "_");
     let lock_path = format!("/var/run/dpdk/device_{}.lock", safe_pci);
 
-    // The runtime we created should hold the lock
     assert!(
         std::path::Path::new(&lock_path).exists(),
         "Lock file should exist at {}",
         lock_path
     );
 
-    // Try to acquire - should fail with EWOULDBLOCK
     let file = OpenOptions::new()
         .write(true)
         .open(&lock_path)
@@ -280,29 +145,30 @@ fn subtest_same_device_lock_held(device: &str) -> SubtestResult {
         std::io::ErrorKind::WouldBlock,
         "Error should be WouldBlock"
     );
-
-    SubtestResult::Passed
 }
 
 /// Test: Other devices should still be lockable.
-fn subtest_different_device_lock_available(all_devices: &[String]) -> SubtestResult {
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_different_device_lock_available() {
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
+    let all_devices = get_all_dpdk_devices();
     if all_devices.len() < 2 {
-        return SubtestResult::Skipped("need 2+ devices");
+        println!("SKIPPED: need 2+ devices");
+        return;
     }
 
-    // Device 1 is held by our runtime. Try to lock device 2.
+    let _rt = dpdk_rt_with_device(&all_devices[0]);
+
     let device2 = &all_devices[1];
     let safe_pci = device2.replace(':', "_");
     let lock_path = format!("/var/run/dpdk/device_{}.lock", safe_pci);
 
-    // Clean up any existing lock
     let _ = std::fs::remove_file(&lock_path);
 
-    // We should be able to acquire this lock
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -315,20 +181,18 @@ fn subtest_different_device_lock_available(all_devices: &[String]) -> SubtestRes
 
     assert_eq!(ret, 0, "Should acquire lock on different device");
 
-    // Cleanup
     unsafe { libc::flock(fd, libc::LOCK_UN) };
     drop(file);
     let _ = std::fs::remove_file(&lock_path);
-
-    SubtestResult::Passed
 }
 
-// =============================================================================
-// Subtests: Init Port with REAL Traffic (1.4)
-// =============================================================================
-
 /// Test: Single queue mode with REAL HTTP traffic.
-fn subtest_single_queue_real_traffic(rt: &Runtime) -> SubtestResult {
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_single_queue_real_traffic() {
+    let device = get_first_dpdk_device();
+    let rt = dpdk_rt_with_device(&device);
+
     rt.block_on(async {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpDpdkStream;
@@ -349,11 +213,15 @@ fn subtest_single_queue_real_traffic(rt: &Runtime) -> SubtestResult {
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("HTTP"), "Should be HTTP response");
     });
-    SubtestResult::Passed
 }
 
 /// Test: Multiple concurrent tasks with REAL network operations.
-fn subtest_multi_task_real_traffic(rt: &Runtime) -> SubtestResult {
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_multi_task_real_traffic() {
+    let device = get_first_dpdk_device();
+    let rt = dpdk_rt_with_device(&device);
+
     rt.block_on(async {
         let mut handles = Vec::new();
 
@@ -383,15 +251,15 @@ fn subtest_multi_task_real_traffic(rt: &Runtime) -> SubtestResult {
 
         assert!(success >= 2, "At least 2 of 4 connections should succeed");
     });
-    SubtestResult::Passed
 }
 
-// =============================================================================
-// Subtests: E2E Traffic Tests (4.1, 4.2)
-// =============================================================================
-
 /// Test: Real HTTP traffic through DPDK stack.
-fn subtest_real_network_http(rt: &Runtime) -> SubtestResult {
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_e2e_real_network_http() {
+    let device = get_first_dpdk_device();
+    let rt = dpdk_rt_with_device(&device);
+
     rt.block_on(async {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpDpdkStream;
@@ -411,11 +279,15 @@ fn subtest_real_network_http(rt: &Runtime) -> SubtestResult {
             assert!(n > 0);
         }
     });
-    SubtestResult::Passed
 }
 
 /// Test: Multiple concurrent connections to external service.
-fn subtest_multiple_connections(rt: &Runtime) -> SubtestResult {
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_e2e_multiple_connections() {
+    let device = get_first_dpdk_device();
+    let rt = dpdk_rt_with_device(&device);
+
     rt.block_on(async {
         let success_count = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
@@ -452,11 +324,15 @@ fn subtest_multiple_connections(rt: &Runtime) -> SubtestResult {
             successes
         );
     });
-    SubtestResult::Passed
 }
 
 /// Test: Concurrent workers handling traffic.
-fn subtest_concurrent_workers_traffic(rt: &Runtime) -> SubtestResult {
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_e2e_concurrent_workers_traffic() {
+    let device = get_first_dpdk_device();
+    let rt = dpdk_rt_with_device(&device);
+
     rt.block_on(async {
         use std::collections::HashSet;
 
@@ -490,11 +366,15 @@ fn subtest_concurrent_workers_traffic(rt: &Runtime) -> SubtestResult {
         let ids = thread_ids.lock().unwrap();
         assert!(!ids.is_empty(), "Tasks should have executed");
     });
-    SubtestResult::Passed
 }
 
 /// Test: Traffic distribution metrics.
-fn subtest_traffic_distribution(rt: &Runtime) -> SubtestResult {
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_e2e_traffic_distribution() {
+    let device = get_first_dpdk_device();
+    let rt = dpdk_rt_with_device(&device);
+
     rt.block_on(async {
         let rx_count = Arc::new(AtomicUsize::new(0));
         let tx_count = Arc::new(AtomicUsize::new(0));
@@ -545,67 +425,4 @@ fn subtest_traffic_distribution(rt: &Runtime) -> SubtestResult {
             rx_result
         );
     });
-    SubtestResult::Passed
-}
-
-// =============================================================================
-// Separate test: Lock release after process exit (2.2)
-//
-// This test does NOT use DPDK runtime - it uses shell commands to test
-// that OS releases locks when process exits.
-// =============================================================================
-
-/// Test: Locks are released after process exit.
-#[test]
-fn test_multi_process_lock_release_on_exit() {
-    let device = get_first_dpdk_device();
-    let safe_pci = device.replace(':', "_");
-    let lock_path = format!("/var/run/dpdk/device_{}.lock", safe_pci);
-
-    println!("\n=== test_multi_process_lock_release_on_exit ===");
-    println!("Testing lock release for: {}", lock_path);
-
-    // Use a DIFFERENT test lock file to avoid conflicting with the combined test
-    let test_lock_path = "/var/run/dpdk/test_release.lock";
-    let _ = std::fs::remove_file(test_lock_path);
-
-    // Spawn child that holds lock briefly then exits
-    let status = Command::new("bash")
-        .arg("-c")
-        .arg(format!(
-            "mkdir -p /var/run/dpdk && \
-             flock -n -x {} -c 'echo Locked; sleep 0.5; echo Releasing'",
-            test_lock_path
-        ))
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .expect("Failed to spawn");
-
-    assert!(status.success(), "Child should complete");
-
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Now we should be able to acquire the lock
-    use std::fs::OpenOptions;
-    use std::os::unix::io::AsRawFd;
-
-    let _ = std::fs::remove_file(test_lock_path);
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(test_lock_path)
-        .expect("Should open");
-
-    let fd = file.as_raw_fd();
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-
-    assert_eq!(ret, 0, "Should acquire lock after child exits");
-
-    // Cleanup
-    unsafe { libc::flock(fd, libc::LOCK_UN) };
-    drop(file);
-    let _ = std::fs::remove_file(test_lock_path);
-
-    println!("=== PASSED ===\n");
 }

@@ -280,199 +280,6 @@ impl ClientResult {
 }
 
 // =============================================================================
-// Subtest Result
-// =============================================================================
-
-#[derive(Debug)]
-enum SubtestResult {
-    Passed,
-    Failed(String),
-}
-
-// =============================================================================
-// Main Combined Test
-// =============================================================================
-
-/// Combined test that verifies worker data isolation.
-///
-/// Each client sends messages containing its unique ID, and verifies that
-/// it receives back only its own messages, not messages from other clients.
-///
-/// This test contains multiple subtests that run sequentially with the same
-/// DPDK runtime (since EAL can only be initialized once per process).
-#[test]
-fn test_dpdk_worker_data_isolation() {
-    println!("\n========================================");
-    println!("  DPDK Worker Data Isolation Test Suite");
-    println!("========================================\n");
-
-    // Start echo server in a separate thread
-    println!("[SERVER] Starting echo server...");
-    let (server_addr, shutdown, server_handle) = start_echo_server();
-    println!("[SERVER] Listening on {}", server_addr);
-
-    // Give server a moment to be ready
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Create DPDK runtime (ONCE for all subtests)
-    println!("[DPDK] Creating DPDK runtime...");
-    let rt = dpdk_rt();
-
-    let mut passed = 0;
-    let mut failed = 0;
-
-    // Subtest 1: Basic isolation test (20 clients × 10 messages)
-    print!("[TEST] Basic Isolation (20 clients × 10 msgs) ... ");
-    match run_basic_isolation_test(&rt, server_addr) {
-        SubtestResult::Passed => {
-            println!("PASSED");
-            passed += 1;
-        }
-        SubtestResult::Failed(msg) => {
-            println!("FAILED: {}", msg);
-            failed += 1;
-        }
-    }
-
-    // Subtest 2: High contention test (50 clients × 5 messages)
-    print!("[TEST] High Contention (50 clients × 5 msgs) ... ");
-    match run_high_contention_test(&rt, server_addr) {
-        SubtestResult::Passed => {
-            println!("PASSED");
-            passed += 1;
-        }
-        SubtestResult::Failed(msg) => {
-            println!("FAILED: {}", msg);
-            failed += 1;
-        }
-    }
-
-    // Subtest 3: Rapid reconnect test (10 clients, each reconnects 5 times)
-    print!("[TEST] Rapid Reconnect (10 clients × 5 reconnects) ... ");
-    match run_rapid_reconnect_test(&rt, server_addr) {
-        SubtestResult::Passed => {
-            println!("PASSED");
-            passed += 1;
-        }
-        SubtestResult::Failed(msg) => {
-            println!("FAILED: {}", msg);
-            failed += 1;
-        }
-    }
-
-    // Shutdown server
-    shutdown.store(true, Ordering::Relaxed);
-    let _ = server_handle.join();
-
-    // Summary
-    println!("\n========================================");
-    println!("  Results: {} passed, {} failed", passed, failed);
-    println!("========================================\n");
-
-    assert_eq!(failed, 0, "{} subtests failed", failed);
-}
-
-// =============================================================================
-// Subtest Implementations
-// =============================================================================
-
-fn run_basic_isolation_test(rt: &Runtime, server_addr: SocketAddr) -> SubtestResult {
-    const NUM_CLIENTS: usize = 20;
-    const MESSAGES_PER_CLIENT: usize = 10;
-
-    let results = rt.block_on(async {
-        run_isolation_test(server_addr, NUM_CLIENTS, MESSAGES_PER_CLIENT).await
-    });
-
-    let total_wrong: usize = results.iter().map(|r| r.wrong_responses).sum();
-    let total_correct: usize = results.iter().map(|r| r.correct_responses).sum();
-    let expected = NUM_CLIENTS * MESSAGES_PER_CLIENT;
-
-    if total_wrong > 0 {
-        SubtestResult::Failed(format!("{} messages received by wrong client", total_wrong))
-    } else if total_correct < expected * 8 / 10 {
-        SubtestResult::Failed(format!(
-            "only {}/{} correct responses",
-            total_correct, expected
-        ))
-    } else {
-        SubtestResult::Passed
-    }
-}
-
-fn run_high_contention_test(rt: &Runtime, server_addr: SocketAddr) -> SubtestResult {
-    const NUM_CLIENTS: usize = 50;
-    const MESSAGES_PER_CLIENT: usize = 5;
-
-    let results = rt.block_on(async {
-        run_isolation_test(server_addr, NUM_CLIENTS, MESSAGES_PER_CLIENT).await
-    });
-
-    let total_wrong: usize = results.iter().map(|r| r.wrong_responses).sum();
-    let total_correct: usize = results.iter().map(|r| r.correct_responses).sum();
-    let expected = NUM_CLIENTS * MESSAGES_PER_CLIENT;
-
-    if total_wrong > 0 {
-        SubtestResult::Failed(format!("{} messages received by wrong client", total_wrong))
-    } else if total_correct < expected * 7 / 10 {
-        SubtestResult::Failed(format!(
-            "only {}/{} correct responses",
-            total_correct, expected
-        ))
-    } else {
-        SubtestResult::Passed
-    }
-}
-
-fn run_rapid_reconnect_test(rt: &Runtime, server_addr: SocketAddr) -> SubtestResult {
-    const NUM_CLIENTS: usize = 10;
-    const RECONNECTS_PER_CLIENT: usize = 5;
-    const MESSAGES_PER_CONNECTION: usize = 3;
-
-    let results = rt.block_on(async {
-        let results = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let mut handles = Vec::new();
-
-        for client_id in 0..NUM_CLIENTS {
-            let results = results.clone();
-            let handle = tokio::spawn(async move {
-                for reconnect in 0..RECONNECTS_PER_CLIENT {
-                    let unique_id = client_id * 1000 + reconnect;
-                    let result =
-                        run_client_n_messages(unique_id, server_addr, MESSAGES_PER_CONNECTION)
-                            .await;
-                    results.lock().await.push(result);
-                }
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            let _ = tokio::time::timeout(Duration::from_secs(60), handle).await;
-        }
-
-        Arc::try_unwrap(results)
-            .expect("Arc still has references")
-            .into_inner()
-    });
-
-    let total_wrong: usize = results.iter().map(|r| r.wrong_responses).sum();
-    let total_correct: usize = results.iter().map(|r| r.correct_responses).sum();
-    let expected = NUM_CLIENTS * RECONNECTS_PER_CLIENT * MESSAGES_PER_CONNECTION;
-
-    if total_wrong > 0 {
-        SubtestResult::Failed(format!("{} messages received by wrong client", total_wrong))
-    } else if total_correct < expected * 7 / 10 {
-        SubtestResult::Failed(format!(
-            "only {}/{} correct responses",
-            total_correct, expected
-        ))
-    } else {
-        SubtestResult::Passed
-    }
-}
-
-// =============================================================================
 // Test Helpers
 // =============================================================================
 
@@ -695,4 +502,137 @@ fn rand_u64() -> u64 {
     let tid = std::thread::current().id();
     let tid_hash = format!("{:?}", tid).len() as u64;
     ((nanos as u64) ^ (tid_hash << 32)).wrapping_mul(0x517cc1b727220a95)
+}
+
+// =============================================================================
+// Independent Tests (Each spawns its own echo server and DPDK runtime)
+// =============================================================================
+
+/// Test basic isolation: 20 clients × 10 messages
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_basic_isolation() {
+    const NUM_CLIENTS: usize = 20;
+    const MESSAGES_PER_CLIENT: usize = 10;
+
+    let (server_addr, shutdown, server_handle) = start_echo_server();
+    std::thread::sleep(Duration::from_millis(100));
+    let rt = dpdk_rt();
+
+    let results = rt.block_on(async {
+        run_isolation_test(server_addr, NUM_CLIENTS, MESSAGES_PER_CLIENT).await
+    });
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    let total_wrong: usize = results.iter().map(|r| r.wrong_responses).sum();
+    let total_correct: usize = results.iter().map(|r| r.correct_responses).sum();
+    let expected = NUM_CLIENTS * MESSAGES_PER_CLIENT;
+
+    assert_eq!(
+        total_wrong, 0,
+        "{} messages received by wrong client",
+        total_wrong
+    );
+    assert!(
+        total_correct >= expected * 8 / 10,
+        "only {}/{} correct responses",
+        total_correct,
+        expected
+    );
+}
+
+/// Test high contention: 50 clients × 5 messages
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_high_contention_isolation() {
+    const NUM_CLIENTS: usize = 50;
+    const MESSAGES_PER_CLIENT: usize = 5;
+
+    let (server_addr, shutdown, server_handle) = start_echo_server();
+    std::thread::sleep(Duration::from_millis(100));
+    let rt = dpdk_rt();
+
+    let results = rt.block_on(async {
+        run_isolation_test(server_addr, NUM_CLIENTS, MESSAGES_PER_CLIENT).await
+    });
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    let total_wrong: usize = results.iter().map(|r| r.wrong_responses).sum();
+    let total_correct: usize = results.iter().map(|r| r.correct_responses).sum();
+    let expected = NUM_CLIENTS * MESSAGES_PER_CLIENT;
+
+    assert_eq!(
+        total_wrong, 0,
+        "{} messages received by wrong client",
+        total_wrong
+    );
+    assert!(
+        total_correct >= expected * 7 / 10,
+        "only {}/{} correct responses",
+        total_correct,
+        expected
+    );
+}
+
+/// Test rapid reconnect: 10 clients × 5 reconnects × 3 messages
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_rapid_reconnect_isolation() {
+    const NUM_CLIENTS: usize = 10;
+    const RECONNECTS_PER_CLIENT: usize = 5;
+    const MESSAGES_PER_CONNECTION: usize = 3;
+
+    let (server_addr, shutdown, server_handle) = start_echo_server();
+    std::thread::sleep(Duration::from_millis(100));
+    let rt = dpdk_rt();
+
+    let results = rt.block_on(async {
+        let results = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+
+        for client_id in 0..NUM_CLIENTS {
+            let results = results.clone();
+            let handle = tokio::spawn(async move {
+                for reconnect in 0..RECONNECTS_PER_CLIENT {
+                    let unique_id = client_id * 1000 + reconnect;
+                    let result =
+                        run_client_n_messages(unique_id, server_addr, MESSAGES_PER_CONNECTION)
+                            .await;
+                    results.lock().await.push(result);
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(60), handle).await;
+        }
+
+        Arc::try_unwrap(results)
+            .expect("Arc still has references")
+            .into_inner()
+    });
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    let total_wrong: usize = results.iter().map(|r| r.wrong_responses).sum();
+    let total_correct: usize = results.iter().map(|r| r.correct_responses).sum();
+    let expected = NUM_CLIENTS * RECONNECTS_PER_CLIENT * MESSAGES_PER_CONNECTION;
+
+    assert_eq!(
+        total_wrong, 0,
+        "{} messages received by wrong client",
+        total_wrong
+    );
+    assert!(
+        total_correct >= expected * 7 / 10,
+        "only {}/{} correct responses",
+        total_correct,
+        expected
+    );
 }

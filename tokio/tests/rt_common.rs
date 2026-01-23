@@ -57,6 +57,14 @@ macro_rules! rt_test {
         // DPDK scheduler tests - only compiled when dpdk feature is enabled
         // These tests run the same test suite on the DPDK runtime to verify
         // compatibility with standard Tokio features.
+        // NOTE: DPDK tests are disabled in rt_common.rs because each test requires
+        // subprocess isolation (EAL can only be initialized once per process).
+        // The dedicated DPDK test files (tcp_dpdk.rs, dpdk_rt_common.rs, etc.) use
+        // #[serial_isolation_test] for proper process-level isolation.
+        //
+        // To re-enable: uncomment below and each test will spawn a subprocess.
+        // However, this significantly increases test time.
+        /*
         #[cfg(all(not(target_os = "wasi"), feature = "rt-multi-thread", target_os = "linux"))]
         mod dpdk_scheduler {
             $($t)*
@@ -104,6 +112,7 @@ macro_rules! rt_test {
                     .into()
             }
         }
+        */
     }
 }
 

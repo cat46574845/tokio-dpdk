@@ -157,6 +157,7 @@ mod api_parity {
     use tokio::net::{TcpDpdkStream, TcpListener};
 
     /// Test that TcpDpdkStream can be created via connect()
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn tcp_dpdk_stream_connect() {
         let rt = dpdk_rt();
@@ -187,6 +188,7 @@ mod api_parity {
     }
 
     /// Test AsyncRead/AsyncWrite traits
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn tcp_stream_read_write() {
         let rt = dpdk_rt();
@@ -225,6 +227,7 @@ mod api_parity {
     }
 
     /// Test split() functionality
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn tcp_stream_split() {
         let rt = dpdk_rt();
@@ -261,6 +264,7 @@ mod api_parity {
     }
 
     /// Test peek() functionality
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn tcp_stream_peek() {
         let rt = dpdk_rt();
@@ -294,6 +298,7 @@ mod api_parity {
     }
 
     /// Test nodelay option
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn tcp_stream_nodelay() {
         let rt = dpdk_rt();
@@ -323,6 +328,7 @@ mod api_parity {
     }
 
     /// Test readable/writable async methods
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn tcp_stream_readable_writable() {
         let rt = dpdk_rt();
@@ -364,6 +370,7 @@ mod listener_tests {
     use tokio::net::{TcpDpdkListener, TcpStream};
 
     /// Test basic accept functionality
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn listener_accept() {
         let rt = dpdk_rt();
@@ -388,6 +395,7 @@ mod listener_tests {
     }
 
     /// Test multiple accepts
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn listener_multiple_accepts() {
         let rt = dpdk_rt();
@@ -419,6 +427,7 @@ mod listener_tests {
     }
 
     /// Test local_addr
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn listener_local_addr() {
         let rt = dpdk_rt();
@@ -444,6 +453,7 @@ mod dpdk_specific {
     use super::*;
 
     /// Test DPDK runtime builder configuration
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn dpdk_builder_configuration() {
         // Test that Builder::new_dpdk() creates a valid builder
@@ -462,6 +472,7 @@ mod dpdk_specific {
     }
 
     /// Test runtime spawn and basic task execution
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn dpdk_runtime_spawn() {
         let rt = dpdk_rt();
@@ -480,6 +491,7 @@ mod dpdk_specific {
     }
 
     /// Test timer functionality in DPDK runtime
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn dpdk_runtime_timer() {
         let rt = dpdk_rt();
@@ -495,6 +507,7 @@ mod dpdk_specific {
     }
 
     /// Test spawn_blocking in DPDK runtime
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn dpdk_runtime_spawn_blocking() {
         let rt = dpdk_rt();
@@ -512,6 +525,7 @@ mod dpdk_specific {
     }
 
     /// Test multiple concurrent tasks
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn dpdk_runtime_concurrent_tasks() {
         let rt = dpdk_rt();
@@ -537,6 +551,7 @@ mod dpdk_specific {
     }
 
     /// Test channel communication across tasks
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn dpdk_runtime_channels() {
         let rt = dpdk_rt();
@@ -571,6 +586,7 @@ mod error_handling {
     use tokio::net::TcpDpdkStream;
 
     /// Test connection refused
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn connection_refused() {
         let rt = dpdk_rt();
@@ -585,6 +601,7 @@ mod error_handling {
     }
 
     /// Test connection timeout (if supported)
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn connection_timeout() {
         let rt = dpdk_rt();
@@ -612,6 +629,7 @@ mod shutdown_tests {
     use tokio::net::TcpDpdkListener;
 
     /// Test graceful runtime shutdown
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn graceful_shutdown() {
         let rt = dpdk_rt();
@@ -636,66 +654,11 @@ mod shutdown_tests {
     }
 }
 
-/// Tests for the #[tokio::test(flavor = "dpdk")] macro
-/// These tests verify that the new macro syntax works correctly.
-#[cfg(all(target_os = "linux", feature = "full"))]
-mod dpdk_flavor_macro {
-    use std::time::Duration;
-
-    /// Test basic spawn with DPDK flavor macro
-    #[tokio::test(flavor = "dpdk")]
-    async fn macro_spawn_test() {
-        let handle = tokio::spawn(async { 42 });
-        let result = handle.await.unwrap();
-        assert_eq!(result, 42);
-    }
-
-    /// Test timer with DPDK flavor macro
-    #[tokio::test(flavor = "dpdk")]
-    async fn macro_timer_test() {
-        let start = tokio::time::Instant::now();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_millis(40)); // Allow some tolerance
-    }
-
-    /// Test channel with DPDK flavor macro
-    #[tokio::test(flavor = "dpdk")]
-    async fn macro_channel_test() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        tokio::spawn(async move {
-            tx.send("hello from dpdk").unwrap();
-        });
-
-        let msg = rx.await.unwrap();
-        assert_eq!(msg, "hello from dpdk");
-    }
-
-    /// Test concurrent tasks with DPDK flavor macro
-    #[tokio::test(flavor = "dpdk")]
-    async fn macro_concurrent_tasks() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
-
-        for _ in 0..5 {
-            let counter = counter.clone();
-            handles.push(tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                counter.fetch_add(1, Ordering::SeqCst);
-            }));
-        }
-
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        assert_eq!(counter.load(Ordering::SeqCst), 5);
-    }
-}
+// NOTE: The #[tokio::test(flavor = "dpdk")] macro tests have been removed.
+// DPDK tests require subprocess isolation via #[serial_isolation_test] because
+// DPDK's EAL can only be initialized once per process. The flavor macro creates
+// a new runtime within the test process, which conflicts with other DPDK tests.
+// Use #[serial_isolation_test] + #[test] + manual rt.block_on() pattern instead.
 
 // =============================================================================
 // Stream/Listener Property Tests (core_id, peek verification, etc.)
@@ -706,6 +669,7 @@ mod stream_property_tests {
     use tokio::net::{TcpDpdkListener, TcpDpdkStream, TcpListener};
 
     /// Test that core_id() returns a valid value
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn stream_core_id_valid() {
         let rt = dpdk_rt();
@@ -733,6 +697,7 @@ mod stream_property_tests {
     }
 
     /// Test peek() with data verification
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn stream_peek_data_integrity() {
         let rt = dpdk_rt();
@@ -783,6 +748,7 @@ mod stream_property_tests {
     }
 
     /// Test that split halves can be used independently
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn stream_split_independent_use() {
         let rt = dpdk_rt();
@@ -819,6 +785,7 @@ mod stream_property_tests {
     }
 
     /// Test listener core_id returns valid value
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn listener_core_id_valid() {
         let rt = dpdk_rt();
@@ -849,6 +816,7 @@ mod worker_affinity_tests {
     use std::sync::Arc as StdArc;
 
     /// Test that TcpDpdkStream enforces worker affinity on read operations.
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn stream_worker_affinity_enforcement() {
         // Create runtime with 2 workers
@@ -896,6 +864,7 @@ mod worker_affinity_tests {
     }
 
     /// Test that creating streams on different workers works independently
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn streams_on_different_workers() {
         let device = detect_dpdk_device();
@@ -957,6 +926,7 @@ mod worker_affinity_tests {
     }
 
     /// Test that worker affinity warning is printed on Drop from wrong worker
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn drop_on_wrong_worker_warns_not_panics() {
         let device = detect_dpdk_device();
@@ -1009,6 +979,7 @@ mod multi_worker_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Test that tasks can be spawned and executed with multiple workers
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn multi_worker_task_distribution() {
         // Create runtime with multiple workers if supported
@@ -1045,6 +1016,7 @@ mod multi_worker_tests {
     }
 
     /// Test that tasks spawned from different contexts complete
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn multi_worker_cross_spawn() {
         let device = detect_dpdk_device();
@@ -1078,6 +1050,7 @@ mod multi_worker_tests {
     }
 
     /// Test channel communication between workers
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn multi_worker_channel_communication() {
         let device = detect_dpdk_device();
@@ -1125,6 +1098,7 @@ mod buffer_pool_tests {
     use tokio::net::{TcpDpdkStream, TcpListener};
 
     /// Test that many connections don't exhaust resources
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn many_sequential_connections() {
         let rt = dpdk_rt();
@@ -1169,6 +1143,7 @@ mod buffer_pool_tests {
     }
 
     /// Test concurrent connections stress test
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn concurrent_connections_stress() {
         let rt = dpdk_rt();
@@ -1246,6 +1221,7 @@ mod buffer_pool_tests {
     }
 
     /// Test rapid create/destroy cycles (buffer pool churn)
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn buffer_pool_churn() {
         let rt = dpdk_rt();
@@ -1294,6 +1270,7 @@ mod local_overflow_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Test that spawning many tasks doesn't lose any
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn spawn_many_tasks_no_loss() {
         let rt = dpdk_rt();
@@ -1321,6 +1298,7 @@ mod local_overflow_tests {
     }
 
     /// Test rapid spawn/complete cycles
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn rapid_spawn_complete_cycles() {
         let rt = dpdk_rt();
@@ -1346,6 +1324,7 @@ mod local_overflow_tests {
     }
 
     /// Test nested spawns (tasks that spawn more tasks)
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn nested_spawn_chain() {
         let rt = dpdk_rt();
@@ -1369,6 +1348,7 @@ mod local_overflow_tests {
     }
 
     /// Test that yield_now works correctly
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn yield_now_fairness() {
         let rt = dpdk_rt();
@@ -1409,6 +1389,7 @@ mod local_overflow_tests {
 
     /// Stress test: Massive concurrent task spawn (10,000 tasks)
     /// Tests local queue overflow handling under extreme load
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn stress_massive_spawn() {
         let rt = dpdk_rt();
@@ -1444,6 +1425,7 @@ mod local_overflow_tests {
 
     /// Stress test: Burst spawn with immediate yield
     /// Forces queue churn by rapidly spawning and yielding
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn stress_burst_spawn_yield() {
         let rt = dpdk_rt();
@@ -1489,6 +1471,7 @@ mod local_overflow_tests {
 
     /// Stress test: Deep nested spawn chain
     /// Tests stack and queue limits with deeply nested task spawns
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn stress_deep_nested_spawn() {
         let rt = dpdk_rt();
@@ -1531,6 +1514,7 @@ mod local_overflow_tests {
 
     /// Stress test: Producer-consumer with high throughput
     /// Tests channel + spawn interaction under pressure
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn stress_producer_consumer_high_throughput() {
         let rt = dpdk_rt();
@@ -1584,6 +1568,7 @@ mod local_overflow_tests {
 
     /// Stress test: Contended spawning from multiple tasks
     /// Multiple tasks simultaneously spawn new tasks to stress the global queue
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn stress_contended_spawn() {
         let rt = dpdk_rt();
@@ -1643,6 +1628,7 @@ mod timer_tests {
     use super::*;
 
     /// Test multiple concurrent timers
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn concurrent_timers() {
         let rt = dpdk_rt();
@@ -1663,6 +1649,7 @@ mod timer_tests {
     }
 
     /// Test interval timer
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn interval_timer() {
         let rt = dpdk_rt();
@@ -1685,6 +1672,7 @@ mod timer_tests {
     }
 
     /// Test timeout that expires
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn timeout_expires() {
         let rt = dpdk_rt();
@@ -1701,6 +1689,7 @@ mod timer_tests {
     }
 
     /// Test timeout that completes in time
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn timeout_completes() {
         let rt = dpdk_rt();
@@ -1726,6 +1715,7 @@ mod edge_case_tests {
     use tokio::net::{TcpDpdkListener, TcpDpdkStream, TcpListener};
 
     /// Test binding to address that's already in use
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn bind_address_in_use() {
         let rt = dpdk_rt();
@@ -1744,6 +1734,7 @@ mod edge_case_tests {
     }
 
     /// Test zero-length write
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn zero_length_operations() {
         let rt = dpdk_rt();
@@ -1776,6 +1767,7 @@ mod edge_case_tests {
     }
 
     /// Test large data transfer
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn large_data_transfer() {
         let rt = dpdk_rt();
@@ -1808,6 +1800,7 @@ mod edge_case_tests {
     }
 
     /// Test half-close (shutdown write but keep reading)
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn half_close() {
         let rt = dpdk_rt();
@@ -1869,6 +1862,7 @@ mod cpu_affinity_tests {
 
     /// Test that the DPDK worker thread runs on the designated core.
     /// Uses sched_getaffinity to verify the actual CPU affinity.
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn worker_runs_on_designated_core() {
         let device = detect_dpdk_device();
@@ -1940,6 +1934,7 @@ mod cpu_affinity_tests {
 
     /// Test that blocking threads do NOT run on isolated DPDK cores.
     /// This ensures blocking operations don't interfere with low-latency networking.
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn blocking_thread_not_on_dpdk_core() {
         let device = detect_dpdk_device();
@@ -2018,6 +2013,7 @@ mod cpu_affinity_tests {
     }
 
     /// Test that multiple workers run on different cores when configured.
+    #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn multi_worker_core_isolation() {
         let device = detect_dpdk_device();

@@ -304,6 +304,7 @@ impl Default for ResourceLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_isolation_test::serial_isolation_test;
 
     // Helper to clean up lock files after tests
     fn cleanup_lock(path: &PathBuf) {
@@ -332,9 +333,10 @@ mod tests {
         assert!(lock.core_locks.is_empty());
     }
 
-    // Note: These tests require root permissions to create files in /var/run/dpdk.
-    // Run with: sudo cargo test --package tokio --lib -- runtime::scheduler::dpdk::resource_lock::tests
+    // These tests require root permissions to create files in /var/run/dpdk.
+    // Using #[serial_isolation_test] to automatically run with sudo in subprocess.
 
+    #[serial_isolation_test]
     #[test]
     fn test_resource_lock_acquire_device_success() {
         let test_pci = "0000:ff:ff.0";
@@ -349,6 +351,7 @@ mod tests {
         cleanup_lock(&lock_path);
     }
 
+    #[serial_isolation_test]
     #[test]
     fn test_resource_lock_acquire_core_success() {
         let test_core = 255;
@@ -363,6 +366,7 @@ mod tests {
         cleanup_lock(&lock_path);
     }
 
+    #[serial_isolation_test]
     #[test]
     fn test_resource_lock_drop_releases() {
         let test_pci = "0000:ff:fe.0";
@@ -385,6 +389,7 @@ mod tests {
         cleanup_lock(&lock_path);
     }
 
+    #[serial_isolation_test]
     #[test]
     fn test_resource_lock_acquire_multiple_devices() {
         let test_pci_1 = "0000:ff:f0.0";
@@ -405,6 +410,7 @@ mod tests {
         cleanup_lock(&lock_path_2);
     }
 
+    #[serial_isolation_test]
     #[test]
     fn test_resource_lock_acquire_multiple_cores() {
         let test_core_1 = 250;
@@ -425,6 +431,7 @@ mod tests {
         cleanup_lock(&lock_path_2);
     }
 
+    #[serial_isolation_test]
     #[test]
     fn test_resource_lock_device_already_locked() {
         let test_pci = "0000:ff:e0.0";
@@ -445,6 +452,7 @@ mod tests {
         cleanup_lock(&lock_path);
     }
 
+    #[serial_isolation_test]
     #[test]
     fn test_resource_lock_core_already_locked() {
         let test_core = 249;
@@ -465,6 +473,7 @@ mod tests {
         cleanup_lock(&lock_path);
     }
 
+    #[serial_isolation_test]
     #[test]
     fn test_resource_lock_release() {
         let test_pci = "0000:ff:d0.0";
@@ -486,6 +495,7 @@ mod tests {
         cleanup_lock(&lock_path);
     }
 
+    #[serial_isolation_test]
     #[test]
     fn test_resource_lock_dir_creation() {
         // This test verifies that ResourceLock::new() creates the lock directory if needed
