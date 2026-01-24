@@ -255,10 +255,32 @@ impl Dpdk {
             init::initialize_dpdk_from_plan(&plan, dpdk_builder.get_eal_args())?;
 
         // Create flow rules for multi-queue traffic routing
-        // This is best-effort - if flow rules fail (e.g., AWS ENA limited support),
-        // traffic will still work but may not be correctly routed
+        // In multi-queue mode, rte_flow is REQUIRED for correct traffic routing.
+        // If flow rules fail, we PANIC instead of silently falling back to RSS,
+        // which would cause traffic to be routed to wrong workers.
         let mut _flow_rules = Vec::new();
-        for (pci_address, _num_queues) in allocation::get_device_queue_counts(&plan) {
+        let is_multi_queue = plan.workers.len() > 1;
+
+        // Log allocation plan details for debugging
+        eprintln!(
+            "[DPDK] AllocationPlan: {} workers, is_multi_queue={}",
+            plan.workers.len(), is_multi_queue
+        );
+        let queue_counts = allocation::get_device_queue_counts(&plan);
+        for (pci, num_q) in &queue_counts {
+            eprintln!("[DPDK]   Device {}: {} queues", pci, num_q);
+        }
+
+        for (pci_address, num_queues) in queue_counts {
+            // Skip flow rule creation for single-queue devices
+            if num_queues <= 1 {
+                eprintln!(
+                    "[DPDK] Skipping flow rules for device {} (only {} queue)",
+                    pci_address, num_queues
+                );
+                continue;
+            }
+
             // Find port_id for this PCI address
             if let Some(worker) = plan.workers.iter().find(|w| w.pci_address == pci_address) {
                 if let Some(port) = resources.ports.iter().find(|&&p| {
@@ -269,11 +291,18 @@ impl Dpdk {
                 }) {
                     // Check if this port supports rte_flow before attempting to create rules
                     if !flow_rules::check_flow_support(*port) {
-                        eprintln!(
-                            "[DPDK] Port {} does not support rte_flow, skipping flow rule creation",
-                            port
+                        // In multi-queue mode, rte_flow is REQUIRED
+                        // Panic instead of silently falling back to incorrect behavior
+                        panic!(
+                            "[DPDK] FATAL: Port {} (device {}) does not support rte_flow. \
+                             Multi-queue mode REQUIRES rte_flow for IP-based queue steering. \
+                             Without rte_flow, traffic will NOT be correctly routed to workers. \
+                             Options: \
+                             (1) Use single worker per NIC (dpdk_num_workers(1)), \
+                             (2) Use multiple NICs with one worker each, \
+                             (3) Use hardware that supports rte_flow (not AWS ENA).",
+                            port, pci_address
                         );
-                        continue;
                     }
 
                     // Collect IP -> queue_id mappings for this port
@@ -294,19 +323,36 @@ impl Dpdk {
                         .collect();
 
                     if !allocations.is_empty() {
-                        // Create flow rules - this is best-effort
+                        // Create flow rules - REQUIRED for multi-queue
                         match flow_rules::create_flow_rules(*port, &allocations) {
-                            Ok(rules) => _flow_rules.extend(rules),
-                            Err(e) => {
+                            Ok(rules) => {
                                 eprintln!(
-                                    "[DPDK] Warning: Failed to create flow rules for port {}: {}",
-                                    port, e
+                                    "[DPDK] Created {} flow rules for port {} (device {})",
+                                    rules.len(), port, pci_address
+                                );
+                                _flow_rules.extend(rules);
+                            }
+                            Err(e) => {
+                                // Flow rule creation failed - this is FATAL in multi-queue mode
+                                panic!(
+                                    "[DPDK] FATAL: Failed to create flow rules for port {} (device {}): {}. \
+                                     Multi-queue mode REQUIRES flow rules for correct operation. \
+                                     Without flow rules, traffic will NOT be correctly routed to workers.",
+                                    port, pci_address, e
                                 );
                             }
                         }
                     }
                 }
             }
+        }
+
+        // Log summary
+        if is_multi_queue && !_flow_rules.is_empty() {
+            eprintln!(
+                "[DPDK] Multi-queue mode initialized with {} flow rules across {} workers",
+                _flow_rules.len(), plan.workers.len()
+            );
         }
 
         // Create Handle and Launch using the new worker::create_from_workers

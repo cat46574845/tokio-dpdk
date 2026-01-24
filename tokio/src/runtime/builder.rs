@@ -1191,6 +1191,60 @@ impl Builder {
         self
     }
 
+    /// Specifies DPDK devices by PCI address.
+    ///
+    /// This method uses the AllocationPlan path which supports multi-queue
+    /// mode (multiple workers on a single NIC). Device configuration is
+    /// read from `/etc/dpdk/env.json`.
+    ///
+    /// Use this with `dpdk_num_workers()` for multi-queue configurations:
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let rt = Builder::new_dpdk()
+    ///     .dpdk_pci_addresses(&["0000:28:00.0"])  // Single NIC
+    ///     .dpdk_num_workers(4)                    // 4 workers = 4 queues
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[cfg(feature = "rt-multi-thread")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    pub fn dpdk_pci_addresses(&mut self, pci_addresses: &[&str]) -> &mut Self {
+        if let Some(ref mut dpdk_builder) = self.dpdk_builder {
+            *dpdk_builder = std::mem::take(dpdk_builder).dpdk_devices(pci_addresses);
+        }
+        self
+    }
+
+    /// Specifies the number of DPDK workers to create.
+    ///
+    /// This method uses the AllocationPlan path which supports multi-queue
+    /// mode. When combined with a single device via `dpdk_pci_addresses()`,
+    /// multiple workers will share the same NIC with different queues.
+    ///
+    /// **Note:** Multi-queue mode requires rte_flow support from the NIC
+    /// for IP-based traffic steering. If rte_flow is not supported (e.g.,
+    /// AWS ENA), runtime creation will panic.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let rt = Builder::new_dpdk()
+    ///     .dpdk_pci_addresses(&["0000:28:00.0"])  // Single NIC
+    ///     .dpdk_num_workers(4)                    // 4 workers = 4 queues
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[cfg(feature = "rt-multi-thread")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    pub fn dpdk_num_workers(&mut self, count: usize) -> &mut Self {
+        if let Some(ref mut dpdk_builder) = self.dpdk_builder {
+            *dpdk_builder = std::mem::take(dpdk_builder).dpdk_num_workers(count);
+        }
+        self
+    }
+
     /// Sets the number of scheduler ticks after which the scheduler will poll the global
     /// task queue.
     ///
