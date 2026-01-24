@@ -256,7 +256,7 @@ pub(crate) struct DpdkTxToken<'a> {
 impl smoltcp::phy::RxToken for DpdkRxToken {
     fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
         // Get mbuf data pointer and length
         let (data_ptr, data_len) = unsafe {
@@ -265,7 +265,7 @@ impl smoltcp::phy::RxToken for DpdkRxToken {
             (ptr, len)
         };
 
-        let data = unsafe { std::slice::from_raw_parts_mut(data_ptr, data_len) };
+        let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
 
         let result = f(data);
 

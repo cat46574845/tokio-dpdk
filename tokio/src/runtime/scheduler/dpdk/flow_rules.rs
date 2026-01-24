@@ -220,12 +220,12 @@ impl FlowPatternBuilder {
         let (is_ipv4, dst_addr, prefix_len) = match ip {
             IpCidr::Ipv4(cidr) => {
                 let mut addr = [0u8; 16];
-                addr[..4].copy_from_slice(&cidr.address().0);
+                addr[..4].copy_from_slice(&cidr.address().octets());
                 (true, addr, cidr.prefix_len())
             }
             IpCidr::Ipv6(cidr) => {
                 let mut addr = [0u8; 16];
-                addr.copy_from_slice(&cidr.address().0);
+                addr.copy_from_slice(&cidr.address().octets());
                 (false, addr, cidr.prefix_len())
             }
         };
@@ -368,11 +368,11 @@ mod tests {
         // Verify IPv4 and IPv6 are both present
         let ipv4_count = allocations
             .iter()
-            .filter(|(ip, _)| ip.address().as_bytes().len() == 4)
+            .filter(|(ip, _)| matches!(ip.address(), smoltcp::wire::IpAddress::Ipv4(_)))
             .count();
         let ipv6_count = allocations
             .iter()
-            .filter(|(ip, _)| ip.address().as_bytes().len() == 16)
+            .filter(|(ip, _)| matches!(ip.address(), smoltcp::wire::IpAddress::Ipv6(_)))
             .count();
 
         assert_eq!(ipv4_count, 2);

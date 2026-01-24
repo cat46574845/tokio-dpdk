@@ -20,8 +20,69 @@ use crate::net::{to_socket_addrs, ToSocketAddrs};
 // Import worker context from dpdk scheduler
 use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver};
 
+use std::marker::PhantomData;
+
 // =============================================================================
-// TcpDpdkStream
+// PeekGuard - Zero-copy access to smoltcp receive buffer
+// =============================================================================
+
+/// RAII guard for zero-copy access to smoltcp receive buffer.
+///
+/// # Safety
+/// This guard uses unsafe lifetime extension. The borrowed slice is valid
+/// as long as:
+/// 1. The guard is not dropped
+/// 2. No mutable operations are performed on the socket
+/// 3. The stream remains on the same worker thread
+///
+/// # Important: LinearBuffer Compaction
+/// When using LinearBuffer, the peek slice is guaranteed stable because:
+/// - `get_allocated(&self, ...)` takes &self (immutable) and never triggers compaction
+/// - Compaction only happens on mutating operations (recv, dequeue, etc.)
+/// - As long as PeekGuard exists, no mutating operations can be called
+pub struct PeekGuard<'a> {
+    stream: &'a TcpDpdkStream,
+    /// Pointer to data in smoltcp buffer (lifetime-extended)
+    data: *const u8,
+    len: usize,
+    /// Makes this type !Send + !Sync via PhantomData<*const ()>
+    /// Note: Explicit `impl !Send` requires nightly, so we use PhantomData instead
+    _marker: PhantomData<*const ()>,
+}
+
+impl<'a> PeekGuard<'a> {
+    /// Returns the peeked data as a byte slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        if self.data.is_null() || self.len == 0 {
+            return &[];
+        }
+        // SAFETY: Lifetime extended from smoltcp buffer, valid while guard alive
+        // LinearBuffer.get_allocated() is &self so no compaction can occur
+        unsafe { std::slice::from_raw_parts(self.data, self.len) }
+    }
+
+    /// Returns the length of available data.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true if no data is available.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Drop for PeekGuard<'_> {
+    fn drop(&mut self) {
+        // No-op: data remains in buffer until explicitly consumed
+    }
+}
+
+// Note: PeekGuard is !Send + !Sync via PhantomData<*const ()>
+// The *const () is inherently !Send + !Sync
 // =============================================================================
 
 /// A DPDK-backed TCP stream.
@@ -166,7 +227,7 @@ impl TcpDpdkStream {
                     );
                     let octets = v4.ip().octets();
                     let remote_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address(octets)),
+                        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(octets)),
                         v4.port(),
                     );
                     (local_ep, remote_ep)
@@ -185,7 +246,7 @@ impl TcpDpdkStream {
                     );
                     let octets = v6.ip().octets();
                     let remote_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address(octets)),
+                        smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(octets)),
                         v6.port(),
                     );
                     (local_ep, remote_ep)
@@ -346,7 +407,7 @@ impl TcpDpdkStream {
                         })?
                     } else {
                         match local_addr.ip() {
-                            std::net::IpAddr::V4(v4) => smoltcp::wire::Ipv4Address(v4.octets()),
+                            std::net::IpAddr::V4(v4) => smoltcp::wire::Ipv4Address::from_octets(v4.octets()),
                             _ => {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidInput,
@@ -362,7 +423,7 @@ impl TcpDpdkStream {
                     );
                     let octets = v4.ip().octets();
                     let remote_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address(octets)),
+                        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(octets)),
                         v4.port(),
                     );
                     (local_ep, remote_ep)
@@ -378,7 +439,7 @@ impl TcpDpdkStream {
                         })?
                     } else {
                         match local_addr.ip() {
-                            std::net::IpAddr::V6(v6) => smoltcp::wire::Ipv6Address(v6.octets()),
+                            std::net::IpAddr::V6(v6) => smoltcp::wire::Ipv6Address::from_octets(v6.octets()),
                             _ => {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidInput,
@@ -394,7 +455,7 @@ impl TcpDpdkStream {
                     );
                     let octets = v6.ip().octets();
                     let remote_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address(octets)),
+                        smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(octets)),
                         v6.port(),
                     );
                     (local_ep, remote_ep)
@@ -661,6 +722,172 @@ impl TcpDpdkStream {
     /// This function is equivalent to `ready(Interest::WRITABLE)`.
     pub async fn writable(&self) -> io::Result<()> {
         poll_fn(|cx| self.poll_write_ready(cx)).await
+    }
+
+    // =========================================================================
+    // Zero-copy receive API
+    // =========================================================================
+
+    /// Wait for receive buffer data size to change.
+    ///
+    /// This method blocks until NEW data arrives (buffer size increases),
+    /// not just when data is present. This is critical for partial message
+    /// processing where the caller needs to wait for additional bytes.
+    ///
+    /// Returns the NEW total number of bytes available for reading.
+    /// Returns `Ok(0)` on EOF (connection closed by peer).
+    pub async fn wait_recv(&self) -> io::Result<usize> {
+        self.assert_on_correct_worker();
+
+        // Capture initial buffer size
+        let initial_size = with_current_driver(|driver| {
+            driver.get_tcp_socket_mut(self.handle).recv_queue()
+        }).unwrap_or(0);
+
+        poll_fn(|cx| {
+            let handle = self.handle;
+            let waker = cx.waker();
+
+            let result = with_current_driver(|driver| {
+                let socket = driver.get_tcp_socket_mut(handle);
+                socket.register_recv_waker(waker);
+
+                let current_size = socket.recv_queue();
+
+                // Check for EOF
+                if socket.state() == smoltcp::socket::tcp::State::CloseWait
+                    || socket.state() == smoltcp::socket::tcp::State::Closed {
+                    return Ok(0); // EOF
+                }
+
+                // Wait for size CHANGE, not just "has data"
+                if current_size > initial_size {
+                    Ok(current_size)
+                } else {
+                    Err(io::ErrorKind::WouldBlock)
+                }
+            });
+
+            match result {
+                Some(Ok(n)) => Poll::Ready(Ok(n)),
+                Some(Err(io::ErrorKind::WouldBlock)) => Poll::Pending,
+                Some(Err(kind)) => Poll::Ready(Err(io::Error::new(kind, "socket error"))),
+                None => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "driver unavailable"))),
+            }
+        }).await
+    }
+
+    /// Try to peek at receive buffer without consuming data (zero-copy).
+    ///
+    /// Returns a guard providing zero-copy access to the buffer.
+    /// The guard borrows from smoltcp's internal buffer using unsafe lifetime extension.
+    ///
+    /// # Safety
+    /// The returned `PeekGuard` contains a pointer to smoltcp's internal buffer.
+    /// This is safe because:
+    /// 1. LinearBuffer's `get_allocated` is `&self` and never triggers compaction
+    /// 2. The guard holds `&TcpDpdkStream` preventing concurrent mutable access
+    /// 3. Data remains valid until `consume_recv()` is called
+    pub fn try_peek_zero_copy(&self) -> io::Result<PeekGuard<'_>> {
+        self.assert_on_correct_worker();
+
+        if self.read_shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(PeekGuard {
+                stream: self,
+                data: std::ptr::null(),
+                len: 0,
+                _marker: PhantomData,
+            });
+        }
+
+        let handle = self.handle;
+        let result = with_current_driver(|driver| {
+            let socket = driver.get_tcp_socket_mut(handle);
+
+            if !socket.can_recv() {
+                if socket.state() == smoltcp::socket::tcp::State::CloseWait
+                    || socket.state() == smoltcp::socket::tcp::State::Closed {
+                    // EOF: return empty guard
+                    return Ok((std::ptr::null(), 0));
+                }
+                return Err(io::ErrorKind::WouldBlock);
+            }
+
+            // Peek at all available data
+            // Note: smoltcp socket.peek(&mut self, size) returns Result<&[u8], RecvError>
+            // The returned slice lifetime is tied to the &mut self borrow
+            // We use unsafe to extend this lifetime to the PeekGuard
+            let queue_len = socket.recv_queue();
+            match socket.peek(queue_len) {
+                Ok(data) => {
+                    // SAFETY: Extend lifetime - data is valid because:
+                    // 1. LinearBuffer.get_allocated() is &self (no compaction during peek)
+                    // 2. Data remains valid until recv()/dequeue operations
+                    // 3. PeekGuard holds &TcpDpdkStream preventing concurrent mutable access
+                    let ptr = data.as_ptr();
+                    let len = data.len();
+                    Ok((ptr, len))
+                }
+                Err(_) => Err(io::ErrorKind::WouldBlock),
+            }
+        });
+
+        match result {
+            Some(Ok((ptr, len))) => Ok(PeekGuard {
+                stream: self,
+                data: ptr,
+                len,
+                _marker: PhantomData,
+            }),
+            Some(Err(io::ErrorKind::WouldBlock)) => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            Some(Err(kind)) => Err(io::Error::new(kind, "socket peek error")),
+            None => Err(io::Error::new(io::ErrorKind::Other, "driver unavailable")),
+        }
+    }
+
+    /// Peek at receive buffer (zero-copy), waiting if necessary.
+    pub async fn peek_zero_copy(&self) -> io::Result<PeekGuard<'_>> {
+        loop {
+            self.readable().await?;
+            match self.try_peek_zero_copy() {
+                Ok(guard) => return Ok(guard),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Consume (discard) bytes from the receive buffer.
+    ///
+    /// Call this after processing data obtained via `try_peek_zero_copy()`.
+    pub fn consume_recv(&self, n: usize) -> io::Result<()> {
+        self.assert_on_correct_worker();
+
+        if n == 0 {
+            return Ok(());
+        }
+
+        let handle = self.handle;
+        let result = with_current_driver(|driver| {
+            let socket = driver.get_tcp_socket_mut(handle);
+
+            // recv() with a closure that just discards the data
+            match socket.recv(|data| {
+                let consume = n.min(data.len());
+                (consume, consume)
+            }) {
+                Ok(_consumed) => Ok(()),
+                Err(_) => Err(io::ErrorKind::Other),
+            }
+        });
+
+        match result {
+            Some(Ok(())) => Ok(()),
+            Some(Err(kind)) => Err(io::Error::new(kind, "consume error")),
+            None => Err(io::Error::new(io::ErrorKind::Other, "driver unavailable")),
+        }
     }
 
     /// Tries to read data from the stream into the provided buffer.

@@ -200,12 +200,12 @@ pub(crate) fn create_allocation_plan(
             let ipv4 = device
                 .addresses
                 .iter()
-                .find(|a| a.address().as_bytes().len() == 4)
+                .find(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv4(_)))
                 .cloned();
             let ipv6 = device
                 .addresses
                 .iter()
-                .find(|a| a.address().as_bytes().len() == 16)
+                .find(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv6(_)))
                 .cloned();
 
             // Each worker needs at least one IP
@@ -253,12 +253,12 @@ pub(crate) fn create_allocation_plan(
             let ipv4_addrs: Vec<&IpCidr> = device
                 .addresses
                 .iter()
-                .filter(|a| a.address().as_bytes().len() == 4)
+                .filter(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv4(_)))
                 .collect();
             let ipv6_addrs: Vec<&IpCidr> = device
                 .addresses
                 .iter()
-                .filter(|a| a.address().as_bytes().len() == 16)
+                .filter(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv6(_)))
                 .collect();
 
             // Check if we have enough IPs

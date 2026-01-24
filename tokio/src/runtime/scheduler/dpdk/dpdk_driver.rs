@@ -13,7 +13,8 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
+use smoltcp::socket::tcp::Socket as TcpSocket;
+use smoltcp::storage::LinearBuffer;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
@@ -149,7 +150,7 @@ pub(crate) struct DpdkDriver {
     /// smoltcp network interface
     iface: Interface,
     /// Socket set containing TCP/UDP sockets
-    sockets: SocketSet<'static>,
+    sockets: SocketSet<'static, LinearBuffer<'static>>,
     /// Start time for timestamp calculation
     start_time: Instant,
     /// Set of registered socket handles (for has_registered_sockets check)
@@ -264,7 +265,8 @@ impl DpdkDriver {
         // Note: dispatch_wakers() is no longer needed!
         // smoltcp's native waker mechanism handles wakeups internally.
 
-        result
+        // Return true if there was socket state change (activity)
+        matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
     }
 
     /// Create a new TCP socket using pre-allocated buffers from the pool.
@@ -279,10 +281,13 @@ impl DpdkDriver {
         // Acquire pre-allocated buffers from pool
         let (rx_buf, tx_buf) = self.buffer_pool.acquire()?;
 
-        let rx_buffer = TcpSocketBuffer::new(rx_buf);
-        let tx_buffer = TcpSocketBuffer::new(tx_buf);
+        // Use LinearBuffer with compaction threshold = 16384 (max TLS record size)
+        // Compaction only triggers when buffer is full and data < threshold
+        const COMPACT_THRESHOLD: usize = 16384;
+        let rx_buffer = LinearBuffer::with_threshold(rx_buf, COMPACT_THRESHOLD);
+        let tx_buffer = LinearBuffer::with_threshold(tx_buf, COMPACT_THRESHOLD);
 
-        let socket = TcpSocket::new(rx_buffer, tx_buffer);
+        let socket: TcpSocket<'_, LinearBuffer<'_>> = TcpSocket::new(rx_buffer, tx_buffer);
         Some(self.sockets.add(socket))
     }
 
@@ -323,13 +328,13 @@ impl DpdkDriver {
     {
         let cx = self.iface.context();
         self.sockets
-            .get_mut::<TcpSocket<'_>>(handle)
+            .get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle)
             .connect(cx, remote_endpoint, local_endpoint)
     }
 
     /// Get TCP socket mutable reference.
-    pub(crate) fn get_tcp_socket_mut(&mut self, handle: SocketHandle) -> &mut TcpSocket<'static> {
-        self.sockets.get_mut::<TcpSocket<'_>>(handle)
+    pub(crate) fn get_tcp_socket_mut(&mut self, handle: SocketHandle) -> &mut TcpSocket<'static, LinearBuffer<'static>> {
+        self.sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle)
     }
 
     /// Remove a socket from the socket set and return its buffers to the pool.
@@ -392,7 +397,7 @@ impl DpdkDriver {
         for cidr in self.iface.ip_addrs() {
             if let smoltcp::wire::IpAddress::Ipv6(addr) = cidr.address() {
                 // Skip unspecified and link-local addresses
-                if !addr.is_unspecified() && !addr.is_link_local() {
+                if !addr.is_unspecified() && !addr.is_unicast_link_local() {
                     return Some(addr);
                 }
             }

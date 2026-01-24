@@ -199,7 +199,7 @@ impl TcpDpdkListener {
                     addr: if v4.ip().is_unspecified() {
                         None
                     } else {
-                        Some(smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address(
+                        Some(smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(
                             v4.ip().octets(),
                         )))
                     },
@@ -209,7 +209,7 @@ impl TcpDpdkListener {
                     addr: if v6.ip().is_unspecified() {
                         None
                     } else {
-                        Some(smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address(
+                        Some(smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(
                             v6.ip().octets(),
                         )))
                     },
@@ -302,10 +302,10 @@ impl TcpDpdkListener {
                     SocketAddr::new(
                         match ep.addr {
                             smoltcp::wire::IpAddress::Ipv4(v4) => {
-                                std::net::IpAddr::V4(std::net::Ipv4Addr::from(v4.0))
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::from(v4.octets()))
                             }
                             smoltcp::wire::IpAddress::Ipv6(v6) => {
-                                std::net::IpAddr::V6(std::net::Ipv6Addr::from(v6.0))
+                                std::net::IpAddr::V6(std::net::Ipv6Addr::from(v6.octets()))
                             }
                         },
                         ep.port,

@@ -218,7 +218,7 @@ where
     match opt {
         Some(s) => {
             if let Ok(addr) = s.parse::<std::net::Ipv4Addr>() {
-                Ok(Some(Ipv4Address::from_bytes(&addr.octets())))
+                Ok(Some(Ipv4Address::from_octets(addr.octets())))
             } else {
                 Ok(None)
             }
@@ -237,7 +237,7 @@ where
             // Handle malformed gateway like "2406:da18:e99:5d00:0:0:0:0::1"
             let s_clean = s.replace(":::", "::");
             if let Ok(addr) = s_clean.parse::<std::net::Ipv6Addr>() {
-                Ok(Some(Ipv6Address::from_bytes(&addr.octets())))
+                Ok(Some(Ipv6Address::from_octets(addr.octets())))
             } else {
                 Ok(None)
             }
