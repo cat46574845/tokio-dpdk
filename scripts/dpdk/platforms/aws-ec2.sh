@@ -43,6 +43,17 @@ get_pci_address() {
     fi
 }
 
+# Get dpdk-devbind.py path (with fallback)
+get_dpdk_devbind() {
+    if command -v dpdk-devbind.py &>/dev/null; then
+        echo "dpdk-devbind.py"
+    elif [[ -x "${DPDK_PREFIX:-/usr/local}/bin/dpdk-devbind.py" ]]; then
+        echo "${DPDK_PREFIX:-/usr/local}/bin/dpdk-devbind.py"
+    else
+        echo ""
+    fi
+}
+
 # Get MAC address from interface or from dpdk-devbind
 get_mac_for_pci() {
     local pci="$1"
@@ -59,7 +70,8 @@ get_mac_for_pci() {
     
     # If bound to DPDK, get from dpdk-devbind output
     # This is a backup - metadata is the primary source
-    dpdk-devbind.py --status 2>/dev/null | grep "$pci" | grep -oP "'[0-9a-fA-F:]+'" | tr -d "'" | head -1
+    local devbind=$(get_dpdk_devbind)
+    [[ -n "$devbind" ]] && $devbind --status 2>/dev/null | grep "$pci" | grep -oP "'[0-9a-fA-F:]+'" | tr -d "'" | head -1
 }
 
 # Generate configuration JSON
@@ -155,7 +167,9 @@ generate_config() {
         # Use dpdk-devbind to get status and find by checking PCI device properties
         if [[ -z "$pci" ]]; then
             # Get all DPDK-bound devices
-            local dpdk_devices=$(dpdk-devbind.py --status 2>/dev/null | grep "drv=vfio-pci" | awk '{print $1}')
+            local devbind=$(get_dpdk_devbind)
+            local dpdk_devices=""
+            [[ -n "$devbind" ]] && dpdk_devices=$($devbind --status 2>/dev/null | grep "drv=vfio-pci" | awk '{print $1}')
             
             for test_pci in $dpdk_devices; do
                 # For DPDK-bound devices, we can't get MAC from sysfs
@@ -183,7 +197,8 @@ generate_config() {
         
         # Determine role: check ACTUAL current binding status
         local role="kernel"
-        if dpdk-devbind.py --status 2>/dev/null | grep "$pci" | grep -q "drv=vfio-pci\|drv=igb_uio"; then
+        local devbind_check=$(get_dpdk_devbind)
+        if [[ -n "$devbind_check" ]] && $devbind_check --status 2>/dev/null | grep "$pci" | grep -q "drv=vfio-pci\|drv=igb_uio"; then
             role="dpdk"
         fi
         # Note: We only report actual state, not intended state

@@ -111,13 +111,15 @@ detect_cpus() {
 
 detect_nics() {
     declare -ga ALL_NICS
+    declare -ga DPDK_BOUND_NICS
+    declare -gA DPDK_NIC_PCI
     declare -g PRIMARY_NIC
     
     # Find primary NIC (used for SSH/default route)
     PRIMARY_NIC=$(ip route show default 2>/dev/null | head -1 | awk '{print $5}')
     
-    # Find all physical NICs
-    for iface in $(ls /sys/class/net/ | grep -v lo); do
+    # Find all physical NICs currently bound to kernel driver
+    for iface in $(ls /sys/class/net/ 2>/dev/null | grep -v lo); do
         # Skip virtual interfaces
         if [[ -d "/sys/devices/virtual/net/$iface" ]]; then
             continue
@@ -125,7 +127,50 @@ detect_nics() {
         ALL_NICS+=("$iface")
     done
     
+    # Find NICs already bound to DPDK (vfio-pci or igb_uio)
+    local dpdk_devbind=""
+    if command -v dpdk-devbind.py &>/dev/null; then
+        dpdk_devbind="dpdk-devbind.py"
+    elif [[ -x "$DPDK_PREFIX/bin/dpdk-devbind.py" ]]; then
+        dpdk_devbind="$DPDK_PREFIX/bin/dpdk-devbind.py"
+    fi
+    
+    if [[ -n "$dpdk_devbind" ]]; then
+        # Parse dpdk-devbind.py output for DPDK-bound devices
+        local in_dpdk_section=false
+        while IFS= read -r line; do
+            # Check for section headers
+            if [[ "$line" =~ ^Network\ devices\ using\ DPDK-compatible\ driver ]]; then
+                in_dpdk_section=true
+                continue
+            elif [[ "$line" =~ ^Network\ devices\ using\ kernel\ driver ]] || \
+                 [[ "$line" =~ ^Other\ Network\ devices ]] || \
+                 [[ "$line" =~ ^Crypto\ devices ]] || \
+                 [[ "$line" =~ ^[A-Z] ]]; then
+                in_dpdk_section=false
+                continue
+            fi
+            
+            # Parse DPDK-bound devices
+            if [[ "$in_dpdk_section" == "true" ]] && [[ "$line" =~ ^[0-9a-fA-F]{4}: ]]; then
+                local pci=$(echo "$line" | awk '{print $1}')
+                # Try to extract original interface name or construct from PCI slot
+                local slot=$(echo "$pci" | cut -d: -f2)
+                local slot_dec=$((16#$slot))
+                local ifname="enp${slot_dec}s0"
+                
+                # Add to detected lists
+                DPDK_BOUND_NICS+=("$ifname")
+                DPDK_NIC_PCI["$ifname"]="$pci"
+                ALL_NICS+=("$ifname")
+            fi
+        done < <($dpdk_devbind --status 2>/dev/null)
+    fi
+    
     echo "Detected NICs: ${ALL_NICS[*]}"
+    if [[ ${#DPDK_BOUND_NICS[@]} -gt 0 ]]; then
+        echo -e "  ${YELLOW}Already bound to DPDK: ${DPDK_BOUND_NICS[*]}${NC}"
+    fi
     echo "Primary NIC (SSH): $PRIMARY_NIC"
 }
 
@@ -159,8 +204,15 @@ cmd_detect() {
     echo "  - $PRIMARY_NIC: Keep for SSH/management (DO NOT bind to DPDK)"
     for nic in "${ALL_NICS[@]}"; do
         if [[ "$nic" != "$PRIMARY_NIC" ]]; then
-            local pci=$(readlink -f "/sys/class/net/$nic/device" | xargs basename)
-            echo "  - $nic ($pci): Available for DPDK"
+            local pci=""
+            local dpdk_tag=""
+            if [[ -n "${DPDK_NIC_PCI[$nic]:-}" ]]; then
+                pci="${DPDK_NIC_PCI[$nic]}"
+                dpdk_tag=" ${CYAN}[Already bound to DPDK]${NC}"
+            else
+                pci=$(readlink -f "/sys/class/net/$nic/device" 2>/dev/null | xargs basename)
+            fi
+            echo -e "  - $nic ($pci): Available for DPDK${dpdk_tag}"
         fi
     done
 }
@@ -241,21 +293,54 @@ cmd_wizard() {
     log_section "Step 3: NIC Allocation"
     echo "Available NICs:"
     for nic in "${ALL_NICS[@]}"; do
-        local pci=$(readlink -f "/sys/class/net/$nic/device" 2>/dev/null | xargs basename)
-        local ip=$(ip -4 addr show "$nic" 2>/dev/null | grep inet | head -1 | awk '{print $2}')
+        local pci=""
+        local ip=""
+        local dpdk_tag=""
         local primary_tag=""
+        
+        # Check if this NIC is already bound to DPDK
+        if [[ -n "${DPDK_NIC_PCI[$nic]:-}" ]]; then
+            pci="${DPDK_NIC_PCI[$nic]}"
+            dpdk_tag="${CYAN}[DPDK]${NC} "
+        else
+            pci=$(readlink -f "/sys/class/net/$nic/device" 2>/dev/null | xargs basename)
+            ip=$(ip -4 addr show "$nic" 2>/dev/null | grep inet | head -1 | awk '{print $2}')
+        fi
+        
         [[ "$nic" == "$PRIMARY_NIC" ]] && primary_tag="${YELLOW}[PRIMARY - SSH]${NC} "
-        echo -e "  ${primary_tag}$nic ($pci) - $ip"
+        
+        if [[ -n "$ip" ]]; then
+            echo -e "  ${primary_tag}${dpdk_tag}$nic ($pci) - $ip"
+        else
+            echo -e "  ${primary_tag}${dpdk_tag}$nic ($pci)"
+        fi
     done
     echo ""
     
     log_warning "Do NOT bind the primary NIC ($PRIMARY_NIC) to DPDK or you will lose SSH!"
     echo ""
     
-    # Auto-suggest: all NICs except primary
-    local suggested_nics=""
+    # Auto-suggest: select N NICs (N = number of DPDK cores) in reverse lexicographical order
+    # excluding the primary NIC
+    local num_dpdk_cores=${#DPDK_CPUS[@]}
+    
+    # Build array of available NICs (excluding primary), sorted in reverse lexicographical order
+    declare -a available_nics
     for nic in "${ALL_NICS[@]}"; do
-        [[ "$nic" != "$PRIMARY_NIC" ]] && suggested_nics="$suggested_nics$nic,"
+        [[ "$nic" != "$PRIMARY_NIC" ]] && available_nics+=("$nic")
+    done
+    
+    # Sort in reverse lexicographical order
+    IFS=$'\n' available_nics=($(printf '%s\n' "${available_nics[@]}" | sort -r))
+    unset IFS
+    
+    # Select up to num_dpdk_cores NICs
+    local suggested_nics=""
+    local count=0
+    for nic in "${available_nics[@]}"; do
+        [[ $count -ge $num_dpdk_cores ]] && break
+        suggested_nics="$suggested_nics$nic,"
+        count=$((count + 1))
     done
     suggested_nics="${suggested_nics%,}"  # Remove trailing comma
     
@@ -309,6 +394,19 @@ cmd_wizard() {
         exit 0
     fi
     
+    # Build PCI address list for DPDK NICs
+    local dpdk_nics_pci=""
+    for nic in "${DPDK_NICS[@]}"; do
+        local pci=""
+        if [[ -n "${DPDK_NIC_PCI[$nic]:-}" ]]; then
+            pci="${DPDK_NIC_PCI[$nic]}"
+        else
+            pci=$(readlink -f "/sys/class/net/$nic/device" 2>/dev/null | xargs basename)
+        fi
+        dpdk_nics_pci="$dpdk_nics_pci$pci "
+    done
+    dpdk_nics_pci="${dpdk_nics_pci% }"  # Remove trailing space
+    
     # Save configuration
     mkdir -p "$CONFIG_DIR"
     cat > "$LL_CONFIG_FILE" << EOF
@@ -318,6 +416,7 @@ cmd_wizard() {
 DPDK_CPUS="${DPDK_CPUS[*]}"
 SYSTEM_CPUS="${SYSTEM_CPUS[*]}"
 DPDK_NICS="${DPDK_NICS[*]}"
+DPDK_NICS_PCI="$dpdk_nics_pci"
 KERNEL_NICS="${KERNEL_NICS[*]}"
 HUGEPAGES="$hugepages"
 ISOLCPUS="$isolcpus"
@@ -638,18 +737,49 @@ cmd_dpdk_bind() {
         echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
     fi
     
+    # Build NIC to PCI mapping from saved config
+    declare -A nic_to_pci
+    local nics_array=($DPDK_NICS)
+    local pci_array=($DPDK_NICS_PCI)
+    for i in "${!nics_array[@]}"; do
+        if [[ -n "${pci_array[$i]:-}" ]]; then
+            nic_to_pci["${nics_array[$i]}"]="${pci_array[$i]}"
+        fi
+    done
+    
     # Bind each DPDK NIC
     for nic in $DPDK_NICS; do
-        if [[ ! -d "/sys/class/net/$nic" ]]; then
-            log_warning "$nic not found, may already be bound to DPDK"
+        local pci=""
+        
+        # First try to get PCI from sysfs (kernel-bound device)
+        if [[ -d "/sys/class/net/$nic" ]]; then
+            pci=$(readlink -f "/sys/class/net/$nic/device" 2>/dev/null | xargs basename)
+        fi
+        
+        # If not found, use saved PCI address
+        if [[ -z "$pci" ]] && [[ -n "${nic_to_pci[$nic]:-}" ]]; then
+            pci="${nic_to_pci[$nic]}"
+        fi
+        
+        # Skip if no PCI address found
+        if [[ -z "$pci" ]]; then
+            log_warning "$nic: Cannot determine PCI address, skipping"
             continue
         fi
         
-        local pci=$(readlink -f "/sys/class/net/$nic/device" | xargs basename)
+        # Check if already bound to DPDK
+        local devbind_status=""
+        devbind_status=$(dpdk-devbind.py --status 2>/dev/null) || \
+            devbind_status=$("$DPDK_PREFIX/bin/dpdk-devbind.py" --status 2>/dev/null) || true
+        
+        if echo "$devbind_status" | grep "$pci" | grep -q "drv=vfio-pci\|drv=igb_uio"; then
+            log_success "  $nic ($pci) already bound to DPDK"
+            continue
+        fi
         
         log_info "Binding $nic ($pci) to vfio-pci..."
         
-        # Bring down interface
+        # Bring down interface if still kernel-bound
         ip link set "$nic" down 2>/dev/null || true
         
         # Bind to vfio-pci

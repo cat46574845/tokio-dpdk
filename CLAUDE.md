@@ -2,6 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working Guidelines
+
+**Claude Code's Responsibility:** Do the work yourself. Do not delegate to the user.
+
+The user's role is limited to:
+- Making technical decisions when there are multiple valid approaches
+- Reviewing and approving results
+
+Claude Code should independently handle everything else:
+- Researching information (web searches, documentation)
+- Investigating code issues and debugging
+- Running tests and validating solutions
+- Setting up and configuring environments
+- Tracing problems through the codebase
+
+Do not ask the user to do research, check documentation, run commands, or investigate issues themselves. Use available tools to complete all work and report back with findings and solutions.
+
 ## Project Overview
 
 This is a fork of Tokio (asynchronous runtime for Rust) that integrates Intel DPDK (Data Plane Development Kit) for high-performance, low-latency networking. The project adds a new DPDK-based scheduler alongside Tokio's existing current-thread and multi-thread schedulers.
