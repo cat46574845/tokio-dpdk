@@ -394,6 +394,9 @@ pub(super) fn create(
         }));
     }
 
+    // Register handle for panic shutdown support
+    super::init::register_handle_for_panic(&handle);
+
     (handle, launch)
 }
 
@@ -498,6 +501,9 @@ pub(super) fn create_from_workers(
             core: AtomicCell::new(Some(core)),
         }));
     }
+
+    // Register handle for panic shutdown support
+    super::init::register_handle_for_panic(&handle);
 
     (handle, launch)
 }
