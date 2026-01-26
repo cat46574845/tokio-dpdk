@@ -250,9 +250,14 @@ impl Dpdk {
         let core_ids: Vec<usize> = plan.workers.iter().map(|w| w.core_id).collect();
         let _ = resource_lock.acquire_cores(&core_ids);
 
+        // Merge eal_args from env config with builder's extra args.
+        // Env config args come first, builder args follow (allowing overrides).
+        let mut combined_eal_args = env_config.eal_args.clone();
+        combined_eal_args.extend(dpdk_builder.get_eal_args().iter().cloned());
+
         // Initialize DPDK from allocation plan
         let (resources, initialized_workers) =
-            init::initialize_dpdk_from_plan(&plan, dpdk_builder.get_eal_args())?;
+            init::initialize_dpdk_from_plan(&plan, &combined_eal_args)?;
 
         // Create flow rules for multi-queue traffic routing
         // In multi-queue mode, rte_flow is REQUIRED for correct traffic routing.

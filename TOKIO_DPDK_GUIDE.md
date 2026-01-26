@@ -86,7 +86,7 @@ struct DeviceConfig {
 }
 ```
 
-> **注意**：配置文件中的 `version`、`platform`、`generated_at`、`eal_args` 字段會被忽略（用於人類閱讀或未來擴展）。EAL 參數應通過 Builder API 的 `dpdk_eal_args()` 方法指定。
+> **注意**：配置文件中的 `version`、`platform`、`generated_at` 字段會被忽略（用於人類閱讀）。`eal_args` 字段會被透傳至 `rte_eal_init()`，與 Builder API 的 `dpdk_eal_args()` 合併（env.json 優先，Builder 可覆蓋）。
 
 ### smoltcp 環境變量（必須！）
 

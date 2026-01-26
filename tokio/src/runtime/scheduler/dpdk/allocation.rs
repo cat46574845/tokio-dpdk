@@ -366,6 +366,7 @@ mod tests {
         DpdkEnvConfig {
             devices,
             dpdk_cores: cores,
+            eal_args: Vec::new(),
         }
     }
 

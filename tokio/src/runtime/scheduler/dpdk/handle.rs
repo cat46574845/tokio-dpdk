@@ -12,6 +12,7 @@ use crate::runtime::{blocking, driver, TaskHooks, TaskMeta, TimerFlavor};
 use crate::util::RngSeedGenerator;
 
 use std::fmt;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU64;
 
 use super::worker::{self, Notified as WorkerNotified, Shared};
@@ -72,6 +73,11 @@ impl Handle {
         // First, close the inject queue and signal workers to stop
         self.close();
 
+        // Close per-worker inject queues to prevent new targeted tasks
+        for remote in self.shared.remotes.iter() {
+            remote.per_inject.close();
+        }
+
         // Mark as shutting down
         self.is_shutdown.store(true, Ordering::SeqCst);
 
@@ -88,6 +94,13 @@ impl Handle {
             drop(task);
         }
         drop(synced);
+
+        // Drain per-worker inject queues
+        for remote in self.shared.remotes.iter() {
+            while let Some(task) = remote.per_inject.pop() {
+                drop(task);
+            }
+        }
 
         // Note: DPDK device cleanup (mbufs) is handled automatically by DpdkDevice::drop,
         // which is guaranteed to run BEFORE DpdkResourcesCleaner::drop (mempool/EAL cleanup)
@@ -222,20 +235,15 @@ impl Handle {
         }
     }
 
-    /// Spawns a task to be executed on a specific core.
+    /// Spawns a `Send` task targeted to a specific worker's queue.
     ///
-    /// The task will be placed in the inject queue and picked up by the target worker.
-    /// Note: Due to DPDK's no-work-stealing design, there's no per-worker inject queue,
-    /// so the task may initially be picked up by any worker but will eventually run on
-    /// the target core through task scheduling.
-    ///
-    /// For guaranteed execution on a specific core, the task should check `current_worker_index()`
-    /// and re-schedule itself if not on the correct core. This API provides best-effort placement.
+    /// The task is placed in the target worker's per-worker inject queue, which
+    /// guarantees it will be picked up only by that worker. If the caller is
+    /// already on the target worker, the task is scheduled directly to the local queue.
     #[track_caller]
-    #[allow(dead_code)] // Public API - will be exposed to users
-    pub(crate) fn spawn_on_core<F>(
+    pub(crate) fn spawn_on_worker<F>(
         me: &Arc<Self>,
-        core_id: usize,
+        worker_index: usize,
         future: F,
         id: task::Id,
         spawned_at: SpawnLocation,
@@ -244,54 +252,78 @@ impl Handle {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        // Validate core_id
-        if core_id >= me.shared.remotes.len() {
-            panic!(
-                "spawn_on_core: core_id {} is out of range (max {})",
-                core_id,
-                me.shared.remotes.len() - 1
-            );
+        assert!(
+            worker_index < me.shared.remotes.len(),
+            "spawn_on_worker: worker_index {} is out of range (num_workers: {})",
+            worker_index,
+            me.shared.remotes.len()
+        );
+
+        let (handle, notified) = me.shared.owned.bind(future, me.clone(), id, spawned_at);
+
+        me.task_hooks.spawn(&TaskMeta {
+            id,
+            spawned_at,
+            _phantom: Default::default(),
+        });
+
+        if let Some(task) = notified {
+            // If already on the target worker, schedule locally for lower latency
+            if worker::current_worker_index() == Some(worker_index) {
+                worker::with_current(|ctx| {
+                    if let Some(cx) = ctx {
+                        if let Some(core) = cx.core.borrow_mut().as_mut() {
+                            me.schedule_local(core, task, false);
+                            return;
+                        }
+                    }
+                    me.push_worker_task(worker_index, task);
+                });
+            } else {
+                me.push_worker_task(worker_index, task);
+            }
         }
 
-        // For now, we use the standard spawn mechanism since DPDK doesn't have
-        // per-worker inject queues. The task will be picked up by any worker.
-        // TODO: Implement per-worker inject queues for strict core affinity.
-        let _ = core_id; // Suppress warning - future implementation will use this
-        Self::bind_new_task(me, future, id, spawned_at)
+        handle
     }
 
-    /// Spawns a task to be executed on the current core.
+    /// Spawns a `!Send` future on the current DPDK worker thread.
     ///
-    /// This must be called from a DPDK worker thread. The task will be placed
-    /// in the current worker's local queue for immediate execution on this core.
+    /// # Safety
     ///
-    /// Returns `None` if not called from a DPDK worker thread.
+    /// This uses `bind_local` which creates a task that is not `Send`.
+    /// This is safe because DPDK workers:
+    /// - Have CPU affinity (pinned to a specific core)
+    /// - Never steal work from other workers
+    /// - Only consume tasks from their own local queue
+    ///
+    /// These properties guarantee single-threaded execution for !Send futures.
+    ///
+    /// Returns `None` if not called from a DPDK worker thread of this runtime.
     #[track_caller]
-    #[allow(dead_code)] // Public API - will be exposed to users
-    pub(crate) fn spawn_local_core<F>(
+    pub(crate) fn spawn_local_impl<F>(
         me: &Arc<Self>,
         future: F,
         id: task::Id,
         spawned_at: SpawnLocation,
     ) -> Option<JoinHandle<F::Output>>
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: Future + 'static,
+        F::Output: 'static,
     {
-        // Check if we're on a DPDK worker thread
         worker::with_current(|maybe_cx| {
             let cx = maybe_cx?;
 
             // Verify we're in the same runtime
-            let same_runtime =
-                std::ptr::eq(&cx.worker.handle.shared as *const _, &me.shared as *const _);
-
-            if !same_runtime {
+            if !std::ptr::eq(&cx.worker.handle.shared as *const _, &me.shared as *const _) {
                 return None;
             }
 
-            // Bind the task
-            let (handle, notified) = me.shared.owned.bind(future, me.clone(), id, spawned_at);
+            // Safety: DPDK workers never migrate tasks (no work stealing, CPU affinity).
+            // Tasks in the local queue are only consumed by the owning worker.
+            let (handle, notified) = unsafe {
+                me.shared.owned.bind_local(future, me.clone(), id, spawned_at)
+            };
 
             me.task_hooks.spawn(&TaskMeta {
                 id,
@@ -299,18 +331,59 @@ impl Handle {
                 _phantom: Default::default(),
             });
 
-            // Schedule directly to local queue
+            // Schedule to local queue
             if let Some(task) = notified {
                 if let Some(core) = cx.core.borrow_mut().as_mut() {
                     me.schedule_local(core, task, false);
-                } else {
-                    // If no core (shouldn't happen on worker thread), use inject queue
-                    me.push_remote_task(task);
                 }
             }
 
             Some(handle)
         })
+    }
+
+    /// Pushes a task to a specific worker's per-worker inject queue.
+    pub(crate) fn push_worker_task(&self, worker_index: usize, task: WorkerNotified) {
+        self.shared.remotes[worker_index].per_inject.push(task);
+    }
+
+    /// Pops a task from a specific worker's per-worker inject queue.
+    #[allow(dead_code)]
+    pub(crate) fn next_worker_task(&self, worker_index: usize) -> Option<WorkerNotified> {
+        self.shared.remotes[worker_index].per_inject.pop()
+    }
+
+    /// Pushes a factory closure to a specific worker's local_spawn_queue.
+    ///
+    /// The closure will be executed on the target worker thread, where it can
+    /// create and spawn !Send futures.
+    pub(crate) fn push_local_spawn_factory(
+        &self,
+        worker_index: usize,
+        factory: Box<dyn FnOnce() + Send + 'static>,
+    ) {
+        assert!(worker_index < self.shared.remotes.len());
+        let mut queue = self.shared.remotes[worker_index]
+            .local_spawn_queue
+            .lock()
+            .unwrap();
+        queue.push(factory);
+    }
+
+    /// Returns the IPv4 address configured on the specified worker's DPDK interface.
+    pub(crate) fn worker_ipv4(&self, worker_index: usize) -> Option<Ipv4Addr> {
+        let driver_mutex = self.shared.drivers.get(worker_index)?;
+        let driver = driver_mutex.lock().ok()?;
+        // smoltcp::wire::Ipv4Address is a type alias for std::net::Ipv4Addr
+        driver.get_ipv4_address()
+    }
+
+    /// Returns the IPv6 address configured on the specified worker's DPDK interface.
+    pub(crate) fn worker_ipv6(&self, worker_index: usize) -> Option<Ipv6Addr> {
+        let driver_mutex = self.shared.drivers.get(worker_index)?;
+        let driver = driver_mutex.lock().ok()?;
+        // smoltcp::wire::Ipv6Address is a type alias for std::net::Ipv6Addr
+        driver.get_ipv6_address()
     }
 
     /// Shuts down a worker's core.
@@ -330,11 +403,18 @@ impl Handle {
         let mut cores = self.shared.shutdown_cores.lock();
         cores.push(core);
 
-        // If all workers have shut down, drain the inject queue
+        // If all workers have shut down, drain the inject queue and per-worker queues
         // The inject queue has no CPU affinity requirement
         if cores.len() == self.shared.remotes.len() {
             while let Some(task) = self.next_remote_task() {
                 drop(task);
+            }
+
+            // Drain any remaining per-worker inject queue tasks
+            for remote in self.shared.remotes.iter() {
+                while let Some(task) = remote.per_inject.pop() {
+                    drop(task);
+                }
             }
         }
     }

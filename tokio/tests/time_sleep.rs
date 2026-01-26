@@ -375,13 +375,17 @@ mod dpdk_flavor {
         Duration::from_millis(n)
     }
 
+    fn dpdk_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_dpdk()
+            .enable_all()
+            .build()
+            .expect("Failed building the DPDK Runtime")
+    }
+
     #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn dpdk_short_sleeps() {
-        let rt = tokio::runtime::Builder::new_dpdk()
-            .enable_all()
-            .build()
-            .expect("Failed building the Runtime");
+        let rt = dpdk_rt();
         rt.block_on(async {
             for _ in 0..10 {
                 tokio::time::sleep(std::time::Duration::from_millis(0)).await;
@@ -392,10 +396,7 @@ mod dpdk_flavor {
     #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn dpdk_delayed_sleep() {
-        let rt = tokio::runtime::Builder::new_dpdk()
-            .enable_all()
-            .build()
-            .expect("Failed building the Runtime");
+        let rt = dpdk_rt();
         rt.block_on(async {
             let now = Instant::now();
             let dur = ms(50);
@@ -411,10 +412,7 @@ mod dpdk_flavor {
     #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn dpdk_concurrent_sleeps() {
-        let rt = tokio::runtime::Builder::new_dpdk()
-            .enable_all()
-            .build()
-            .expect("Failed building the Runtime");
+        let rt = dpdk_rt();
         rt.block_on(async {
             let start = Instant::now();
 

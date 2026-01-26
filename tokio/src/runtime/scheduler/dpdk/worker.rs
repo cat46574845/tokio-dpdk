@@ -258,6 +258,14 @@ pub(super) struct Remote {
     /// Barrier for resume synchronization.
     /// Worker and main thread both wait here when worker is resuming.
     pub(super) resume_barrier: std::sync::Barrier,
+
+    /// Per-worker inject queue for spawn_on (targeted task spawning).
+    /// Tasks pushed here will only be consumed by this specific worker.
+    pub(super) per_inject: inject::Inject<Arc<Handle>>,
+
+    /// Queue of factory closures for spawn_local_on (!Send task spawning).
+    /// Each closure creates a !Send future and spawns it locally on this worker.
+    pub(super) local_spawn_queue: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
 /// Thread-local context
@@ -352,6 +360,8 @@ pub(super) fn create(
             transfer_requested: AtomicBool::new(false),
             pause_barrier: std::sync::Barrier::new(2),
             resume_barrier: std::sync::Barrier::new(2),
+            per_inject: inject::Inject::new(),
+            local_spawn_queue: std::sync::Mutex::new(Vec::new()),
         });
         worker_metrics.push(metrics);
     }
@@ -460,6 +470,8 @@ pub(super) fn create_from_workers(
             transfer_requested: AtomicBool::new(false),
             pause_barrier: std::sync::Barrier::new(2),
             resume_barrier: std::sync::Barrier::new(2),
+            per_inject: inject::Inject::new(),
+            local_spawn_queue: std::sync::Mutex::new(Vec::new()),
         });
         worker_metrics.push(metrics);
     }
@@ -881,6 +893,9 @@ impl Context {
             // Poll DPDK network stack (receive packets, process TCP/IP, wake socket tasks)
             self.poll_dpdk_driver();
 
+            // Process any pending factory closures from spawn_local_on
+            self.process_local_spawn_queue();
+
             // Start tracking scheduled task processing
             if let Some(core) = self.core.borrow_mut().as_mut() {
                 core.stats.start_processing_scheduled_tasks();
@@ -960,6 +975,14 @@ impl Context {
     /// - Batch-pull tasks from inject queue to local queue
     /// - LIFO slot with starvation prevention
     fn next_task_with_fairness(&self, lifo_polls: &mut usize) -> Option<Notified> {
+        // Check per-worker inject queue first (targeted tasks from spawn_on).
+        // This is checked every tick since the atomic load is cheap and
+        // targeted tasks should be picked up promptly.
+        if let Some(task) = self.next_per_worker_task() {
+            *lifo_polls = 0;
+            return Some(task);
+        }
+
         let mut core = self.core.borrow_mut();
         let core = core.as_mut()?;
 
@@ -1192,6 +1215,18 @@ impl Context {
             // Drain LIFO slot
             drop(core.lifo_slot.take());
 
+            // Drain per-worker inject queue
+            let remote = &self.worker.handle.shared.remotes[self.worker.index];
+            while let Some(task) = remote.per_inject.pop() {
+                drop(task);
+            }
+
+            // Drain local_spawn_queue (discard pending factory closures)
+            {
+                let mut queue = remote.local_spawn_queue.lock().unwrap();
+                queue.clear();
+            }
+
             // Check if this is a block_on scenario - if so, return Core instead of
             // giving it to handle.shutdown_core(), so it can be respawned
             if self.block_on_state.borrow().is_some() {
@@ -1216,6 +1251,31 @@ impl Context {
         if let Some(core) = self.core.borrow_mut().as_mut() {
             core.lifo_enabled = !self.worker.handle.shared.config.disable_lifo_slot;
         }
+    }
+
+    /// Process pending factory closures from the local_spawn_queue.
+    ///
+    /// This drains closures pushed by `spawn_local_on` and executes them
+    /// on this worker thread, where they create and spawn !Send futures.
+    fn process_local_spawn_queue(&self) {
+        let remote = &self.worker.handle.shared.remotes[self.worker.index];
+        let factories: Vec<Box<dyn FnOnce() + Send + 'static>> = {
+            let mut queue = remote.local_spawn_queue.lock().unwrap();
+            if queue.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *queue)
+        };
+        for factory in factories {
+            factory();
+        }
+    }
+
+    /// Pop a task from this worker's per-worker inject queue.
+    fn next_per_worker_task(&self) -> Option<Notified> {
+        self.worker.handle.shared.remotes[self.worker.index]
+            .per_inject
+            .pop()
     }
 }
 

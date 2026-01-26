@@ -45,12 +45,16 @@ This is a fork of Tokio (asynchronous runtime for Rust) that integrates Intel DP
 
 ### Build Commands
 
+**IMPORTANT:** Always use `cargo-fast` instead of `cargo` for all build, check, and test commands. This applies to `build`, `check`, `test`, `clippy`, and all other cargo subcommands.
+
+**IMPORTANT:** Never use `tail` or `head` to truncate test output. Always show the full, complete output when running tests. This ensures no errors or important information is missed.
+
 ```bash
 # Standard build (requires DPDK)
-cargo build
+cargo-fast build
 
 # Build specific package
-cargo build -p tokio
+cargo-fast build -p tokio
 
 # Build will compile DPDK C wrappers (build.rs)
 # On Windows: uses hardcoded paths to DPDK installation
@@ -59,18 +63,20 @@ cargo build -p tokio
 
 ### Running Tests
 
+DPDK tests require environment variables and sudo isolation:
+
 ```bash
-# Run all tests
-cargo test
+# Run all tests (recommended)
+source .env && export DPDK_TEST_PORT
+SERIAL_ISOLATION_SUDO=1 cargo-fast test --manifest-path tokio/Cargo.toml --features "full,test-util"
 
-# Run DPDK-specific tests (requires DPDK environment)
-cargo test --test tcp_dpdk
+# Run specific DPDK test
+source .env && export DPDK_TEST_PORT
+SERIAL_ISOLATION_SUDO=1 cargo-fast test --manifest-path tokio/Cargo.toml --test tcp_dpdk --features full
 
-# Run tokio core tests
-cargo test -p tokio
-
-# Run single test
-cargo test --test tcp_dpdk tcp_dpdk_stream_connect
+# Run single test function
+source .env && export DPDK_TEST_PORT
+SERIAL_ISOLATION_SUDO=1 cargo-fast test --manifest-path tokio/Cargo.toml --test tcp_dpdk --features full -- test_name
 ```
 
 ### Common Issues

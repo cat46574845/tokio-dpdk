@@ -52,6 +52,13 @@ pub(crate) struct DpdkEnvConfig {
     /// CPU cores available for DPDK workers.
     #[serde(default)]
     pub dpdk_cores: Vec<usize>,
+
+    /// Extra EAL arguments to pass to rte_eal_init.
+    ///
+    /// These are merged with any EAL arguments specified via the Builder API.
+    /// Environment config args are applied first, then builder args (allowing overrides).
+    #[serde(default)]
+    pub eal_args: Vec<String>,
 }
 
 /// Configuration for a single DPDK device.
@@ -164,6 +171,7 @@ impl Default for DpdkEnvConfig {
         Self {
             devices: Vec::new(),
             dpdk_cores: Vec::new(),
+            eal_args: Vec::new(),
         }
     }
 }
@@ -328,7 +336,8 @@ mod tests {
 
     #[test]
     fn test_parse_config_with_extra_fields() {
-        // Test that extra fields in JSON (like version, platform, eal_args) are ignored
+        // Test that extra fields in JSON (like version, platform) are ignored,
+        // and eal_args is correctly parsed
         let json = r#"{
             "version": 2,
             "platform": "aws-ec2",
@@ -341,5 +350,18 @@ mod tests {
         let config = DpdkEnvConfig::parse_json(json).unwrap();
         assert_eq!(config.dpdk_cores, vec![1]);
         assert!(config.devices.is_empty());
+        assert_eq!(config.eal_args, vec!["--iova-mode=pa".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_config_without_eal_args() {
+        // eal_args should default to empty when not present
+        let json = r#"{
+            "dpdk_cores": [1],
+            "devices": []
+        }"#;
+
+        let config = DpdkEnvConfig::parse_json(json).unwrap();
+        assert!(config.eal_args.is_empty());
     }
 }

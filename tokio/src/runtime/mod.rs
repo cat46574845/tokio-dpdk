@@ -381,6 +381,10 @@ pub(crate) mod driver;
 
 pub(crate) mod scheduler;
 
+cfg_rt_multi_thread! {
+    pub mod dpdk;
+}
+
 cfg_io_driver_impl! {
     pub(crate) mod io;
 }

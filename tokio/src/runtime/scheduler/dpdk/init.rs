@@ -361,7 +361,14 @@ pub(crate) fn initialize_dpdk(builder: &DpdkBuilder) -> io::Result<DpdkResources
     }
 
     // 2. Generate and call EAL init
-    let eal_args = generate_eal_args(&resolved_devices, builder.get_eal_args());
+    // Merge eal_args from env config (best-effort) with builder's extra args.
+    // Env config args come first, builder args follow (allowing overrides).
+    let env_eal_args = super::env_config::DpdkEnvConfig::load()
+        .map(|c| c.eal_args)
+        .unwrap_or_default();
+    let mut combined_extra_args = env_eal_args;
+    combined_extra_args.extend(builder.get_eal_args().iter().cloned());
+    let eal_args = generate_eal_args(&resolved_devices, &combined_extra_args);
     init_eal(&eal_args)?;
 
     // 3. Create mempool

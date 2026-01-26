@@ -218,11 +218,18 @@ cfg_rt! {
             F: Future + 'static,
             F::Output: 'static,
         {
-            if let Handle::CurrentThread(h) = self {
-                // Safety: caller guarantees that this is a `LocalRuntime`.
-                unsafe { current_thread::Handle::spawn_local(h, future, id, spawned_at) }
-            } else {
-                panic!("Only current_thread and LocalSet have spawn_local internals implemented")
+            match self {
+                Handle::CurrentThread(h) => {
+                    // Safety: caller guarantees that this is a `LocalRuntime`.
+                    unsafe { current_thread::Handle::spawn_local(h, future, id, spawned_at) }
+                }
+                #[cfg(feature = "rt-multi-thread")]
+                Handle::Dpdk(h) => {
+                    dpdk::Handle::spawn_local_impl(h, future, id, spawned_at)
+                        .expect("spawn_local on DPDK requires being on a DPDK worker thread")
+                }
+                #[cfg(feature = "rt-multi-thread")]
+                _ => panic!("Only current_thread, LocalSet, and DPDK have spawn_local internals implemented"),
             }
         }
 
