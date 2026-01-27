@@ -47,7 +47,7 @@ This is a fork of Tokio (asynchronous runtime for Rust) that integrates Intel DP
 
 **IMPORTANT:** Always use `cargo-fast` instead of `cargo` for all build, check, and test commands. This applies to `build`, `check`, `test`, `clippy`, and all other cargo subcommands.
 
-**IMPORTANT:** Never use `tail` or `head` to truncate test output. Always show the full, complete output when running tests. This ensures no errors or important information is missed.
+**CRITICAL: NEVER use `tail`, `head`, or any other command to truncate build/test/command output. ALWAYS show the FULL, COMPLETE, UNTRUNCATED output. Truncated output hides errors and wastes debugging time. This is a HARD requirement with NO exceptions.**
 
 ```bash
 # Standard build (requires DPDK)

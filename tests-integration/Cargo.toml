@@ -30,6 +30,15 @@ name = "macros_select"
 name = "rt_yield"
 required-features = ["rt", "macros", "sync"]
 
+[[test]]
+name = "dpdk_tcp_stream_tests"
+
+[[test]]
+name = "dpdk_tcp_listener_tests"
+
+[[test]]
+name = "dpdk_tcp_socket_tests"
+
 [features]
 # For mem check
 rt-net = ["tokio/rt", "tokio/rt-multi-thread", "tokio/net"]
@@ -61,6 +70,7 @@ tokio-test = { version = "0.4", path = "../tokio-test", optional = true }
 doc-comment = "0.3.1"
 futures = { version = "0.3.0", features = ["async-await"] }
 bytes = "1.0.0"
+serial_isolation_test = { path = "../../serial_isolation_test" }
 
 [lints]
 workspace = true
