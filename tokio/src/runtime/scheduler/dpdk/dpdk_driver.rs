@@ -376,7 +376,8 @@ impl DpdkDriver {
 
     /// Get the first IPv4 address configured on this interface.
     ///
-    /// This is used as the source address for outgoing connections.
+    /// This is used as the default source address for outgoing connections.
+    /// To get all configured addresses, use `get_ipv4_addresses()`.
     pub(crate) fn get_ipv4_address(&self) -> Option<smoltcp::wire::Ipv4Address> {
         for cidr in self.iface.ip_addrs() {
             if let smoltcp::wire::IpAddress::Ipv4(addr) = cidr.address() {
@@ -391,8 +392,9 @@ impl DpdkDriver {
 
     /// Get the first global unicast IPv6 address configured on this interface.
     ///
-    /// This is used as the source address for outgoing IPv6 connections.
+    /// This is used as the default source address for outgoing IPv6 connections.
     /// Link-local addresses (fe80::) are excluded as they're not routable.
+    /// To get all configured addresses, use `get_ipv6_addresses()`.
     pub(crate) fn get_ipv6_address(&self) -> Option<smoltcp::wire::Ipv6Address> {
         for cidr in self.iface.ip_addrs() {
             if let smoltcp::wire::IpAddress::Ipv6(addr) = cidr.address() {
@@ -403,6 +405,38 @@ impl DpdkDriver {
             }
         }
         None
+    }
+
+    /// Get all IPv4 addresses configured on this interface.
+    ///
+    /// Filters out unspecified addresses (0.0.0.0).
+    /// Returns addresses in the order configured by smoltcp.
+    pub(crate) fn get_ipv4_addresses(&self) -> Vec<smoltcp::wire::Ipv4Address> {
+        let mut addrs = Vec::new();
+        for cidr in self.iface.ip_addrs() {
+            if let smoltcp::wire::IpAddress::Ipv4(addr) = cidr.address() {
+                if !addr.is_unspecified() {
+                    addrs.push(addr);
+                }
+            }
+        }
+        addrs
+    }
+
+    /// Get all global unicast IPv6 addresses configured on this interface.
+    ///
+    /// Excludes link-local (fe80::) and unspecified (::) addresses.
+    /// Returns addresses in the order configured by smoltcp.
+    pub(crate) fn get_ipv6_addresses(&self) -> Vec<smoltcp::wire::Ipv6Address> {
+        let mut addrs = Vec::new();
+        for cidr in self.iface.ip_addrs() {
+            if let smoltcp::wire::IpAddress::Ipv6(addr) = cidr.address() {
+                if !addr.is_unspecified() && !addr.is_unicast_link_local() {
+                    addrs.push(addr);
+                }
+            }
+        }
+        addrs
     }
 
     /// Check if a port is already in use.

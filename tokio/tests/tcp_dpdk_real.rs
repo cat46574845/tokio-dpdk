@@ -32,47 +32,6 @@ const LOCAL_VPC_SSH: &str = "172.31.1.228:22";
 /// Simple HTTP GET request
 const HTTP_GET: &[u8] = b"GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n";
 
-/// Detect first available DPDK device from env.json configuration.
-fn detect_dpdk_device() -> String {
-    const CONFIG_PATHS: &[&str] = &[
-        "/etc/dpdk/env.json",
-        "./config/dpdk-env.json",
-        "./dpdk-env.json",
-    ];
-
-    for path in CONFIG_PATHS {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Some(dpdk_device) = find_dpdk_device_in_json(&content) {
-                return dpdk_device;
-            }
-        }
-    }
-
-    panic!(
-        "No DPDK device found in env.json. Searched: {:?}",
-        CONFIG_PATHS
-    )
-}
-
-/// Find first DPDK device (PCI address) from JSON config content using serde_json.
-fn find_dpdk_device_in_json(content: &str) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_str(content).ok()?;
-
-    if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
-        for device in devices {
-            let role = device.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            if role == "dpdk" {
-                // Prefer PCI address as it's always present
-                if let Some(pci) = device.get("pci_address").and_then(|p| p.as_str()) {
-                    return Some(pci.to_string());
-                }
-            }
-        }
-    }
-
-    None
-}
-
 /// Detect DPDK interface IP address from env.json.
 fn detect_dpdk_ip() -> Option<String> {
     let config_paths = [
@@ -119,15 +78,13 @@ fn find_dpdk_ip_in_json(content: &str) -> Option<String> {
 
 /// Create a DPDK runtime for testing.
 fn dpdk_rt() -> Runtime {
-    let device = detect_dpdk_device();
     tokio::runtime::Builder::new_dpdk()
-        .dpdk_device(&device)
         .enable_all()
         .build()
         .unwrap_or_else(|e| {
             panic!(
-                "DPDK runtime creation failed for device '{}' - ensure DPDK is properly configured: {:?}",
-                device, e
+                "DPDK runtime creation failed - ensure DPDK is properly configured: {:?}",
+                e
             )
         })
 }

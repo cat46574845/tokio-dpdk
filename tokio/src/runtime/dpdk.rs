@@ -157,6 +157,55 @@ pub fn current_ipv6() -> Option<Ipv6Addr> {
     worker_ipv6(current_worker())
 }
 
+/// Returns all IPv4 addresses configured on the specified worker's DPDK interface.
+///
+/// Returns an empty Vec if the worker has no IPv4 addresses configured.
+///
+/// # Panics
+///
+/// Panics if not called from within a DPDK runtime context.
+#[track_caller]
+pub fn worker_ipv4s(id: WorkerId) -> Vec<Ipv4Addr> {
+    with_dpdk_handle(|h| h.worker_ipv4s(id.index))
+}
+
+/// Returns all IPv6 addresses configured on the specified worker's DPDK interface.
+///
+/// Link-local addresses (fe80::) are excluded.
+/// Returns an empty Vec if the worker has no IPv6 addresses configured.
+///
+/// # Panics
+///
+/// Panics if not called from within a DPDK runtime context.
+#[track_caller]
+pub fn worker_ipv6s(id: WorkerId) -> Vec<Ipv6Addr> {
+    with_dpdk_handle(|h| h.worker_ipv6s(id.index))
+}
+
+/// Returns all IPv4 addresses configured on the current worker's DPDK interface.
+///
+/// Convenience function equivalent to `worker_ipv4s(current_worker())`.
+///
+/// # Panics
+///
+/// Panics if not called from a DPDK worker thread.
+#[track_caller]
+pub fn current_ipv4s() -> Vec<Ipv4Addr> {
+    worker_ipv4s(current_worker())
+}
+
+/// Returns all IPv6 addresses configured on the current worker's DPDK interface.
+///
+/// Convenience function equivalent to `worker_ipv6s(current_worker())`.
+///
+/// # Panics
+///
+/// Panics if not called from a DPDK worker thread.
+#[track_caller]
+pub fn current_ipv6s() -> Vec<Ipv6Addr> {
+    worker_ipv6s(current_worker())
+}
+
 // ============================================================================
 // Spawn APIs
 // ============================================================================

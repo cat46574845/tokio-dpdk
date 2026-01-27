@@ -21,51 +21,33 @@ use tokio::runtime::Runtime;
 /// Create a DPDK runtime using all cores from configuration.
 /// This is the default mode used by `#[tokio::test(flavor = "dpdk")]`.
 pub fn dpdk_rt_all_cores() -> Arc<Runtime> {
-    let device = detect_dpdk_device();
-
     Arc::new(
         tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(&device)
             .enable_all()
             .build()
-            .expect(&format!(
-                "DPDK runtime creation failed for device '{}'",
-                device
-            )),
+            .expect("DPDK runtime creation failed"),
     )
 }
 
 /// Create a DPDK runtime using a single core.
 pub fn dpdk_rt_single_core() -> Arc<Runtime> {
-    let device = detect_dpdk_device();
-
     Arc::new(
         tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(&device)
             .worker_threads(1)
             .enable_all()
             .build()
-            .expect(&format!(
-                "DPDK runtime creation failed for device '{}'",
-                device
-            )),
+            .expect("DPDK runtime creation failed"),
     )
 }
 
 /// Create a DPDK runtime using specified number of cores.
 pub fn dpdk_rt_n_cores(n: usize) -> Arc<Runtime> {
-    let device = detect_dpdk_device();
-
     Arc::new(
         tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(&device)
             .worker_threads(n)
             .enable_all()
             .build()
-            .expect(&format!(
-                "DPDK runtime creation failed for device '{}'",
-                device
-            )),
+            .expect("DPDK runtime creation failed"),
     )
 }
 
@@ -73,7 +55,7 @@ pub fn dpdk_rt_n_cores(n: usize) -> Arc<Runtime> {
 pub fn dpdk_rt_with_device(pci_address: &str) -> Arc<Runtime> {
     Arc::new(
         tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(pci_address)
+            .dpdk_pci_addresses(&[pci_address])
             .enable_all()
             .build()
             .expect(&format!(
@@ -84,6 +66,7 @@ pub fn dpdk_rt_with_device(pci_address: &str) -> Arc<Runtime> {
 }
 
 /// Get the DPDK device PCI address from configuration.
+/// Kept for informational purposes in tests that need to log device info.
 pub fn detect_dpdk_device() -> String {
     let env = DpdkEnv::get();
     env.dpdk_device()

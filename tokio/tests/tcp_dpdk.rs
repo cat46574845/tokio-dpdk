@@ -16,49 +16,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
-/// Get DPDK device PCI address from /etc/dpdk/env.json
-fn detect_dpdk_device() -> String {
-    const CONFIG_PATHS: &[&str] = &[
-        "/etc/dpdk/env.json",
-        "./config/dpdk-env.json",
-        "./dpdk-env.json",
-    ];
-
-    for path in CONFIG_PATHS {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
-                    for device in devices {
-                        if device.get("role").and_then(|r| r.as_str()) == Some("dpdk") {
-                            if let Some(pci) = device.get("pci_address").and_then(|p| p.as_str()) {
-                                return pci.to_string();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    panic!(
-        "No DPDK device found in env.json. Searched: {:?}",
-        CONFIG_PATHS
-    )
-}
-
 /// Helper to create a DPDK runtime for testing.
 /// Requires real DPDK environment - no fallback.
 fn dpdk_rt() -> Arc<Runtime> {
-    let device = detect_dpdk_device();
-
     tokio::runtime::Builder::new_dpdk()
-        .dpdk_device(&device)
         .enable_all()
         .build()
-        .expect(&format!(
-            "DPDK runtime creation failed for device '{}' - ensure DPDK is properly configured",
-            device
-        ))
+        .expect("DPDK runtime creation failed - ensure DPDK is properly configured and env.json exists")
         .into()
 }
 
@@ -461,9 +425,10 @@ mod dpdk_specific {
 
         // Test device configuration (this won't actually work without DPDK)
         // These methods return &mut Builder, so we use them in-place
-        builder.dpdk_device("eth0");
-        builder.dpdk_devices(&["eth0", "eth1"]);
-        builder.dpdk_eal_arg("--no-huge");
+        builder.dpdk_pci_addresses(&["0000:28:00.0"]);
+        builder.dpdk_mempool_size(16384);
+        builder.dpdk_cache_size(512);
+        builder.dpdk_queue_descriptors(256);
 
         // Building will fail without DPDK, but configuration should work
         let result = builder.build();
@@ -820,9 +785,7 @@ mod worker_affinity_tests {
     #[test]
     fn stream_worker_affinity_enforcement() {
         // Create runtime with 2 workers
-        let device = detect_dpdk_device();
         let rt = tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(&device)
             .worker_threads(2)
             .enable_all()
             .build()
@@ -867,9 +830,7 @@ mod worker_affinity_tests {
     #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn streams_on_different_workers() {
-        let device = detect_dpdk_device();
         let rt = tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(&device)
             .worker_threads(2)
             .enable_all()
             .build()
@@ -929,9 +890,7 @@ mod worker_affinity_tests {
     #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn drop_on_wrong_worker_warns_not_panics() {
-        let device = detect_dpdk_device();
         let rt = tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(&device)
             .worker_threads(2)
             .enable_all()
             .build()
@@ -983,9 +942,7 @@ mod multi_worker_tests {
     #[test]
     fn multi_worker_task_distribution() {
         // Create runtime with multiple workers if supported
-        let device = detect_dpdk_device();
         let rt = tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(&device)
             .worker_threads(2) // Request 2 workers
             .enable_all()
             .build()
@@ -1019,10 +976,8 @@ mod multi_worker_tests {
     #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn multi_worker_cross_spawn() {
-        let device = detect_dpdk_device();
         let rt = Arc::new(
             tokio::runtime::Builder::new_dpdk()
-                .dpdk_device(&device)
                 .worker_threads(2)
                 .enable_all()
                 .build()
@@ -1053,9 +1008,7 @@ mod multi_worker_tests {
     #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn multi_worker_channel_communication() {
-        let device = detect_dpdk_device();
         let rt = tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(&device)
             .worker_threads(2)
             .enable_all()
             .build()
@@ -1865,9 +1818,7 @@ mod cpu_affinity_tests {
     #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn worker_runs_on_designated_core() {
-        let device = detect_dpdk_device();
         let rt = tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(&device)
             .enable_all()
             .build()
             .expect("Failed to create DPDK runtime");
@@ -1937,9 +1888,7 @@ mod cpu_affinity_tests {
     #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn blocking_thread_not_on_dpdk_core() {
-        let device = detect_dpdk_device();
         let rt = tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(&device)
             .enable_all()
             .build()
             .expect("Failed to create DPDK runtime");
@@ -2016,9 +1965,7 @@ mod cpu_affinity_tests {
     #[serial_isolation_test::serial_isolation_test]
     #[test]
     fn multi_worker_core_isolation() {
-        let device = detect_dpdk_device();
         let rt = tokio::runtime::Builder::new_dpdk()
-            .dpdk_device(&device)
             .worker_threads(2) // Request 2 workers
             .enable_all()
             .build()
@@ -2078,4 +2025,55 @@ mod cpu_affinity_tests {
             cpus.len()
         );
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "full"))]
+mod multi_ip_api_tests {
+    use super::*;
+    use tokio::runtime::dpdk;
+
+    #[serial_isolation_test::serial_isolation_test]
+    #[test]
+    fn test_worker_ipv4s_ipv6s_consistency() {
+        let rt = dpdk_rt();
+        rt.block_on(async {
+            let workers = dpdk::workers();
+
+            for worker in workers {
+                let ipv4s = dpdk::worker_ipv4s(worker);
+                let ipv6s = dpdk::worker_ipv6s(worker);
+
+                // Verify plural API returns Vec (may be empty but always valid)
+
+                // Verify singular API returns first element (if any)
+                assert_eq!(dpdk::worker_ipv4(worker), ipv4s.first().copied());
+                assert_eq!(dpdk::worker_ipv6(worker), ipv6s.first().copied());
+            }
+        });
+    }
+
+    #[serial_isolation_test::serial_isolation_test]
+    #[test]
+    fn test_current_ipv4s_ipv6s() {
+        let rt = dpdk_rt();
+        rt.block_on(async {
+            // Test from worker thread
+            tokio::spawn(async {
+                let current = dpdk::current_worker();
+
+                let ipv4s_current = dpdk::current_ipv4s();
+                let ipv4s_worker = dpdk::worker_ipv4s(current);
+                assert_eq!(ipv4s_current, ipv4s_worker);
+
+                let ipv6s_current = dpdk::current_ipv6s();
+                let ipv6s_worker = dpdk::worker_ipv6s(current);
+                assert_eq!(ipv6s_current, ipv6s_worker);
+            }).await.unwrap();
+        });
+    }
+
+    // Note: Panic test for calling outside runtime is omitted because:
+    // 1. The API is already documented to panic outside DPDK runtime context
+    // 2. Serial isolation tests make this difficult to test reliably
+    // 3. The behavior is consistent with other dpdk:: APIs like current_worker()
 }

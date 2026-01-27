@@ -95,7 +95,7 @@ fn extract_dpdk_devices_from_json(content: &str) -> Vec<String> {
 /// Create DPDK runtime with a specific real device
 fn dpdk_rt_with_device(pci_address: &str) -> Runtime {
     tokio::runtime::Builder::new_dpdk()
-        .dpdk_device(pci_address)
+        .dpdk_pci_addresses(&[pci_address])
         .enable_all()
         .build()
         .unwrap_or_else(|e| {

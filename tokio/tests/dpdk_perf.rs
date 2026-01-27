@@ -31,22 +31,8 @@ const HTTP_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: keep-al
 // Helper Functions
 // =============================================================================
 
-fn detect_dpdk_device() -> String {
-    std::fs::read_to_string("/home/ubuntu/tokio-dpdk/env.json")
-        .ok()
-        .and_then(|content| {
-            content
-                .lines()
-                .find(|l| l.contains("\"dpdk_pci\""))
-                .and_then(|l| l.split('"').nth(3).map(String::from))
-        })
-        .unwrap_or_else(|| "0000:28:00.0".to_string())
-}
-
 fn dpdk_rt() -> tokio::runtime::Runtime {
-    let device = detect_dpdk_device();
     tokio::runtime::Builder::new_dpdk()
-        .dpdk_device(&device)
         .worker_threads(1)
         .enable_all()
         .build()

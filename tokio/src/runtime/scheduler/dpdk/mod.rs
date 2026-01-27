@@ -15,7 +15,6 @@ mod ffi;
 mod flow_rules;
 pub(crate) mod init;
 pub(crate) mod io_thread;
-mod resolve;
 mod resource_lock;
 
 // Internal modules accessible within dpdk
@@ -40,6 +39,8 @@ pub(crate) use config::DpdkBuilder;
 use crate::future::Future;
 use crate::loom::sync::Arc;
 use crate::runtime::scheduler;
+use crate::runtime::builder::ThreadNameFn;
+use crate::runtime::Callback;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,142 +80,30 @@ impl std::fmt::Debug for Dpdk {
 impl Dpdk {
     /// Create a new DPDK scheduler with initialized resources.
     ///
-    /// This function supports two paths:
-    /// 1. Legacy path: When `devices()` was called, uses the original initialization
-    /// 2. New path: When no devices configured, uses AllocationPlan from env.json
-    ///
-    /// The DPDK resources (mempool) will be stored in Self for proper lifecycle management.
+    /// Uses AllocationPlan from env.json to determine device/core/IP allocation.
+    /// The `requested_worker_count` maps to `Builder::worker_threads()`.
     pub(crate) fn new(
         dpdk_builder: &DpdkBuilder,
         driver_handle: crate::runtime::driver::Handle,
         blocking_spawner: crate::runtime::blocking::Spawner,
         seed_generator: crate::util::RngSeedGenerator,
         config: crate::runtime::Config,
+        requested_worker_count: Option<usize>,
+        thread_name: ThreadNameFn,
+        thread_stack_size: Option<usize>,
+        after_start: Option<Callback>,
+        before_stop: Option<Callback>,
     ) -> io::Result<(Self, worker::Launch)> {
-        // Determine which initialization path to use:
-        // - If devices() was called: use legacy path
-        // - Otherwise: use AllocationPlan path
-        let use_allocation_plan = dpdk_builder.get_devices().is_empty();
-
-        if use_allocation_plan {
-            Self::new_with_allocation_plan(
-                dpdk_builder,
-                driver_handle,
-                blocking_spawner,
-                seed_generator,
-                config,
-            )
-        } else {
-            Self::new_legacy(
-                dpdk_builder,
-                driver_handle,
-                blocking_spawner,
-                seed_generator,
-                config,
-            )
-        }
-    }
-
-    /// Legacy initialization path using devices() configuration.
-    fn new_legacy(
-        dpdk_builder: &DpdkBuilder,
-        driver_handle: crate::runtime::driver::Handle,
-        blocking_spawner: crate::runtime::blocking::Spawner,
-        seed_generator: crate::util::RngSeedGenerator,
-        config: crate::runtime::Config,
-    ) -> io::Result<(Self, worker::Launch)> {
-        // Validate DPDK configuration
+        // Validate configuration
         dpdk_builder
             .validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-        // Initialize DPDK resources (EAL, mempool, ports, devices)
-        let mut resources = init::initialize_dpdk(dpdk_builder)?;
-
-        if resources.devices.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "No DPDK devices initialized",
-            ));
-        }
-
-        // Acquire resource locks for devices and cores to prevent other processes
-        // from using the same resources.
-        let mut resource_lock = resource_lock::ResourceLock::new();
-
-        // Lock devices by PCI address
-        let pci_addresses: Vec<String> = resources
-            .devices
-            .iter()
-            .filter_map(|d| {
-                // Try to get PCI from env_config lookup by PCI or name
-                let env_config = env_config::DpdkEnvConfig::load().ok()?;
-                env_config
-                    .find_by_pci(&d.config.name)
-                    .or_else(|| env_config.find_by_name(&d.config.name))
-                    .map(|dev| dev.pci_address.clone())
-            })
-            .collect();
-
-        if !pci_addresses.is_empty() {
-            // Best-effort locking - don't fail if lock dir doesn't exist
-            let _ = resource_lock.acquire_devices(&pci_addresses);
-        }
-
-        // Lock cores
-        let core_ids: Vec<usize> = resources.devices.iter().map(|d| d.config.core).collect();
-        if !core_ids.is_empty() {
-            // Best-effort locking - don't fail if lock dir doesn't exist
-            let _ = resource_lock.acquire_cores(&core_ids);
-        }
-
-        // Collect port IDs for cleanup
-        let ports: Vec<u16> = resources
-            .devices
-            .iter()
-            .map(|d| d.device.port_id())
-            .collect();
-        let mempool = resources.mempool;
-
-        // Create Handle and Launch using worker::create
-        // Pass mempool and ports for DpdkResourcesCleaner creation
-        let (handle, mut launch) = worker::create(
-            core_ids,
-            std::mem::take(&mut resources.devices), // Move devices to workers
-            mempool,
-            ports,
-            driver_handle,
-            blocking_spawner,
-            seed_generator,
-            config,
-        );
-
-        // Take worker 0 for main thread to use during block_on
-        let worker_0 = launch.take_worker_0();
-
-        Ok((
-            Self {
-                worker_handles: Vec::new(),
-                worker_0,
-                io_thread_handle: None,
-                resource_lock,
-                handle,
-                block_on_in_progress: AtomicBool::new(false),
-            },
-            launch,
-        ))
-    }
-
-    /// New initialization path using AllocationPlan from env.json.
-    fn new_with_allocation_plan(
-        dpdk_builder: &DpdkBuilder,
-        driver_handle: crate::runtime::driver::Handle,
-        blocking_spawner: crate::runtime::blocking::Spawner,
-        seed_generator: crate::util::RngSeedGenerator,
-        config: crate::runtime::Config,
-    ) -> io::Result<(Self, worker::Launch)> {
         // Load environment configuration
         let env_config = env_config::DpdkEnvConfig::load()?;
+
+        // Validate env config
+        env_config.validate()?;
 
         // Create allocation plan based on available resources
         let requested_devices: Option<&[String]> = if dpdk_builder.get_pci_addresses().is_empty() {
@@ -222,12 +111,11 @@ impl Dpdk {
         } else {
             Some(dpdk_builder.get_pci_addresses())
         };
-        let requested_num_workers = dpdk_builder.get_num_workers();
 
         let plan = allocation::create_allocation_plan(
             &env_config,
             requested_devices,
-            requested_num_workers,
+            requested_worker_count,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
@@ -255,9 +143,14 @@ impl Dpdk {
         let mut combined_eal_args = env_config.eal_args.clone();
         combined_eal_args.extend(dpdk_builder.get_eal_args().iter().cloned());
 
-        // Initialize DPDK from allocation plan
-        let (resources, initialized_workers) =
-            init::initialize_dpdk_from_plan(&plan, &combined_eal_args)?;
+        // Initialize DPDK from allocation plan with configurable parameters
+        let (resources, initialized_workers) = init::initialize_dpdk_from_plan(
+            &plan,
+            &combined_eal_args,
+            dpdk_builder.get_mempool_size(),
+            dpdk_builder.get_cache_size(),
+            dpdk_builder.get_queue_descriptors(),
+        )?;
 
         // Create flow rules for multi-queue traffic routing
         // In multi-queue mode, rte_flow is REQUIRED for correct traffic routing.
@@ -303,7 +196,7 @@ impl Dpdk {
                              Multi-queue mode REQUIRES rte_flow for IP-based queue steering. \
                              Without rte_flow, traffic will NOT be correctly routed to workers. \
                              Options: \
-                             (1) Use single worker per NIC (dpdk_num_workers(1)), \
+                             (1) Use single worker per NIC (worker_threads(1)), \
                              (2) Use multiple NICs with one worker each, \
                              (3) Use hardware that supports rte_flow (not AWS ENA).",
                             port, pci_address
@@ -360,9 +253,8 @@ impl Dpdk {
             );
         }
 
-        // Create Handle and Launch using the new worker::create_from_workers
-        // Pass mempool and ports for DpdkResourcesCleaner creation
-        let (handle, mut launch) = worker::create_from_workers(
+        // Create Handle and Launch using worker::create
+        let (handle, mut launch) = worker::create(
             initialized_workers,
             resources.mempool,
             resources.ports.clone(),
@@ -370,6 +262,10 @@ impl Dpdk {
             blocking_spawner,
             seed_generator,
             config,
+            thread_name,
+            thread_stack_size,
+            after_start,
+            before_stop,
         );
 
         // Take worker 0 for main thread to use during block_on

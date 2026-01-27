@@ -210,45 +210,8 @@ async fn handle_client(socket: tokio::net::TcpStream, _peer: SocketAddr, conn_id
     }
 }
 
-// =============================================================================
-// DPDK Device Detection (reused from other tests)
-// =============================================================================
-
-fn detect_dpdk_device() -> String {
-    const CONFIG_PATHS: &[&str] = &[
-        "/etc/dpdk/env.json",
-        "./config/dpdk-env.json",
-        "./dpdk-env.json",
-    ];
-
-    for path in CONFIG_PATHS {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
-                    for device in devices {
-                        if device.get("role").and_then(|r| r.as_str()) == Some("dpdk") {
-                            if let Some(pci) = device.get("pci_address").and_then(|p| p.as_str()) {
-                                return pci.to_string();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    panic!(
-        "No DPDK device found in env.json. Searched: {:?}",
-        CONFIG_PATHS
-    )
-}
-
-// find_dpdk_device_in_json is no longer needed
-
 fn dpdk_rt() -> Runtime {
-    let device = detect_dpdk_device();
     tokio::runtime::Builder::new_dpdk()
-        .dpdk_device(&device)
         .enable_all()
         .build()
         .expect("DPDK runtime creation failed")

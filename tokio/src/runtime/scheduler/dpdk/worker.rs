@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 
 use super::counters::Counters;
 use super::dpdk_driver::DpdkDriver;
-use super::init::{DpdkResourcesCleaner, InitializedDevice};
+use super::init::DpdkResourcesCleaner;
 use super::queue::{self, Local};
 use super::stats::Stats;
 
@@ -284,8 +284,16 @@ pub(crate) struct Context {
     pub(crate) block_on_state: RefCell<Option<BlockOnState>>,
 }
 
-/// Starts the workers
-pub(crate) struct Launch(pub(super) Vec<Arc<Worker>>);
+/// Starts the workers.
+///
+/// Contains worker references and thread configuration from the Builder.
+pub(crate) struct Launch {
+    pub(super) workers: Vec<Arc<Worker>>,
+    pub(super) thread_name: crate::runtime::builder::ThreadNameFn,
+    pub(super) thread_stack_size: Option<usize>,
+    pub(super) after_start: Option<crate::runtime::Callback>,
+    pub(super) before_stop: Option<crate::runtime::Callback>,
+}
 
 /// Running a task may consume the core.
 pub(crate) type RunResult = Result<Box<Core>, ()>;
@@ -301,123 +309,14 @@ use super::Handle;
 use crate::runtime::{TaskHooks, TimerFlavor};
 use crate::util::RngSeedGenerator;
 
-/// Creates the DPDK scheduler workers.
+/// Creates DPDK scheduler workers from initialized workers.
 ///
-/// Unlike multi_thread, this takes a list of core IDs for CPU affinity and
-/// initialized DPDK devices for network I/O.
+/// Accepts `InitializedWorker` which contains pre-configured DpdkDevices
+/// with specific queue IDs for multi-queue support.
 ///
-/// The mempool and ports are used to create a DpdkResourcesCleaner that will
-/// free the mempool and call rte_eal_cleanup() when the last Arc<Handle> is dropped.
+/// Also takes thread configuration from the Builder (thread_name, stack_size,
+/// after_start, before_stop callbacks).
 pub(super) fn create(
-    core_ids: Vec<usize>,
-    devices: Vec<InitializedDevice>,
-    mempool: *mut super::ffi::rte_mempool,
-    ports: Vec<u16>,
-    driver_handle: driver::Handle,
-    blocking_spawner: blocking::Spawner,
-    seed_generator: RngSeedGenerator,
-    config: Config,
-) -> (Arc<Handle>, Launch) {
-    let size = core_ids.len();
-    let mut cores = Vec::with_capacity(size);
-    let mut remotes = Vec::with_capacity(size);
-    let mut worker_metrics = Vec::with_capacity(size);
-    let mut drivers = Vec::with_capacity(size);
-
-    // Create DpdkDrivers from initialized devices
-    for dev in devices {
-        let driver = DpdkDriver::new(
-            dev.device,
-            dev.config.mac,
-            dev.config.addresses.clone(),
-            dev.config.gateway_v4,
-            dev.config.gateway_v6,
-        );
-        drivers.push(std::sync::Mutex::new(driver));
-    }
-
-    // Create the local queues
-    for &core_id in &core_ids {
-        let run_queue = queue::local();
-        let metrics = WorkerMetrics::from_config(&config);
-        let stats = Stats::new(&metrics);
-
-        cores.push(Box::new(Core {
-            tick: 0,
-            lifo_slot: None,
-            lifo_enabled: !config.disable_lifo_slot,
-            run_queue,
-            is_shutdown: false,
-            global_queue_interval: stats.tuned_global_queue_interval(&config),
-            stats,
-            rand: FastRand::from_seed(config.seed_generator.next_seed()),
-            local_overflow: VecDeque::new(),
-        }));
-
-        remotes.push(Remote {
-            core_id,
-            shutdown: AtomicBool::new(false),
-            transfer_requested: AtomicBool::new(false),
-            pause_barrier: std::sync::Barrier::new(2),
-            resume_barrier: std::sync::Barrier::new(2),
-            per_inject: inject::Inject::new(),
-            local_spawn_queue: std::sync::Mutex::new(Vec::new()),
-        });
-        worker_metrics.push(metrics);
-    }
-
-    let (inject, inject_synced) = inject::Shared::new();
-
-    let handle = Arc::new(Handle {
-        task_hooks: TaskHooks::from_config(&config),
-        shared: Shared {
-            remotes: remotes.into_boxed_slice(),
-            inject,
-            owned: OwnedTasks::new(size),
-            synced: Mutex::new(Synced {
-                inject: inject_synced,
-            }),
-            shutdown_cores: Mutex::new(vec![]),
-            config,
-            worker_metrics: worker_metrics.into_boxed_slice(),
-            drivers: drivers.into_boxed_slice(),
-            dpdk_resources: Some(DpdkResourcesCleaner::new(mempool, ports)),
-            _counters: Counters,
-            transfer_core: crate::util::atomic_cell::AtomicCell::new(None),
-            woken: AtomicBool::new(false),
-        },
-        driver: driver_handle,
-        blocking_spawner,
-        seed_generator,
-        timer_flavor: TimerFlavor::Traditional,
-        is_shutdown: AtomicBool::new(false),
-    });
-
-    let mut launch = Launch(vec![]);
-
-    for (index, (core, &core_id)) in cores.drain(..).zip(core_ids.iter()).enumerate() {
-        launch.0.push(Arc::new(Worker {
-            handle: handle.clone(),
-            index,
-            core_id,
-            core: AtomicCell::new(Some(core)),
-        }));
-    }
-
-    // Register handle for panic shutdown support
-    super::init::register_handle_for_panic(&handle);
-
-    (handle, launch)
-}
-
-/// Creates DPDK scheduler workers from initialized workers (multi-queue mode).
-///
-/// This variant accepts `InitializedWorker` which contains pre-configured
-/// DpdkDevices with specific queue IDs for multi-queue support.
-///
-/// The mempool and ports are used to create a DpdkResourcesCleaner that will
-/// free the mempool and call rte_eal_cleanup() when the last Arc<Handle> is dropped.
-pub(super) fn create_from_workers(
     workers: Vec<super::init::InitializedWorker>,
     mempool: *mut super::ffi::rte_mempool,
     ports: Vec<u16>,
@@ -425,6 +324,10 @@ pub(super) fn create_from_workers(
     blocking_spawner: blocking::Spawner,
     seed_generator: RngSeedGenerator,
     config: Config,
+    thread_name: crate::runtime::builder::ThreadNameFn,
+    thread_stack_size: Option<usize>,
+    after_start: Option<crate::runtime::Callback>,
+    before_stop: Option<crate::runtime::Callback>,
 ) -> (Arc<Handle>, Launch) {
     let size = workers.len();
     let mut cores = Vec::with_capacity(size);
@@ -503,10 +406,16 @@ pub(super) fn create_from_workers(
         is_shutdown: AtomicBool::new(false),
     });
 
-    let mut launch = Launch(vec![]);
+    let mut launch = Launch {
+        workers: vec![],
+        thread_name,
+        thread_stack_size,
+        after_start,
+        before_stop,
+    };
 
     for (index, (core, &core_id)) in cores.drain(..).zip(core_ids.iter()).enumerate() {
-        launch.0.push(Arc::new(Worker {
+        launch.workers.push(Arc::new(Worker {
             handle: handle.clone(),
             index,
             core_id,
@@ -527,24 +436,39 @@ impl Launch {
     /// When block_on is called, it signals worker 0 to transfer its Core,
     /// then the main thread takes over worker 0's role.
     ///
+    /// Uses Builder's thread configuration (thread_name, stack_size, callbacks).
+    ///
     /// Returns the JoinHandles for all spawned worker threads so they can be
     /// joined during shutdown.
     pub(crate) fn launch(&mut self) -> Vec<std::thread::JoinHandle<()>> {
-        let mut handles = Vec::with_capacity(self.0.len());
+        let mut handles = Vec::with_capacity(self.workers.len());
 
         // Launch ALL workers including worker 0
         // Worker 0 will transfer its Core to main thread when block_on is called
-        for worker in self.0.iter() {
+        for worker in self.workers.iter() {
             let worker_clone = worker.clone();
             let core_id = worker.core_id;
+            let after_start = self.after_start.clone();
+            let before_stop = self.before_stop.clone();
+            let thread_name = (self.thread_name)();
 
-            // Spawn worker thread with CPU affinity
-            let handle = std::thread::Builder::new()
-                .name(format!("dpdk-worker-{}", core_id))
+            let mut builder = std::thread::Builder::new().name(thread_name);
+            if let Some(stack_size) = self.thread_stack_size {
+                builder = builder.stack_size(stack_size);
+            }
+
+            let handle = builder
                 .spawn(move || {
                     #[cfg(target_os = "linux")]
                     set_cpu_affinity(core_id);
+
+                    if let Some(ref f) = after_start {
+                        f();
+                    }
                     run(worker_clone);
+                    if let Some(ref f) = before_stop {
+                        f();
+                    }
                 })
                 .expect("failed to spawn worker thread");
 
@@ -556,10 +480,10 @@ impl Launch {
 
     /// Get worker 0 for the main thread to use during block_on.
     pub(crate) fn take_worker_0(&mut self) -> Option<Arc<Worker>> {
-        if self.0.is_empty() {
+        if self.workers.is_empty() {
             None
         } else {
-            Some(self.0[0].clone())
+            Some(self.workers[0].clone())
         }
     }
 }

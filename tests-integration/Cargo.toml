@@ -30,15 +30,6 @@ name = "macros_select"
 name = "rt_yield"
 required-features = ["rt", "macros", "sync"]
 
-[[test]]
-name = "dpdk_tcp_stream_tests"
-
-[[test]]
-name = "dpdk_tcp_listener_tests"
-
-[[test]]
-name = "dpdk_tcp_socket_tests"
-
 [features]
 # For mem check
 rt-net = ["tokio/rt", "tokio/rt-multi-thread", "tokio/net"]

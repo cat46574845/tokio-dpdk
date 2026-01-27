@@ -386,6 +386,26 @@ impl Handle {
         driver.get_ipv6_address()
     }
 
+    /// Returns all IPv4 addresses configured on the specified worker's DPDK interface.
+    pub(crate) fn worker_ipv4s(&self, worker_index: usize) -> Vec<Ipv4Addr> {
+        let driver_mutex = self.shared.drivers.get(worker_index)
+            .expect("worker_index out of range");
+        driver_mutex.lock()
+            .ok()
+            .map(|driver| driver.get_ipv4_addresses())
+            .unwrap_or_default()
+    }
+
+    /// Returns all IPv6 addresses configured on the specified worker's DPDK interface.
+    pub(crate) fn worker_ipv6s(&self, worker_index: usize) -> Vec<Ipv6Addr> {
+        let driver_mutex = self.shared.drivers.get(worker_index)
+            .expect("worker_index out of range");
+        driver_mutex.lock()
+            .ok()
+            .map(|driver| driver.get_ipv6_addresses())
+            .unwrap_or_default()
+    }
+
     /// Shuts down a worker's core.
     ///
     /// IMPORTANT: Each worker MUST drain its own local queues before calling this,

@@ -19,7 +19,7 @@ use tokio::runtime::Builder;
 
 /// Test that creates a multi-queue DPDK runtime on a SINGLE device.
 ///
-/// This test uses `dpdk_pci_addresses()` + `dpdk_num_workers()` to force:
+/// This test uses `dpdk_pci_addresses()` + `worker_threads()` to force:
 /// 1. Using only ONE device (by PCI address)
 /// 2. Creating TWO workers on that single device
 /// 3. This requires 2 queues on the same NIC = multi-queue mode
@@ -50,26 +50,27 @@ fn test_multi_queue_requires_rte_flow() {
     println!("IPv6 addresses: {} total", ipv6_count);
     println!("Total IPs: {}", total_ips);
 
-    if total_ips < 2 {
-        println!("\n⚠️  WARNING: Device only has {} IP(s), need 2+ for multi-queue test", total_ips);
-        println!("   Skipping multi-queue test - add more IPs to test rte_flow.");
-        println!("   You can add secondary IPs via AWS console or CLI.");
-        return;
-    }
+    assert!(
+        total_ips >= 2,
+        "\nDevice only has {} IP(s), but this test requires 2+ IPs for multi-queue testing.\n\
+         Add more secondary IPs to the device via AWS console or CLI.\n\
+         Test cannot proceed without multiple IPs.",
+        total_ips
+    );
 
     println!("\n[1] Creating DPDK runtime with 2 workers on SINGLE NIC...");
     println!("    Using dpdk_pci_addresses([\"{}\"]) - only this device", pci_address);
-    println!("    Using dpdk_num_workers(2) - force 2 queues on 1 device");
+    println!("    Using worker_threads(2) - force 2 queues on 1 device");
     println!("    This requires rte_flow for IP-based queue steering.");
     println!("    If rte_flow is NOT supported, this will PANIC.\n");
 
     // Create runtime using new API:
     // - dpdk_pci_addresses() sets PCI addresses (triggers AllocationPlan path)
-    // - dpdk_num_workers() sets worker count
+    // - worker_threads() sets worker count
     // This forces all workers onto the single device = multi-queue mode
     let result = Builder::new_dpdk()
         .dpdk_pci_addresses(&[pci_address.as_str()])  // Single device
-        .dpdk_num_workers(2)  // 2 workers = 2 queues on same device
+        .worker_threads(2)  // 2 workers = 2 queues on same device
         .enable_all()
         .build();
 

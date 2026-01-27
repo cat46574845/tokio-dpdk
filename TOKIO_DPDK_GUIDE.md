@@ -139,7 +139,7 @@ tokio-dpdk runtime 依賴一個配置文件來獲取裝置的網路配置（IP�
 
 ```
 1. 執行 setup.sh wizard    →  生成 /etc/dpdk/env.json
-2. 在代碼中指定裝置 PCI    →  runtime 從 env.json 讀取配置
+2. 在代碼中建立 runtime    →  自動從 env.json 讀取裝置配置（或用 dpdk_pci_addresses() 指定）
 3. runtime 啟動            →  使用配置初始化 DPDK 和 smoltcp
 ```
 
@@ -155,38 +155,53 @@ Runtime 在以下位置搜索配置文件（按順序）：
 
 ### 建立 DPDK Runtime
 
-**前提條件**：確保已執行 `setup.sh` 生成配置文件。
+**前提條件**：確保已執行 `setup.sh` 生成配置文件。不需要在代碼中指定 PCI 位址，runtime 會自動使用 env.json 中所有 `role: "dpdk"` 的裝置。
 
 ```rust
 use tokio::runtime::Builder;
 
-// 基本 DPDK runtime - 指定裝置的 PCI 位址
+// 基本 DPDK runtime - 使用 env.json 中所有可用裝置和核心
 // IP、MAC、Gateway 會從 /etc/dpdk/env.json 自動讀取
 let rt = Builder::new_dpdk()
-    .dpdk_device("0000:28:00.0")  // PCI 位址
     .enable_all()
     .build()
     .expect("DPDK runtime creation failed");
 
-// 多裝置 runtime - 每個裝置一個 worker
+// 指定特定 PCI 位址
 let rt = Builder::new_dpdk()
-    .dpdk_devices(&["0000:28:00.0", "0000:29:00.0"])
+    .dpdk_pci_addresses(&["0000:28:00.0"])
+    .enable_all()
+    .build()
+    .expect("DPDK runtime creation failed");
+
+// 多裝置 runtime - 指定多個 PCI 位址
+let rt = Builder::new_dpdk()
+    .dpdk_pci_addresses(&["0000:28:00.0", "0000:29:00.0"])
     .enable_all()
     .build()
     .expect("Multi-device DPDK runtime creation failed");
 
-// 多隊列模式 - 單網卡多 worker (版本 2 新功能)
+// 多隊列模式 - 單網卡多 worker
 // 需要設備有多個 IP，每個 worker 分配一個 IP
 let rt = Builder::new_dpdk()
-    .dpdk_devices(&["0000:28:00.0"])
-    .dpdk_num_workers(4)  // 在一張網卡上使用 4 個隊列
+    .dpdk_pci_addresses(&["0000:28:00.0"])
+    .worker_threads(4)  // 在一張網卡上使用 4 個隊列
     .enable_all()
     .build()?;
 
 // 自訂 EAL 參數
 let rt = Builder::new_dpdk()
-    .dpdk_device("0000:28:00.0")
+    .dpdk_pci_addresses(&["0000:28:00.0"])
     .dpdk_eal_args(&["--iova-mode=pa", "--no-telemetry"])
+    .enable_all()
+    .build()
+    .expect("DPDK runtime creation failed");
+
+// 自訂記憶體池和隊列配置
+let rt = Builder::new_dpdk()
+    .dpdk_mempool_size(16384)       // mbuf 數量（預設 8192）
+    .dpdk_cache_size(512)           // 每核心快取大小（預設 256）
+    .dpdk_queue_descriptors(256)    // RX/TX 描述符數量（預設 128）
     .enable_all()
     .build()
     .expect("DPDK runtime creation failed");
@@ -205,9 +220,11 @@ let rt = Builder::new_dpdk()
 | 方法 | 說明 |
 |------|------|
 | `new_dpdk()` | 建立新的 DPDK runtime builder |
-| `dpdk_device(&str)` | 指定單一裝置（PCI 位址或原始介面名） |
-| `dpdk_devices(&[&str])` | 指定多個裝置（每個裝置一個或多個 worker） |
-| `dpdk_num_workers(usize)` | 指定 worker 數量（支援多隊列模式） |
+| `dpdk_pci_addresses(&[&str])` | 指定裝置 PCI 位址（可選；不指定時使用 env.json 中所有 DPDK 裝置） |
+| `worker_threads(usize)` | 指定 worker 數量（支援多隊列模式，多個 worker 共用同一 NIC） |
+| `dpdk_mempool_size(u32)` | 設定 DPDK 記憶體池大小（mbuf 數量，預設 8192） |
+| `dpdk_cache_size(u32)` | 設定每核心記憶體池快取大小（預設 256） |
+| `dpdk_queue_descriptors(u16)` | 設定每個隊列的 RX/TX 描述符數量（預設 128） |
 | `dpdk_eal_arg(&str)` | 添加單個 EAL 參數 |
 | `dpdk_eal_args(&[&str])` | 添加多個 EAL 參數 |
 | `enable_all()` | 啟用所有功能（I/O、time 等） |
@@ -574,4 +591,4 @@ RUST_LOG=tokio::runtime::scheduler::dpdk=debug cargo test ...
 
 ---
 
-*最後更新：2026-01-20*
+*最後更新：2026-01-27*

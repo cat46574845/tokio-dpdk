@@ -214,7 +214,9 @@ impl TcpDpdkStream {
             // Build local and remote endpoints based on address family
             let (local_endpoint, remote_endpoint) = match addr {
                 SocketAddr::V4(v4) => {
-                    // Get the local IPv4 address from the driver
+                    // Get the local IPv4 address from the driver (uses first configured address).
+                    // For multi-homed setups with multiple IPs, this selects the first one.
+                    // To query all addresses, use tokio::runtime::dpdk::worker_ipv4s().
                     let local_ip = driver.get_ipv4_address().ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::AddrNotAvailable,
@@ -233,7 +235,9 @@ impl TcpDpdkStream {
                     (local_ep, remote_ep)
                 }
                 SocketAddr::V6(v6) => {
-                    // Get the local IPv6 address from the driver
+                    // Get the local IPv6 address from the driver (uses first configured address).
+                    // For multi-homed setups with multiple IPs, this selects the first one.
+                    // To query all addresses, use tokio::runtime::dpdk::worker_ipv6s().
                     let local_ip = driver.get_ipv6_address().ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::AddrNotAvailable,

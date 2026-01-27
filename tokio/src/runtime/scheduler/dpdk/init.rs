@@ -12,11 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::sync::{RwLock, Weak};
 
-use super::config::DpdkBuilder;
 use super::device::DpdkDevice;
 use super::ffi;
 use super::handle::Handle;
-use super::resolve::ResolvedDevice;
 
 // Flag to ensure panic hook is only registered once
 static PANIC_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -35,32 +33,9 @@ pub(super) fn register_handle_for_panic(handle: &std::sync::Arc<Handle>) {
     }
 }
 
-/// Initialized DPDK runtime resources.
-pub(crate) struct DpdkResources {
-    /// Memory pool for packet buffers.
-    /// MUST remain allocated for the runtime lifetime - all mbufs reference this pool.
-    /// Cleanup is performed via `cleanup()` method during runtime shutdown.
-    pub mempool: *mut ffi::rte_mempool,
-    /// Initialized devices (one per network interface)
-    pub devices: Vec<InitializedDevice>,
-}
-
-// Safety: DPDK mempools are designed to be thread-safe. The mempool pointer
-// is only accessed during cleanup() which happens after all workers have stopped.
-unsafe impl Send for DpdkResources {}
-unsafe impl Sync for DpdkResources {}
-
-/// A fully initialized DPDK device ready for use.
-pub(crate) struct InitializedDevice {
-    /// The resolved device configuration
-    pub config: ResolvedDevice,
-    /// The DPDK device for smoltcp
-    pub device: DpdkDevice,
-}
-
 /// A fully initialized DPDK worker for multi-queue mode.
 ///
-/// In multi-queue mode, each worker gets its own queue on a shared device.
+/// Each worker gets its own queue on a shared device.
 pub(crate) struct InitializedWorker {
     /// The DPDK device for smoltcp (with specific queue_id)
     pub device: DpdkDevice,
@@ -212,6 +187,7 @@ pub(crate) fn init_port(
     mempool: *mut ffi::rte_mempool,
     nb_rx_queues: u16,
     nb_tx_queues: u16,
+    nb_descriptors: u16,
 ) -> io::Result<()> {
     // Get device info
     let mut dev_info: ffi::rte_eth_dev_info = unsafe { std::mem::zeroed() };
@@ -241,7 +217,7 @@ pub(crate) fn init_port(
             ffi::rte_eth_rx_queue_setup(
                 port_id,
                 queue_id,
-                128, // nb_rx_desc
+                nb_descriptors,
                 socket_id as u32,
                 std::ptr::null(),
                 mempool,
@@ -261,7 +237,7 @@ pub(crate) fn init_port(
             ffi::rte_eth_tx_queue_setup(
                 port_id,
                 queue_id,
-                128, // nb_tx_desc
+                nb_descriptors,
                 socket_id as u32,
                 std::ptr::null(),
             )
@@ -326,90 +302,6 @@ pub(crate) fn find_port_by_mac(target_mac: &[u8; 6]) -> io::Result<Option<u16>> 
     Ok(None)
 }
 
-/// Generate EAL arguments from resolved devices.
-pub(crate) fn generate_eal_args(devices: &[ResolvedDevice], extra_args: &[String]) -> Vec<String> {
-    let mut args = vec!["tokio-dpdk".to_string()];
-
-    // Generate core list from device configurations
-    let cores: Vec<usize> = devices.iter().map(|d| d.core).collect();
-    if !cores.is_empty() {
-        let core_list: String = cores
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        args.push("-l".to_string());
-        args.push(core_list);
-    }
-
-    // Add extra user-provided arguments
-    args.extend(extra_args.iter().cloned());
-
-    args
-}
-
-/// Initialize all DPDK resources based on builder configuration.
-pub(crate) fn initialize_dpdk(builder: &DpdkBuilder) -> io::Result<DpdkResources> {
-    // 1. Resolve all devices
-    let resolved_devices = builder.resolve_devices()?;
-
-    if resolved_devices.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "No devices configured",
-        ));
-    }
-
-    // 2. Generate and call EAL init
-    // Merge eal_args from env config (best-effort) with builder's extra args.
-    // Env config args come first, builder args follow (allowing overrides).
-    let env_eal_args = super::env_config::DpdkEnvConfig::load()
-        .map(|c| c.eal_args)
-        .unwrap_or_default();
-    let mut combined_extra_args = env_eal_args;
-    combined_extra_args.extend(builder.get_eal_args().iter().cloned());
-    let eal_args = generate_eal_args(&resolved_devices, &combined_extra_args);
-    init_eal(&eal_args)?;
-
-    // 3. Create mempool
-    let mempool = create_mempool("tokio_dpdk_mbuf_pool", 8192, 256)?;
-
-    // 4. Initialize each device
-    let mut devices = Vec::with_capacity(resolved_devices.len());
-
-    for (index, resolved) in resolved_devices.into_iter().enumerate() {
-        // Find DPDK port by MAC address
-        let port_id = find_port_by_mac(&resolved.mac)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "Device {} not found by MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                    resolved.name,
-                    resolved.mac[0],
-                    resolved.mac[1],
-                    resolved.mac[2],
-                    resolved.mac[3],
-                    resolved.mac[4],
-                    resolved.mac[5]
-                ),
-            )
-        })?;
-
-        // Initialize port with 1 RX queue and 1 TX queue
-        init_port(port_id, mempool, 1, 1)?;
-
-        // Create DpdkDevice
-        let dpdk_device = unsafe { DpdkDevice::new(port_id, index as u16, mempool) };
-
-        devices.push(InitializedDevice {
-            config: resolved,
-            device: dpdk_device,
-        });
-    }
-
-    Ok(DpdkResources { mempool, devices })
-}
-
 /// Generate EAL arguments from allocation plan.
 pub(crate) fn generate_eal_args_from_plan(
     plan: &super::allocation::AllocationPlan,
@@ -440,14 +332,17 @@ pub(crate) fn generate_eal_args_from_plan(
 
 /// Initialize DPDK resources based on an allocation plan.
 ///
-/// This function is used when multi-queue mode is enabled. It:
+/// This function:
 /// 1. Initializes DPDK EAL with cores from the allocation plan
-/// 2. Creates mempool
+/// 2. Creates mempool with configurable size and cache
 /// 3. Initializes each unique port with the required number of queues
 /// 4. Creates InitializedWorker for each worker allocation
 pub(crate) fn initialize_dpdk_from_plan(
     plan: &super::allocation::AllocationPlan,
     eal_args: &[String],
+    mempool_size: u32,
+    cache_size: u32,
+    queue_descriptors: u16,
 ) -> io::Result<(DpdkResourcesMultiQueue, Vec<InitializedWorker>)> {
     use super::allocation::get_device_queue_counts;
     use std::collections::HashMap;
@@ -463,8 +358,8 @@ pub(crate) fn initialize_dpdk_from_plan(
     let full_eal_args = generate_eal_args_from_plan(plan, eal_args);
     init_eal(&full_eal_args)?;
 
-    // 2. Create mempool
-    let mempool = create_mempool("tokio_dpdk_mbuf_pool", 8192, 256)?;
+    // 2. Create mempool with configurable parameters
+    let mempool = create_mempool("tokio_dpdk_mbuf_pool", mempool_size, cache_size)?;
 
     // 3. Get queue counts per device
     let queue_counts = get_device_queue_counts(plan);
@@ -503,8 +398,8 @@ pub(crate) fn initialize_dpdk_from_plan(
             )
         })?;
 
-        // Initialize port with required number of queues
-        init_port(port_id, mempool, *num_queues, *num_queues)?;
+        // Initialize port with required number of queues and configurable descriptors
+        init_port(port_id, mempool, *num_queues, *num_queues, queue_descriptors)?;
 
         pci_to_port.insert(pci_address.clone(), port_id);
         initialized_ports.push(port_id);

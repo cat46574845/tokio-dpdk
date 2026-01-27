@@ -113,6 +113,70 @@ pub(crate) enum DeviceRole {
 }
 
 impl DpdkEnvConfig {
+    /// Validate that the configuration is usable for DPDK runtime.
+    ///
+    /// Checks:
+    /// - At least one device with role "dpdk"
+    /// - Each DPDK device has a non-empty PCI address
+    /// - Each DPDK device has at least one IP address
+    /// - Each DPDK device has a non-zero MAC address
+    /// - dpdk_cores is non-empty
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        let dpdk_devices: Vec<_> = self.devices.iter()
+            .filter(|d| d.role == DeviceRole::Dpdk)
+            .collect();
+
+        if dpdk_devices.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DPDK env config has no device with role 'dpdk'. \
+                 Check /etc/dpdk/env.json and ensure at least one device has \"role\": \"dpdk\".",
+            ));
+        }
+
+        for dev in &dpdk_devices {
+            if dev.pci_address.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "DPDK device has empty pci_address. \
+                         Each DPDK device must have a valid PCI address (e.g., \"0000:28:00.0\")."
+                    ),
+                ));
+            }
+            if dev.addresses.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "DPDK device '{}' has no IP addresses configured. \
+                         Each DPDK device must have at least one IP address.",
+                        dev.pci_address
+                    ),
+                ));
+            }
+            if dev.mac == [0u8; 6] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "DPDK device '{}' has all-zero MAC address. \
+                         Each DPDK device must have a valid MAC address.",
+                        dev.pci_address
+                    ),
+                ));
+            }
+        }
+
+        if self.dpdk_cores.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DPDK env config has no dpdk_cores. \
+                 At least one CPU core must be configured for DPDK workers.",
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Load configuration from the default search paths.
     pub(crate) fn load() -> io::Result<Self> {
         // Check environment variable first

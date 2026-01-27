@@ -107,7 +107,7 @@ Located in `tokio/src/runtime/scheduler/dpdk/`:
 - **ffi/** - FFI bindings to DPDK C API and wrapper functions
 - **init.rs** - DPDK EAL initialization, mempool creation, port setup
 - **io_thread.rs** - Dedicated thread for standard I/O and timers
-- **resolve/** - Automatic device configuration resolution from OS
+- **env_config.rs** - Environment configuration loading from env.json
 
 ### Network Stack Integration
 
@@ -122,14 +122,16 @@ Located in `tokio/src/runtime/scheduler/dpdk/`:
 
 When building a DPDK runtime:
 1. `Builder::new_dpdk()` creates builder with DpdkBuilder
-2. `builder.dpdk_device("eth0")` specifies network devices
-3. `builder.build()` triggers:
-   - DPDK EAL initialization (rte_eal_init)
-   - Memory pool creation for packet buffers
-   - Port initialization and configuration
-   - Device configuration resolution (IP, gateway, core from OS)
+2. `builder.dpdk_pci_addresses(...)` optionally specifies devices
+3. `builder.worker_threads(N)` optionally specifies worker count
+4. `builder.build()` triggers:
+   - env.json loading and validation
+   - AllocationPlan creation
+   - DPDK EAL initialization
+   - Memory pool creation
+   - Port initialization
    - Worker creation with CPU affinity
-   - IO thread spawn for standard I/O
+   - IO thread spawn
 
 ### Key Files
 
@@ -138,29 +140,39 @@ When building a DPDK runtime:
 - **tokio/src/net/tcp_dpdk/** - TcpDpdkStream and TcpDpdkListener APIs
 - **tokio/build.rs** - Compiles DPDK C wrappers (dpdk_wrappers.c)
 - **tokio/tests/tcp_dpdk.rs** - Integration tests for DPDK networking
+- **tokio/src/runtime/scheduler/dpdk/env_config.rs** - env.json loading and environment configuration
+- **tokio/src/runtime/scheduler/dpdk/allocation.rs** - AllocationPlan for device/worker/core assignment
 
 ## API Usage
 
 ### Creating DPDK Runtime
 
 ```rust
-// Simple usage
+// Simple usage - auto-detects devices from env.json
 let rt = tokio::runtime::Builder::new_dpdk()
-    .dpdk_device("eth0")
+    .enable_all()
     .build()?;
 
-// Multiple devices
+// With specific PCI addresses
 let rt = Builder::new_dpdk()
-    .dpdk_device("eth0")
-    .dpdk_device("eth1")
+    .dpdk_pci_addresses(&["0000:28:00.0"])
+    .worker_threads(4)
     .build()?;
 
 // With EAL arguments
 let rt = Builder::new_dpdk()
-    .dpdk_device("eth0")
-    .eal_arg("--no-huge")
+    .dpdk_eal_arg("--no-huge")
     .build()?;
 ```
+
+### Builder Methods
+
+- `dpdk_pci_addresses(&[&str])` - Specify PCI device addresses (optional; auto-detected from env.json if omitted)
+- `worker_threads(N)` - Set number of worker threads (replaces the old `dpdk_num_workers()`)
+- `dpdk_eal_arg(&str)` - Pass additional EAL arguments to DPDK initialization
+- `dpdk_mempool_size(usize)` - Configure the DPDK memory pool size
+- `dpdk_cache_size(usize)` - Configure the DPDK mempool cache size
+- `dpdk_queue_descriptors(u16)` - Configure the number of RX/TX queue descriptors
 
 ### Using TcpDpdkStream
 

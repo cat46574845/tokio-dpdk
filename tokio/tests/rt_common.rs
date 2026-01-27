@@ -98,17 +98,11 @@ macro_rules! rt_test {
             }
 
             fn rt() -> Arc<Runtime> {
-                let device = detect_dpdk_device();
-
-                // Create DPDK runtime with the specified device
+                // Create DPDK runtime (device auto-detected from env.json)
                 tokio::runtime::Builder::new_dpdk()
-                    .dpdk_device(&device)
                     .enable_all()
                     .build()
-                    .expect(&format!(
-                        "DPDK runtime creation failed for device '{}' - ensure DPDK is properly configured",
-                        device
-                    ))
+                    .expect("DPDK runtime creation failed - ensure DPDK is properly configured")
                     .into()
             }
         }

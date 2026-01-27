@@ -143,7 +143,7 @@ sudo ./setup.sh refresh-config
 | `generated_at` | 生成時間戳 |
 | `eal_args` | 透傳至 `rte_eal_init()`，與 Builder API 的 `dpdk_eal_args()` 合併 |
 
-**注意**：version 2 格式下，配置腳本只標記可用資源（設備和核心），不配置具體的設備-核心對應關係。運行時會根據 `dpdk_devices()` 和 `dpdk_num_workers()` API 自動分配。
+**注意**：version 2 格式下，配置腳本只標記可用資源（設備和核心），不配置具體的設備-核心對應關係。運行時會根據 `dpdk_pci_addresses()` 和 `worker_threads()` API 自動分配。
 
 ## 內核參數詳解
 
