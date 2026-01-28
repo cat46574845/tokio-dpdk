@@ -11,7 +11,6 @@ enum RuntimeFlavor {
     CurrentThread,
     Threaded,
     Local,
-    Dpdk,
 }
 
 impl RuntimeFlavor {
@@ -20,11 +19,11 @@ impl RuntimeFlavor {
             "current_thread" => Ok(RuntimeFlavor::CurrentThread),
             "multi_thread" => Ok(RuntimeFlavor::Threaded),
             "local" => Ok(RuntimeFlavor::Local),
-            "dpdk" => Ok(RuntimeFlavor::Dpdk),
+            "dpdk" => Err("The `dpdk` runtime flavor is not supported via macros. Use `Builder::new_dpdk()` directly.".to_string()),
             "single_thread" => Err("The single threaded runtime flavor is called `current_thread`.".to_string()),
             "basic_scheduler" => Err("The `basic_scheduler` runtime flavor has been renamed to `current_thread`.".to_string()),
             "threaded_scheduler" => Err("The `threaded_scheduler` runtime flavor has been renamed to `multi_thread`.".to_string()),
-            _ => Err(format!("No such runtime flavor `{s}`. The runtime flavors are `current_thread`, `local`, `multi_thread`, and `dpdk`.")),
+            _ => Err(format!("No such runtime flavor `{s}`. The runtime flavors are `current_thread`, `local`, and `multi_thread`.")),
         }
     }
 }
@@ -183,14 +182,14 @@ impl Configuration {
         let flavor = self.flavor.unwrap_or(self.default_flavor);
 
         let worker_threads = match (flavor, self.worker_threads) {
-            (F::CurrentThread | F::Local | F::Dpdk, Some((_, worker_threads_span))) => {
+            (F::CurrentThread | F::Local, Some((_, worker_threads_span))) => {
                 let msg = format!(
                     "The `worker_threads` option requires the `multi_thread` runtime flavor. Use `#[{}(flavor = \"multi_thread\")]`",
                     self.macro_name(),
                 );
                 return Err(syn::Error::new(worker_threads_span, msg));
             }
-            (F::CurrentThread | F::Local | F::Dpdk, None) => None,
+            (F::CurrentThread | F::Local, None) => None,
             (F::Threaded, worker_threads) if self.rt_multi_thread_available => {
                 worker_threads.map(|(val, _span)| val)
             }
@@ -205,7 +204,7 @@ impl Configuration {
         };
 
         let start_paused = match (flavor, self.start_paused) {
-            (F::Threaded | F::Dpdk, Some((_, start_paused_span))) => {
+            (F::Threaded, Some((_, start_paused_span))) => {
                 let msg = format!(
                     "The `start_paused` option requires the `current_thread` runtime flavor. Use `#[{}(flavor = \"current_thread\")]`",
                     self.macro_name(),
@@ -217,7 +216,7 @@ impl Configuration {
         };
 
         let unhandled_panic = match (flavor, self.unhandled_panic) {
-            (F::Threaded | F::Dpdk, Some((_, unhandled_panic_span))) => {
+            (F::Threaded, Some((_, unhandled_panic_span))) => {
                 let msg = format!(
                     "The `unhandled_panic` option requires the `current_thread` runtime flavor. Use `#[{}(flavor = \"current_thread\")]`",
                     self.macro_name(),
@@ -421,35 +420,6 @@ fn parse_knobs(mut input: ItemFn, is_test: bool, config: FinalConfig) -> TokenSt
         RuntimeFlavor::Threaded => quote_spanned! {last_stmt_start_span=>
             #crate_path::runtime::Builder::new_multi_thread()
         },
-        RuntimeFlavor::Dpdk => quote_spanned! {last_stmt_start_span=>
-            #crate_path::runtime::Builder::new_dpdk()
-                .dpdk_device(&{
-                    const CONFIG_PATHS: &[&str] = &[
-                        "/etc/dpdk/env.json",
-                        "./config/dpdk-env.json",
-                        "./dpdk-env.json",
-                    ];
-                    let mut result: Option<String> = None;
-                    for path in CONFIG_PATHS {
-                        if let Ok(content) = ::std::fs::read_to_string(path) {
-                            if let Ok(json) = ::serde_json::from_str::<::serde_json::Value>(&content) {
-                                if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
-                                    for device in devices {
-                                        if device.get("role").and_then(|r| r.as_str()) == Some("dpdk") {
-                                            if let Some(pci) = device.get("pci_address").and_then(|p| p.as_str()) {
-                                                result = Some(pci.to_string());
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if result.is_some() { break; }
-                    }
-                    result.expect("No DPDK device found in env.json. Searched: /etc/dpdk/env.json, ./config/dpdk-env.json, ./dpdk-env.json")
-                })
-        },
     };
 
     let mut checks = vec![];
@@ -460,12 +430,6 @@ fn parse_knobs(mut input: ItemFn, is_test: bool, config: FinalConfig) -> TokenSt
             checks.push(quote! { tokio_unstable });
             errors.push("The local runtime flavor is only available when `tokio_unstable` is set.");
             quote_spanned! {last_stmt_start_span=> build_local(Default::default())}
-        }
-        RuntimeFlavor::Dpdk => {
-            // DPDK requires Linux and rt-multi-thread feature
-            checks.push(quote! { target_os = "linux" });
-            errors.push("The DPDK runtime flavor is only available on Linux.");
-            quote_spanned! {last_stmt_start_span=> build()}
         }
         _ => {
             quote_spanned! {last_stmt_start_span=> build()}

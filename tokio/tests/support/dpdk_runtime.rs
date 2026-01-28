@@ -19,7 +19,6 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 /// Create a DPDK runtime using all cores from configuration.
-/// This is the default mode used by `#[tokio::test(flavor = "dpdk")]`.
 pub fn dpdk_rt_all_cores() -> Arc<Runtime> {
     Arc::new(
         tokio::runtime::Builder::new_dpdk()
@@ -52,10 +51,13 @@ pub fn dpdk_rt_n_cores(n: usize) -> Arc<Runtime> {
 }
 
 /// Create a DPDK runtime with a specific device PCI address.
+/// Uses worker_threads(1) because a single device on AWS ENA cannot support
+/// multi-queue mode (no rte_flow support).
 pub fn dpdk_rt_with_device(pci_address: &str) -> Arc<Runtime> {
     Arc::new(
         tokio::runtime::Builder::new_dpdk()
             .dpdk_pci_addresses(&[pci_address])
+            .worker_threads(1)
             .enable_all()
             .build()
             .expect(&format!(

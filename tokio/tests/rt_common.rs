@@ -54,59 +54,10 @@ macro_rules! rt_test {
             }
         }
 
-        // DPDK scheduler tests - only compiled when dpdk feature is enabled
-        // These tests run the same test suite on the DPDK runtime to verify
-        // compatibility with standard Tokio features.
-        // NOTE: DPDK tests are disabled in rt_common.rs because each test requires
-        // subprocess isolation (EAL can only be initialized once per process).
-        // The dedicated DPDK test files (tcp_dpdk.rs, dpdk_rt_common.rs, etc.) use
-        // #[serial_isolation_test] for proper process-level isolation.
-        //
-        // To re-enable: uncomment below and each test will spawn a subprocess.
-        // However, this significantly increases test time.
-        /*
-        #[cfg(all(not(target_os = "wasi"), feature = "rt-multi-thread", target_os = "linux"))]
-        mod dpdk_scheduler {
-            $($t)*
-
-            const NUM_WORKERS: usize = 1;
-
-            /// Get DPDK device PCI address from /etc/dpdk/env.json
-            fn detect_dpdk_device() -> String {
-                const CONFIG_PATHS: &[&str] = &[
-                    "/etc/dpdk/env.json",
-                    "./config/dpdk-env.json",
-                    "./dpdk-env.json",
-                ];
-
-                for path in CONFIG_PATHS {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                            if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
-                                for device in devices {
-                                    if device.get("role").and_then(|r| r.as_str()) == Some("dpdk") {
-                                        if let Some(pci) = device.get("pci_address").and_then(|p| p.as_str()) {
-                                            return pci.to_string();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                panic!("No DPDK device found in env.json. Searched: {:?}", CONFIG_PATHS)
-            }
-
-            fn rt() -> Arc<Runtime> {
-                // Create DPDK runtime (device auto-detected from env.json)
-                tokio::runtime::Builder::new_dpdk()
-                    .enable_all()
-                    .build()
-                    .expect("DPDK runtime creation failed - ensure DPDK is properly configured")
-                    .into()
-            }
-        }
-        */
+        // NOTE: DPDK scheduler tests are NOT included in rt_common.rs.
+        // DPDK EAL can only be initialized once per process, so each DPDK test
+        // requires subprocess isolation via #[serial_isolation_test].
+        // See dedicated test files: dpdk_rt_common.rs, tcp_dpdk.rs, etc.
     }
 }
 

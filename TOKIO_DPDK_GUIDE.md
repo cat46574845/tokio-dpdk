@@ -43,7 +43,25 @@
 - **DPDK 23.11+** 系統級安裝
 - **Hugepages** 已配置 (2MB 或 1GB)
 - **VFIO-PCI** 或 **igb_uio** 驅動程式已綁定到網路介面
-- **Root 權限** (或 CAP_NET_ADMIN + CAP_SYS_ADMIN)
+- **Root 權限** — 必須以 `sudo` 執行（見下方平台說明）
+
+### 平台特定：AWS EC2（非裸機）
+
+EC2 虛擬機（非 bare-metal 實例）**不支援 IOVA VA（虛擬地址）模式**，因為 guest OS 無法存取真實的 IOMMU。DPDK 在此環境下必須使用 **IOVA PA（物理地址）模式**，這帶來一個硬性限制：
+
+> **所有 DPDK 相關操作必須以 root 執行。** PA 模式需要讀取 `/proc/self/pagemap` 來取得物理地址映射，這是一個特權操作。
+
+**影響範圍：**
+
+| 場景 | 做法 |
+|------|------|
+| **應用程式** | `sudo ./your_app` 或 `sudo cargo-fast run` |
+| **測試** | 設定 `SERIAL_ISOLATION_SUDO=1`，隔離測試宏會自動對子進程使用 `sudo` |
+| **建置** | `cargo-fast build` 本身不需要 root，只有**執行**時需要 |
+
+**EAL 會自動偵測並使用 PA 模式**，不需要手動傳 `--iova-mode=pa`（除非你有特殊需求）。
+
+> **裸機實例**（如 `m5.metal`、`c5.metal`）支援 IOMMU 和 VA 模式，可能不需要 root。但為統一性建議仍以 root 執行。
 
 ### 設定腳本
 
@@ -155,49 +173,42 @@ Runtime 在以下位置搜索配置文件（按順序）：
 
 ### 建立 DPDK Runtime
 
-**前提條件**：確保已執行 `setup.sh` 生成配置文件。不需要在代碼中指定 PCI 位址，runtime 會自動使用 env.json 中所有 `role: "dpdk"` 的裝置。
+**前提條件**：確保已執行 `setup.sh` 生成配置文件（`/etc/dpdk/env.json`）。
+
+**核心原則：不要在代碼中硬編碼 PCI 地址。** Runtime 會自動從 `env.json` 讀取所有裝置和網路配置（IP、MAC、Gateway、核心分配）。PCI 地址是機器特定的，硬編碼會導致代碼無法在不同機器上運行。
 
 ```rust
 use tokio::runtime::Builder;
 
-// 基本 DPDK runtime - 使用 env.json 中所有可用裝置和核心
-// IP、MAC、Gateway 會從 /etc/dpdk/env.json 自動讀取
+// ✅ 標準用法 - 自動使用 env.json 中所有 DPDK 裝置和核心
 let rt = Builder::new_dpdk()
     .enable_all()
     .build()
     .expect("DPDK runtime creation failed");
 
-// 指定特定 PCI 位址
+// ✅ 限制 worker 數量（不指定 PCI，仍然自動選裝置）
 let rt = Builder::new_dpdk()
-    .dpdk_pci_addresses(&["0000:28:00.0"])
+    .worker_threads(1)
+    .enable_all()
+    .build()
+    .expect("DPDK runtime creation failed");
+```
+
+> **`dpdk_pci_addresses()` 何時使用？**
+> 僅在多進程場景下，需要不同進程使用不同 NIC 時才需要。即便如此，PCI 地址也應該從 `env.json` 讀取，而非硬編碼在源碼中。大多數情況下，資源鎖機制會自動處理多進程的裝置分配。
+
+```rust
+// ⚠️ 進階：多進程手動分配裝置（PCI 從配置或命令列參數取得，不要硬編碼）
+let pci = std::env::var("MY_APP_PCI_ADDR")
+    .expect("Set MY_APP_PCI_ADDR to the PCI address of the NIC to use");
+let rt = Builder::new_dpdk()
+    .dpdk_pci_addresses(&[pci.as_str()])
+    .worker_threads(1)
     .enable_all()
     .build()
     .expect("DPDK runtime creation failed");
 
-// 多裝置 runtime - 指定多個 PCI 位址
-let rt = Builder::new_dpdk()
-    .dpdk_pci_addresses(&["0000:28:00.0", "0000:29:00.0"])
-    .enable_all()
-    .build()
-    .expect("Multi-device DPDK runtime creation failed");
-
-// 多隊列模式 - 單網卡多 worker
-// 需要設備有多個 IP，每個 worker 分配一個 IP
-let rt = Builder::new_dpdk()
-    .dpdk_pci_addresses(&["0000:28:00.0"])
-    .worker_threads(4)  // 在一張網卡上使用 4 個隊列
-    .enable_all()
-    .build()?;
-
-// 自訂 EAL 參數
-let rt = Builder::new_dpdk()
-    .dpdk_pci_addresses(&["0000:28:00.0"])
-    .dpdk_eal_args(&["--iova-mode=pa", "--no-telemetry"])
-    .enable_all()
-    .build()
-    .expect("DPDK runtime creation failed");
-
-// 自訂記憶體池和隊列配置
+// ⚠️ 進階：調整記憶體池和隊列參數
 let rt = Builder::new_dpdk()
     .dpdk_mempool_size(16384)       // mbuf 數量（預設 8192）
     .dpdk_cache_size(512)           // 每核心快取大小（預設 256）
@@ -437,38 +448,34 @@ SERIAL_ISOLATION_SUDO=1 cargo test --manifest-path tokio/Cargo.toml \
 
 ### 編寫 DPDK 測試
 
-DPDK 測試有兩種模式：
+> **`#[tokio::test(flavor = "dpdk")]` 和 `#[tokio::main(flavor = "dpdk")]` 不受支援。**
+> DPDK runtime 的配置需求（PCI 地址、worker 數量、EAL 參數、子進程隔離）不適合用屬性宏表達。
+> 必須使用 `Builder::new_dpdk()` 手動建立 runtime。
 
-**模式 1：使用 `#[tokio::test(flavor = "dpdk")]` 宏**（推薦）
-
-> ⚠️ **宏順序很重要**：`#[tokio::test(flavor = "dpdk")]` **必須**在 `#[serial_isolation_test]` **之前**。Rust proc-macro 從上到下展開，順序錯誤會導致 EAL 初始化失敗。
-
-```rust
-// ✅ 正確順序
-#[tokio::test(flavor = "dpdk")]
-#[serial_isolation_test::serial_isolation_test]
-async fn my_dpdk_test() {
-    // 直接使用 async 代碼
-    let stream = TcpDpdkStream::connect("1.1.1.1:80").await.unwrap();
-}
-```
-
-**模式 2：手動創建 runtime**（⭐ **推薦：最穩定**）
+**標準模式：手動建立 runtime + 子進程隔離**
 
 ```rust
-#[tokio::test]
 #[serial_isolation_test::serial_isolation_test]
+#[test]
 fn my_dpdk_test() {
-    let rt = dpdk_rt();  // 從 support/dpdk_runtime.rs
+    let rt = tokio::runtime::Builder::new_dpdk()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("DPDK runtime creation failed");
+
     rt.block_on(async {
-        // 測試代碼
+        let stream = TcpDpdkStream::connect("1.1.1.1:80").await.unwrap();
+        // ...
     });
 }
 ```
 
-**重要**：
-- 所有 DPDK 測試**必須**使用 `#[serial_isolation_test]` 確保進程隔離
+**要點**：
+- 所有 DPDK 測試**必須**使用 `#[serial_isolation_test]` 確保子進程隔離（EAL 每進程只能初始化一次）
+- `SERIAL_ISOLATION_SUDO=1` 環境變數會讓隔離宏自動以 `sudo` 執行子進程（EC2 PA 模式要求 root）
 - 不要使用 `#[should_panic]` — 使用 `std::panic::catch_unwind` 代替
+- 不要使用 `#[tokio::test]` 或 `#[tokio::main]` 搭配 `flavor = "dpdk"` — 此組合不受支援
 
 ### Panic 測試模式
 
@@ -501,8 +508,22 @@ fn test_expected_panic() {
 | 變數 | 說明 |
 |------|------|
 | `DPDK_TEST_PORT` | 測試用監聽端口（必須設置，建議 8192） |
-| `SERIAL_ISOLATION_SUDO` | 設為 `1` 允許測試自動提權到 root |
+| `SERIAL_ISOLATION_SUDO` | 設為 `1` 時，`#[serial_isolation_test]` 宏會自動對子進程使用 `sudo`。**僅用於測試**；正常應用程式應直接以 `sudo` 執行 |
 | `DPDK_DEVICE` | 覆蓋預設 PCI 位址（可選） |
+
+### 執行 DPDK 應用程式
+
+DPDK 應用程式**必須以 root 執行**（EC2 非裸機需要 PA 模式讀取 `/proc/self/pagemap`）：
+
+```bash
+# 直接執行
+sudo ./target/release/my_dpdk_app
+
+# 透過 cargo 執行
+sudo cargo-fast run --release -p my_dpdk_app
+```
+
+> `SERIAL_ISOLATION_SUDO` 只影響測試宏的子進程行為，**不影響**正常應用程式。正常應用程式需要手動以 `sudo` 啟動。
 
 ---
 
@@ -591,4 +612,4 @@ RUST_LOG=tokio::runtime::scheduler::dpdk=debug cargo test ...
 
 ---
 
-*最後更新：2026-01-27*
+*最後更新：2026-01-28*

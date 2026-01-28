@@ -148,20 +148,22 @@ When building a DPDK runtime:
 ### Creating DPDK Runtime
 
 ```rust
-// Simple usage - auto-detects devices from env.json
+// Standard usage - auto-detects devices and cores from env.json
+// Do NOT hardcode PCI addresses; they are machine-specific.
 let rt = tokio::runtime::Builder::new_dpdk()
     .enable_all()
     .build()?;
 
-// With specific PCI addresses
+// With explicit worker count
 let rt = Builder::new_dpdk()
-    .dpdk_pci_addresses(&["0000:28:00.0"])
-    .worker_threads(4)
+    .worker_threads(1)
+    .enable_all()
     .build()?;
 
 // With EAL arguments
 let rt = Builder::new_dpdk()
     .dpdk_eal_arg("--no-huge")
+    .enable_all()
     .build()?;
 ```
 
@@ -197,6 +199,10 @@ rt.block_on(async {
 - **smoltcp** (0.11) - Pure Rust TCP/IP stack (no std, alloc-only)
 - **DPDK** (23.11 or 24.11) - C library for fast packet processing
 - Core tokio dependencies (bytes, mio, parking_lot, etc.)
+
+## Test Writing Rules
+
+- **Non-tokio-native tests must fail, not skip.** All DPDK tests (and any other tests that are not part of upstream Tokio) must `panic!` when the required environment is not available, rather than printing "SKIPPED" and returning successfully. A silent skip reports as a passing test, which hides missing infrastructure. If a test cannot run, it must fail loudly so the problem is visible.
 
 ## Platform Notes
 
