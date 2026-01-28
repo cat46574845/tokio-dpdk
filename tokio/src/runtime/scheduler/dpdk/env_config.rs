@@ -306,13 +306,14 @@ where
     let opt: Option<String> = Option::deserialize(deserializer)?;
     match opt {
         Some(s) => {
-            // Handle malformed gateway like "2406:da18:e99:5d00:0:0:0:0::1"
-            let s_clean = s.replace(":::", "::");
-            if let Ok(addr) = s_clean.parse::<std::net::Ipv6Addr>() {
-                Ok(Some(Ipv6Address::from_octets(addr.octets())))
-            } else {
-                Ok(None)
-            }
+            let addr: std::net::Ipv6Addr = s.parse().unwrap_or_else(|e| {
+                panic!(
+                    "gateway_v6 '{}' is not a valid IPv6 address: {}. \
+                     Fix the address in /etc/dpdk/env.json or re-run the config generator.",
+                    s, e
+                )
+            });
+            Ok(Some(Ipv6Address::from_octets(addr.octets())))
         }
         None => Ok(None),
     }

@@ -30,6 +30,7 @@ const NUM_WORKERS: usize = 1;
 fn rt() -> Arc<Runtime> {
     Arc::new(
         tokio::runtime::Builder::new_dpdk()
+            .worker_threads(1)
             .enable_all()
             .build()
             .expect("DPDK runtime creation failed"),
@@ -317,6 +318,7 @@ fn outstanding_tasks_dropped() {
 
 #[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore] // DPDK EAL can only be initialized once per process; this test creates 2 runtimes
 fn nested_rt() {
     // Use catch_unwind instead of #[should_panic] because subprocess isolation
     // is incompatible with should_panic attribute
@@ -330,6 +332,7 @@ fn nested_rt() {
 
 #[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore] // DPDK EAL can only be initialized once per process; this test creates 2 runtimes
 fn create_rt_in_block_on() {
     let rt1 = rt();
     let rt2 = rt1.block_on(async { rt() });
@@ -649,6 +652,7 @@ fn io_driver_called_when_under_load() {
 /// spuriously.
 #[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore] // DPDK EAL can only be initialized once per process; retry loop creates multiple runtimes
 #[cfg_attr(miri, ignore)] // No `socket` in miri.
 fn yield_defers_until_park() {
     for _ in 0..10 {
@@ -667,6 +671,7 @@ fn yield_defers_until_park() {
 /// Same as above, but with cooperative scheduling.
 #[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore] // DPDK EAL can only be initialized once per process; retry loop creates multiple runtimes
 #[cfg_attr(miri, ignore)] // No `socket` in miri.
 fn coop_yield_defers_until_park() {
     for _ in 0..10 {
@@ -941,6 +946,7 @@ fn wake_while_rt_is_dropping() {
 #[cfg_attr(miri, ignore)] // No `socket` in miri.
 #[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore] // DPDK EAL can only be initialized once per process; loop creates multiple runtimes
 fn io_notify_while_shutting_down() {
     use std::sync::Arc;
     use tokio::net::UdpSocket;
@@ -1032,6 +1038,7 @@ fn shutdown_wakeup_time() {
 // See https://github.com/rust-lang/rust/issues/74875
 #[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore] // DPDK EAL can only be initialized once per process; this test creates 2 runtimes
 #[cfg(not(windows))]
 #[cfg_attr(target_os = "wasi", ignore = "Wasi does not support threads")]
 fn runtime_in_thread_local() {
@@ -1295,6 +1302,7 @@ fn ping_pong_saturation() {
 
 #[serial_isolation_test::serial_isolation_test]
 #[test]
+#[ignore] // DPDK EAL can only be initialized once per process; loop creates multiple runtimes
 fn shutdown_concurrent_spawn() {
     const NUM_TASKS: usize = 10_000;
     for _ in 0..5 {

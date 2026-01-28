@@ -20,23 +20,41 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::runtime::dpdk;
 
-/// Helper to create a DPDK runtime with multiple workers for testing
-/// Note: Actual worker count depends on available cores and IP addresses in env.json
-/// The number of workers will be: min(available_cores, available_ips)
-fn dpdk_rt_multi_worker(_n: usize) -> Arc<Runtime> {
-    Arc::new(
+/// Helper to create a DPDK runtime with at least `n` workers for testing.
+/// Requests `n` workers via `.worker_threads(n)` and asserts that the
+/// actual allocation provides at least `n` workers.
+/// Fails if the system cannot provide enough workers (e.g., not enough
+/// DPDK devices/IPs/cores in env.json).
+fn dpdk_rt_multi_worker(n: usize) -> Arc<Runtime> {
+    let rt = Arc::new(
         tokio::runtime::Builder::new_dpdk()
-            // Note: .worker_threads() is ignored by DPDK runtime
-            // Worker count is auto-determined by allocation algorithm
+            .worker_threads(n)
             .enable_all()
             .build()
             .expect("DPDK RT creation failed")
-    )
+    );
+
+    // Verify we got enough workers
+    let actual = rt.block_on(async { dpdk::workers().len() });
+    assert!(
+        actual >= n,
+        "Test requires at least {} workers but only got {}. \
+         Ensure env.json has enough DPDK devices with IPs and cores.",
+        n, actual
+    );
+
+    rt
 }
 
 /// Helper to create a single-worker DPDK runtime
 fn dpdk_rt() -> Arc<Runtime> {
-    dpdk_rt_multi_worker(1)
+    Arc::new(
+        tokio::runtime::Builder::new_dpdk()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("DPDK RT creation failed")
+    )
 }
 
 // =============================================================================
@@ -371,10 +389,12 @@ mod mixed_api_stress {
 
         rt.block_on(async {
             let workers = dpdk::workers();
-            if workers.len() < 2 {
-                println!("⚠ Skipping test: requires at least 2 workers");
-                return;
-            }
+            assert!(
+                workers.len() >= 2,
+                "Test requires at least 2 workers, got {}. \
+                 Ensure env.json has enough DPDK devices with IPs and cores.",
+                workers.len()
+            );
 
             let worker0 = workers[0];
             let worker1 = workers[1];

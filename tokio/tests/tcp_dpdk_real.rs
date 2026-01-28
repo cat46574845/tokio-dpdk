@@ -32,50 +32,6 @@ const LOCAL_VPC_SSH: &str = "172.31.1.228:22";
 /// Simple HTTP GET request
 const HTTP_GET: &[u8] = b"GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n";
 
-/// Detect DPDK interface IP address from env.json.
-fn detect_dpdk_ip() -> Option<String> {
-    let config_paths = [
-        "/etc/dpdk/env.json",
-        "./config/dpdk-env.json",
-        "./dpdk-env.json",
-    ];
-
-    for path in &config_paths {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Some(ip) = find_dpdk_ip_in_json(&content) {
-                return Some(ip);
-            }
-        }
-    }
-
-    None
-}
-
-/// Extract DPDK IPv4 address from JSON config.
-fn find_dpdk_ip_in_json(content: &str) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_str(content).ok()?;
-
-    if let Some(devices) = json.get("devices").and_then(|d| d.as_array()) {
-        for device in devices {
-            // Look for 'addresses' array (format: "IP/prefix")
-            if let Some(addrs) = device.get("addresses").and_then(|a| a.as_array()) {
-                for addr in addrs {
-                    if let Some(addr_str) = addr.as_str() {
-                        // Check if it's an IPv4 address (not IPv6, which contains ':')
-                        if !addr_str.contains(':') {
-                            // Extract IP without CIDR notation
-                            let ip = addr_str.split('/').next().unwrap_or(addr_str);
-                            return Some(ip.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
 /// Create a DPDK runtime for testing.
 fn dpdk_rt() -> Runtime {
     tokio::runtime::Builder::new_dpdk()
@@ -111,8 +67,8 @@ fn test_local_vpc_connect() {
         .await
         {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => { println!("SKIPPED: {}", format!("connect failed: {}", e)); return; },
-            Err(_) => { println!("SKIPPED: {}", "connect timeout".to_string()); return; },
+            Ok(Err(e)) => panic!("connect failed: {}", e),
+            Err(_) => panic!("connect timeout"),
         };
 
         // Just verifying we can establish a connection
@@ -128,10 +84,8 @@ fn test_local_vpc_connect() {
 fn test_ipv4_connect() {
     let rt = dpdk_rt();
     rt.block_on(async {
-        let mut stream = match TcpDpdkStream::connect(CLOUDFLARE_V4).await {
-            Ok(s) => s,
-            Err(e) => { println!("SKIPPED: {}", format!("connect failed: {}", e)); return; },
-        };
+        let mut stream = TcpDpdkStream::connect(CLOUDFLARE_V4).await
+            .expect("connect failed");
 
         let local = stream.local_addr().expect("Should have local addr");
         let peer = stream.peer_addr().expect("Should have peer addr");
@@ -172,10 +126,8 @@ fn test_ipv4_connect() {
 fn test_ipv4_read_write() {
     let rt = dpdk_rt();
     rt.block_on(async {
-        let mut stream = match TcpDpdkStream::connect(CLOUDFLARE_V4).await {
-            Ok(s) => s,
-            Err(e) => { println!("SKIPPED: {}", format!("connect failed: {}", e)); return; },
-        };
+        let mut stream = TcpDpdkStream::connect(CLOUDFLARE_V4).await
+            .expect("connect failed");
 
         // Multiple write/read cycles
         for i in 0..3 {
@@ -203,10 +155,8 @@ fn test_ipv4_read_write() {
 fn test_ipv6_connect() {
     let rt = dpdk_rt();
     rt.block_on(async {
-        let mut stream = match TcpDpdkStream::connect(CLOUDFLARE_V6).await {
-            Ok(s) => s,
-            Err(e) => { println!("SKIPPED: {}", format!("IPv6 not available: {}", e)); return; },
-        };
+        let mut stream = TcpDpdkStream::connect(CLOUDFLARE_V6).await
+            .expect("IPv6 connect failed");
 
         let local = stream.local_addr().expect("Should have local addr");
         let peer = stream.peer_addr().expect("Should have peer addr");
@@ -666,20 +616,19 @@ fn test_socket_new_v4() {
 fn test_socket_bind_connect() {
     let rt = dpdk_rt();
     rt.block_on(async {
-        // Get DPDK IP from env.json to bind to a specific address
-        let dpdk_ip = match detect_dpdk_ip() {
-            Some(ip) => ip,
-            None => {
-                { println!("SKIPPED: {}", "DPDK IP not found in env.json".to_string()); return; };
-            }
-        };
+        // Use the runtime API to get current worker's actual NIC IP.
+        // detect_dpdk_ip() reads env.json in file order, but AllocationPlan
+        // sorts devices by PCI address — so they can disagree on which IP
+        // belongs to worker 0.
+        let dpdk_ip = tokio::runtime::dpdk::current_ipv4()
+            .expect("current worker has no IPv4 address");
 
         let socket = match TcpDpdkSocket::new_v4() {
             Ok(s) => s,
             Err(e) => panic!("{}", format!("new_v4() failed: {}", e)),
         };
 
-        // Bind to a specific port on DPDK IP
+        // Bind to a specific port on current worker's DPDK IP
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -776,13 +725,10 @@ fn test_socket_buffer_size() {
 fn test_listener_bind_hostname() {
     let rt = dpdk_rt();
     rt.block_on(async {
-        // Get DPDK IP from env.json
-        let dpdk_ip = match detect_dpdk_ip() {
-            Some(ip) => ip,
-            None => {
-                { println!("SKIPPED: {}", "DPDK IP not found in env.json".to_string()); return; };
-            }
-        };
+        // Use runtime API to get current worker's actual NIC IP
+        let dpdk_ip = tokio::runtime::dpdk::current_ipv4()
+            .expect("current worker has no IPv4 address")
+            .to_string();
 
         // smoltcp doesn't support port 0 for listen (requires explicit port)
         // Use a random high port for testing
@@ -818,13 +764,10 @@ fn test_listener_bind_hostname() {
 fn test_listener_ttl() {
     let rt = dpdk_rt();
     rt.block_on(async {
-        // Get DPDK IP from env.json
-        let dpdk_ip = match detect_dpdk_ip() {
-            Some(ip) => ip,
-            None => {
-                { println!("SKIPPED: {}", "DPDK IP not found in env.json".to_string()); return; };
-            }
-        };
+        // Use runtime API to get current worker's actual NIC IP
+        let dpdk_ip = tokio::runtime::dpdk::current_ipv4()
+            .expect("current worker has no IPv4 address")
+            .to_string();
 
         // smoltcp doesn't support port 0 for listen (requires explicit port)
         // Use a random high port for testing
@@ -1033,13 +976,10 @@ fn test_dns_connect_invalid_hostname() {
 fn test_dns_bind_with_string() {
     let rt = dpdk_rt();
     rt.block_on(async {
-        // Get DPDK IP from env.json
-        let dpdk_ip = match detect_dpdk_ip() {
-            Some(ip) => ip,
-            None => {
-                { println!("SKIPPED: {}", "DPDK IP not found in env.json".to_string()); return; };
-            }
-        };
+        // Use runtime API to get current worker's actual NIC IP
+        let dpdk_ip = tokio::runtime::dpdk::current_ipv4()
+            .expect("current worker has no IPv4 address")
+            .to_string();
 
         // smoltcp doesn't support port 0, use a random high port
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -1075,13 +1015,10 @@ fn test_dns_bind_with_string() {
 fn test_dns_bind_with_tuple() {
     let rt = dpdk_rt();
     rt.block_on(async {
-        // Get DPDK IP from env.json
-        let dpdk_ip = match detect_dpdk_ip() {
-            Some(ip) => ip,
-            None => {
-                { println!("SKIPPED: {}", "DPDK IP not found in env.json".to_string()); return; };
-            }
-        };
+        // Use runtime API to get current worker's actual NIC IP
+        let dpdk_ip = tokio::runtime::dpdk::current_ipv4()
+            .expect("current worker has no IPv4 address")
+            .to_string();
 
         // smoltcp doesn't support port 0, use a random high port
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -1108,5 +1045,416 @@ fn test_dns_bind_with_tuple() {
             }
             Err(e) => panic!("{}", format!("bind({:?}) failed: {}", bind_tuple, e)),
         }
+    })
+}
+
+// =============================================================================
+// IPv6 Tests
+// =============================================================================
+
+/// Test TcpDpdkSocket::new_v6() creation
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_socket_new_v6() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        match TcpDpdkSocket::new_v6() {
+            Ok(_socket) => {}
+            Err(e) => panic!("{}", format!("new_v6() failed: {}", e)),
+        }
+    })
+}
+
+/// Test IPv6 socket bind then connect (verify local IPv6 address is used)
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_socket_bind_connect_ipv6() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        let dpdk_ipv6 = tokio::runtime::dpdk::current_ipv6()
+            .expect("current worker has no IPv6 address");
+
+        let socket = TcpDpdkSocket::new_v6().expect("new_v6() failed");
+
+        // Bind to the DPDK IPv6 address with a random ephemeral port
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u16)
+            .unwrap_or(22222);
+        let bind_port = 49152 + (nanos % 16384);
+
+        let bind_addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(dpdk_ipv6),
+            bind_port,
+        );
+        socket.bind(bind_addr).expect("bind IPv6 failed");
+
+        // Connect to Cloudflare IPv6
+        let remote_addr: std::net::SocketAddr = CLOUDFLARE_V6.parse().unwrap();
+        match tokio::time::timeout(Duration::from_secs(10), socket.connect(remote_addr)).await {
+            Ok(Ok(stream)) => {
+                let local = stream.local_addr().expect("local_addr() failed");
+                let peer = stream.peer_addr().expect("peer_addr() failed");
+                assert!(
+                    local.ip().is_ipv6(),
+                    "local should be IPv6, got: {}",
+                    local
+                );
+                assert!(
+                    peer.ip().is_ipv6(),
+                    "peer should be IPv6, got: {}",
+                    peer
+                );
+                if local.port() != bind_port {
+                    panic!(
+                        "{}",
+                        format!(
+                            "local_addr port mismatch: expected {}, got {}",
+                            bind_port,
+                            local.port()
+                        )
+                    );
+                }
+            }
+            Ok(Err(e)) => panic!("{}", format!("connect() failed: {}", e)),
+            Err(_) => panic!("{}", "Connect timeout".to_string()),
+        }
+    })
+}
+
+/// Test that IPv6 connect returns IPv6 local_addr
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_ipv6_connect_verify_local_ipv6() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        let stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpDpdkStream::connect(CLOUDFLARE_V6),
+        )
+        .await
+        .expect("timeout")
+        .expect("IPv6 connect failed");
+
+        let local = stream.local_addr().expect("local_addr() failed");
+        let peer = stream.peer_addr().expect("peer_addr() failed");
+
+        assert!(
+            local.ip().is_ipv6(),
+            "local_addr should be IPv6 after IPv6 connect, got: {}",
+            local
+        );
+        assert!(
+            peer.ip().is_ipv6(),
+            "peer_addr should be IPv6, got: {}",
+            peer
+        );
+        assert!(local.port() > 0, "local port should be non-zero");
+    })
+}
+
+/// Test TcpDpdkListener::bind to an explicit IPv6 address
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_listener_bind_ipv6() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        let dpdk_ipv6 = tokio::runtime::dpdk::current_ipv6()
+            .expect("current worker has no IPv6 address");
+
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u16)
+            .unwrap_or(33333);
+        let port = 49152 + (nanos % 16384);
+
+        let bind_str = format!("[{}]:{}", dpdk_ipv6, port);
+        let listener = TcpDpdkListener::bind(bind_str.as_str())
+            .await
+            .unwrap_or_else(|e| panic!("{}", format!("bind({}) failed: {}", bind_str, e)));
+
+        let local = listener.local_addr().expect("local_addr() failed");
+        assert!(
+            local.ip().is_ipv6(),
+            "listener local_addr should be IPv6, got: {}",
+            local
+        );
+        assert_eq!(local.port(), port, "listener port mismatch");
+    })
+}
+
+/// Test TcpDpdkListener::bind to unspecified IPv6 address [::]
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_listener_bind_ipv6_unspecified() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u16)
+            .unwrap_or(44444);
+        let port = 49152 + (nanos % 16384);
+
+        let bind_str = format!("[::]:{}", port);
+        let listener = TcpDpdkListener::bind(bind_str.as_str())
+            .await
+            .unwrap_or_else(|e| panic!("{}", format!("bind({}) failed: {}", bind_str, e)));
+
+        let local = listener.local_addr().expect("local_addr() failed");
+        assert_eq!(local.port(), port, "listener port mismatch");
+        // Unspecified address should be preserved
+        assert!(
+            local.ip().is_ipv6(),
+            "listener local_addr should be IPv6, got: {}",
+            local
+        );
+    })
+}
+
+// =============================================================================
+// Address Family Mismatch Tests
+// =============================================================================
+
+/// Test that binding an IPv6 address to an IPv4 socket fails
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_socket_v4_bind_v6_fails() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        let socket = TcpDpdkSocket::new_v4().expect("new_v4() failed");
+        let v6_addr: std::net::SocketAddr = "[::1]:12345".parse().unwrap();
+        match socket.bind(v6_addr) {
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "expected InvalidInput, got: {:?}",
+                    e
+                );
+            }
+            Ok(()) => panic!("binding IPv6 addr to IPv4 socket should fail"),
+        }
+    })
+}
+
+/// Test that binding an IPv4 address to an IPv6 socket fails
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_socket_v6_bind_v4_fails() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        let socket = TcpDpdkSocket::new_v6().expect("new_v6() failed");
+        let v4_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        match socket.bind(v4_addr) {
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "expected InvalidInput, got: {:?}",
+                    e
+                );
+            }
+            Ok(()) => panic!("binding IPv4 addr to IPv6 socket should fail"),
+        }
+    })
+}
+
+/// Test that connecting an IPv4 socket to an IPv6 remote fails
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_socket_v4_connect_v6_fails() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        let socket = TcpDpdkSocket::new_v4().expect("new_v4() failed");
+        let v6_remote: std::net::SocketAddr = CLOUDFLARE_V6.parse().unwrap();
+        match socket.connect(v6_remote).await {
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "expected InvalidInput, got: {:?}",
+                    e
+                );
+            }
+            Ok(_) => panic!("IPv4 socket connecting to IPv6 remote should fail"),
+        }
+    })
+}
+
+/// Test that connecting an IPv6 socket to an IPv4 remote fails
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_socket_v6_connect_v4_fails() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        let socket = TcpDpdkSocket::new_v6().expect("new_v6() failed");
+        let v4_remote: std::net::SocketAddr = CLOUDFLARE_V4.parse().unwrap();
+        match socket.connect(v4_remote).await {
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "expected InvalidInput, got: {:?}",
+                    e
+                );
+            }
+            Ok(_) => panic!("IPv6 socket connecting to IPv4 remote should fail"),
+        }
+    })
+}
+
+// =============================================================================
+// Unspecified Local Address Tests
+// =============================================================================
+
+/// Test bind to 0.0.0.0:0 then connect — driver should auto-fill the local IPv4 address
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_socket_bind_unspecified_v4_connect() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        let socket = TcpDpdkSocket::new_v4().expect("new_v4() failed");
+        let unspecified: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+        socket.bind(unspecified).expect("bind 0.0.0.0:0 failed");
+
+        let remote_addr: std::net::SocketAddr = CLOUDFLARE_V4.parse().unwrap();
+        match tokio::time::timeout(Duration::from_secs(10), socket.connect(remote_addr)).await {
+            Ok(Ok(stream)) => {
+                let local = stream.local_addr().expect("local_addr() failed");
+                // Driver should have filled in a real IPv4 address, not 0.0.0.0
+                assert!(
+                    !local.ip().is_unspecified(),
+                    "local_addr should not be unspecified after connect, got: {}",
+                    local
+                );
+                assert!(local.ip().is_ipv4(), "local should be IPv4, got: {}", local);
+                assert!(local.port() > 0, "local port should be non-zero");
+            }
+            Ok(Err(e)) => panic!("{}", format!("connect() failed: {}", e)),
+            Err(_) => panic!("{}", "Connect timeout".to_string()),
+        }
+    })
+}
+
+/// Test bind to [::]:0 then connect to IPv6 — driver should auto-fill the local IPv6 address
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_socket_bind_unspecified_v6_connect() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        let socket = TcpDpdkSocket::new_v6().expect("new_v6() failed");
+        let unspecified: std::net::SocketAddr = "[::]:0".parse().unwrap();
+        socket.bind(unspecified).expect("bind [::]:0 failed");
+
+        let remote_addr: std::net::SocketAddr = CLOUDFLARE_V6.parse().unwrap();
+        match tokio::time::timeout(Duration::from_secs(10), socket.connect(remote_addr)).await {
+            Ok(Ok(stream)) => {
+                let local = stream.local_addr().expect("local_addr() failed");
+                // Driver should have filled in a real IPv6 address, not ::
+                assert!(
+                    !local.ip().is_unspecified(),
+                    "local_addr should not be unspecified after connect, got: {}",
+                    local
+                );
+                assert!(local.ip().is_ipv6(), "local should be IPv6, got: {}", local);
+                assert!(local.port() > 0, "local port should be non-zero");
+
+                let peer = stream.peer_addr().expect("peer_addr() failed");
+                assert!(peer.ip().is_ipv6(), "peer should be IPv6, got: {}", peer);
+            }
+            Ok(Err(e)) => panic!("{}", format!("connect() failed: {}", e)),
+            Err(_) => panic!("{}", "Connect timeout".to_string()),
+        }
+    })
+}
+
+/// Test IPv6 read/write — full round-trip over IPv6
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_ipv6_read_write() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpDpdkStream::connect(CLOUDFLARE_V6),
+        )
+        .await
+        .expect("timeout")
+        .expect("IPv6 connect failed");
+
+        // Send HTTP request over IPv6
+        stream
+            .write_all(b"GET / HTTP/1.0\r\nHost: [2606:4700:4700::1111]\r\n\r\n")
+            .await
+            .expect("IPv6 write failed");
+
+        // Read response
+        let mut buf = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("read timeout")
+            .expect("IPv6 read failed");
+
+        assert!(n > 0, "should receive data over IPv6");
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("HTTP/1."),
+            "expected HTTP response over IPv6, got: {}",
+            &response[..response.len().min(100)]
+        );
+    })
+}
+
+/// Test IPv6 socket with explicit bind + read/write
+#[serial_isolation_test::serial_isolation_test]
+#[test]
+fn test_socket_ipv6_bind_read_write() {
+    let rt = dpdk_rt();
+    rt.block_on(async {
+        let dpdk_ipv6 = tokio::runtime::dpdk::current_ipv6()
+            .expect("current worker has no IPv6 address");
+
+        let socket = TcpDpdkSocket::new_v6().expect("new_v6() failed");
+        let bind_addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(dpdk_ipv6),
+            0, // ephemeral port
+        );
+        socket.bind(bind_addr).expect("bind IPv6 failed");
+
+        let remote_addr: std::net::SocketAddr = CLOUDFLARE_V6.parse().unwrap();
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            socket.connect(remote_addr),
+        )
+        .await
+        .expect("timeout")
+        .expect("IPv6 socket connect failed");
+
+        // Verify addresses
+        let local = stream.local_addr().expect("local_addr() failed");
+        assert!(local.ip().is_ipv6(), "local should be IPv6: {}", local);
+
+        // Write and read over the IPv6 connection
+        stream
+            .write_all(b"GET / HTTP/1.0\r\nHost: [2606:4700:4700::1111]\r\n\r\n")
+            .await
+            .expect("write failed");
+
+        let mut buf = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("read timeout")
+            .expect("read failed");
+
+        assert!(n > 0, "should receive data");
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("HTTP/1."),
+            "expected HTTP response, got: {}",
+            &response[..response.len().min(100)]
+        );
     })
 }

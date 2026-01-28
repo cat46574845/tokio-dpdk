@@ -211,17 +211,22 @@ generate_config() {
             gateway_v4="${octets[0]}.${octets[1]}.${octets[2]}.1"
         fi
         
-        # Calculate IPv6 gateway (usually ::1 of the subnet)
+        # Get IPv6 gateway and prefix
         local gateway_v6=""
         local prefix_v6="128"
         if [[ -n "$subnet_cidr_v6" ]]; then
             # Extract prefix from IPv6 CIDR (e.g., 2406:da18:e99:5d00::/56 -> 56)
             prefix_v6="${subnet_cidr_v6#*/}"
             [[ -z "$prefix_v6" ]] && prefix_v6="64"
-            # AWS VPC IPv6 gateway is typically the first address of the subnet
-            local subnet_base_v6="${subnet_cidr_v6%/*}"
-            # For /56 or /64 prefixes, gateway is usually ::1
-            gateway_v6="${subnet_base_v6%::*}::1"
+            # AWS VPC uses a link-local address as the IPv6 gateway.
+            # Read it from the kernel routing table for this interface.
+            if [[ -n "$ifname" ]]; then
+                gateway_v6=$(ip -6 route show default dev "$ifname" 2>/dev/null | awk '/via/ {print $3; exit}')
+            fi
+            # Fallback: get from any interface's IPv6 default route
+            if [[ -z "$gateway_v6" ]]; then
+                gateway_v6=$(ip -6 route show default 2>/dev/null | awk '/via/ {print $3; exit}')
+            fi
         fi
         
         # Note: core_affinity removed in version 2, use dpdk_cores instead

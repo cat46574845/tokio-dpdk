@@ -2657,6 +2657,9 @@ unsafe extern "C" {
     pub fn rte_eth_promiscuous_enable(port_id: u16) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    pub fn rte_eth_allmulticast_enable(port_id: u16) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     #[doc = " Retrieve the Ethernet address of an Ethernet device.\n\n @param port_id\n   The port identifier of the Ethernet device.\n @param mac_addr\n   A pointer to a structure of type *ether_addr* to be filled with\n   the Ethernet address of the Ethernet device.\n @return\n   - (0) if successful\n   - (-ENODEV) if *port_id* invalid.\n   - (-EINVAL) if bad parameter."]
     pub fn rte_eth_macaddr_get(port_id: u16, mac_addr: *mut rte_ether_addr) -> ::core::ffi::c_int;
 }

@@ -122,8 +122,11 @@ pub struct TcpDpdkStream {
     peer_addr: Option<SocketAddr>,
     /// Read shutdown flag (smoltcp doesn't support half-close on read side)
     read_shutdown: std::sync::atomic::AtomicBool,
-    /// Last error encountered
-    last_error: std::sync::Mutex<Option<io::Error>>,
+    /// Write shutdown flag — tracks whether we initiated close (FIN sent)
+    /// Used by take_error() to distinguish RST from clean close.
+    write_shutdown: std::sync::atomic::AtomicBool,
+    /// Last error encountered (stored as ErrorKind since io::Error doesn't impl Clone)
+    last_error: std::sync::Mutex<Option<io::ErrorKind>>,
 }
 
 impl TcpDpdkStream {
@@ -142,6 +145,7 @@ impl TcpDpdkStream {
             local_addr,
             peer_addr,
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
+            write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
         }
     }
@@ -353,6 +357,7 @@ impl TcpDpdkStream {
             local_addr,
             peer_addr: Some(addr),
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
+            write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
         })
     }
@@ -534,6 +539,7 @@ impl TcpDpdkStream {
             local_addr: result_local_addr,
             peer_addr: Some(remote_addr),
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
+            write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
         })
     }
@@ -697,21 +703,37 @@ impl TcpDpdkStream {
 
     /// Waits for any of the requested ready states.
     ///
+    /// Returns as soon as **any** of the requested interests becomes ready,
+    /// matching tokio's `TcpStream::ready()` semantics. The returned `Ready`
+    /// value indicates which interests are ready — it may be a subset of
+    /// what was requested.
+    ///
     /// This function is usually paired with `try_read()` or `try_write()`.
     pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
-        let mut ready = Ready::EMPTY;
+        poll_fn(|cx| {
+            let mut ready = Ready::EMPTY;
 
-        if interest.is_readable() {
-            poll_fn(|cx| self.poll_read_ready(cx)).await?;
-            ready |= Ready::READABLE;
-        }
+            if interest.is_readable() {
+                if let Poll::Ready(result) = self.poll_read_ready(cx) {
+                    result?;
+                    ready |= Ready::READABLE;
+                }
+            }
 
-        if interest.is_writable() {
-            poll_fn(|cx| self.poll_write_ready(cx)).await?;
-            ready |= Ready::WRITABLE;
-        }
+            if interest.is_writable() {
+                if let Poll::Ready(result) = self.poll_write_ready(cx) {
+                    result?;
+                    ready |= Ready::WRITABLE;
+                }
+            }
 
-        Ok(ready)
+            if ready.is_empty() {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(ready))
+            }
+        })
+        .await
     }
 
     /// Waits for the socket to become readable.
@@ -933,11 +955,17 @@ impl TcpDpdkStream {
                 self.clear_read_ready();
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             }
-            Some(Err(kind)) => Err(io::Error::new(kind, "socket read error")),
-            None => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Cannot access DPDK driver",
-            )),
+            Some(Err(kind)) => {
+                self.store_error(kind);
+                Err(io::Error::new(kind, "socket read error"))
+            }
+            None => {
+                self.store_error(io::ErrorKind::Other);
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Cannot access DPDK driver",
+                ))
+            }
         }
     }
 
@@ -972,11 +1000,17 @@ impl TcpDpdkStream {
                 self.clear_write_ready();
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             }
-            Some(Err(kind)) => Err(io::Error::new(kind, "socket write error")),
-            None => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Cannot access DPDK driver",
-            )),
+            Some(Err(kind)) => {
+                self.store_error(kind);
+                Err(io::Error::new(kind, "socket write error"))
+            }
+            None => {
+                self.store_error(io::ErrorKind::Other);
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Cannot access DPDK driver",
+                ))
+            }
         }
     }
 
@@ -1153,6 +1187,42 @@ impl TcpDpdkStream {
         Ok(())
     }
 
+    /// Gets the TCP keep-alive interval.
+    ///
+    /// Returns `Some(duration)` if keep-alive is enabled, `None` if disabled.
+    /// In smoltcp, keep-alive is controlled by a single `Option<Duration>` where
+    /// `None` means disabled and `Some(interval)` means enabled with that interval.
+    pub fn keep_alive(&self) -> io::Result<Option<std::time::Duration>> {
+        self.assert_on_correct_worker();
+        let handle = self.handle;
+
+        let result = with_current_driver(|driver| {
+            let socket = driver.get_tcp_socket_mut(handle);
+            socket
+                .keep_alive()
+                .map(|d| std::time::Duration::from_millis(d.total_millis() as u64))
+        });
+
+        result.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Cannot access DPDK driver"))
+    }
+
+    /// Sets the TCP keep-alive interval.
+    ///
+    /// Pass `Some(duration)` to enable keep-alive with the specified interval,
+    /// or `None` to disable keep-alive.
+    pub fn set_keep_alive(&self, interval: Option<std::time::Duration>) -> io::Result<()> {
+        self.assert_on_correct_worker();
+        let handle = self.handle;
+
+        with_current_driver(|driver| {
+            let socket = driver.get_tcp_socket_mut(handle);
+            socket.set_keep_alive(
+                interval.map(|d| smoltcp::time::Duration::from_millis(d.as_millis() as u64)),
+            );
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Cannot access DPDK driver"))
+    }
+
     /// Gets the value of TCP_QUICKACK (Linux-specific).
     ///
     /// Returns true if quick ACK mode is enabled (delayed ACK disabled).
@@ -1191,12 +1261,59 @@ impl TcpDpdkStream {
     }
 
     /// Returns the value of the SO_ERROR option.
+    ///
+    /// Checks two sources of errors:
+    /// 1. **Stored errors** from I/O operations (e.g., `BrokenPipe` from writing
+    ///    to a closed connection). These are returned with take semantics — the
+    ///    stored error is cleared after retrieval.
+    /// 2. **Socket state** — if the smoltcp socket has transitioned to `Closed`
+    ///    without our side initiating shutdown, this indicates a connection reset
+    ///    (RST received from peer).
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        let mut guard = self
-            .last_error
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "lock poisoned"))?;
-        Ok(guard.take())
+        // 1. Check stored error first (take semantics)
+        {
+            let mut guard = self
+                .last_error
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "lock poisoned"))?;
+            if let Some(kind) = guard.take() {
+                return Ok(Some(io::Error::from(kind)));
+            }
+        }
+
+        // 2. Actively probe socket state for async errors (RST received, etc.)
+        //    If socket is Closed and we never initiated write shutdown,
+        //    the peer sent RST → ConnectionReset.
+        let we_closed = self
+            .write_shutdown
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        if we_closed {
+            // We initiated close — Closed state is expected, not an error
+            return Ok(None);
+        }
+
+        let handle = self.handle;
+        let state_error = with_current_driver(|driver| {
+            let socket = driver.get_tcp_socket_mut(handle);
+            match socket.state() {
+                smoltcp::socket::tcp::State::Closed => {
+                    // Socket is closed but we didn't initiate → RST from peer
+                    Some(io::ErrorKind::ConnectionReset)
+                }
+                _ => None,
+            }
+        })
+        .flatten();
+
+        Ok(state_error.map(io::Error::from))
+    }
+
+    /// Store an error kind for later retrieval via `take_error()`.
+    fn store_error(&self, kind: io::ErrorKind) {
+        if let Ok(mut guard) = self.last_error.lock() {
+            *guard = Some(kind);
+        }
     }
 
     /// Shuts down the read, write, or both halves of this connection.
@@ -1217,6 +1334,8 @@ impl TcpDpdkStream {
                     .store(true, std::sync::atomic::Ordering::Release);
             }
             Shutdown::Write => {
+                self.write_shutdown
+                    .store(true, std::sync::atomic::Ordering::Release);
                 let handle = self.handle;
                 with_current_driver(|driver| {
                     let socket = driver.get_tcp_socket_mut(handle);
@@ -1225,6 +1344,8 @@ impl TcpDpdkStream {
             }
             Shutdown::Both => {
                 self.read_shutdown
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.write_shutdown
                     .store(true, std::sync::atomic::Ordering::Release);
                 let handle = self.handle;
                 with_current_driver(|driver| {
@@ -1329,8 +1450,12 @@ impl AsyncRead for TcpDpdkStream {
                 // Not ready - waker already registered with smoltcp
                 Poll::Pending
             }
-            Some(Err(kind)) => Poll::Ready(Err(io::Error::new(kind, "socket read error"))),
+            Some(Err(kind)) => {
+                self.store_error(kind);
+                Poll::Ready(Err(io::Error::new(kind, "socket read error")))
+            }
             None => {
+                self.store_error(io::ErrorKind::Other);
                 // Not on worker thread or driver busy
                 Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -1390,11 +1515,17 @@ impl AsyncWrite for TcpDpdkStream {
                 // Not ready - waker already registered with smoltcp
                 Poll::Pending
             }
-            Some(Err(kind)) => Poll::Ready(Err(io::Error::new(kind, "socket write error"))),
-            None => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Cannot access DPDK driver",
-            ))),
+            Some(Err(kind)) => {
+                self.store_error(kind);
+                Poll::Ready(Err(io::Error::new(kind, "socket write error")))
+            }
+            None => {
+                self.store_error(io::ErrorKind::Other);
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Cannot access DPDK driver",
+                )))
+            }
         }
     }
 

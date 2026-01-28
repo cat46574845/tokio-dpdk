@@ -92,10 +92,13 @@ fn extract_dpdk_devices_from_json(content: &str) -> Vec<String> {
     devices
 }
 
-/// Create DPDK runtime with a specific real device
+/// Create DPDK runtime with a specific real device.
+/// Uses worker_threads(1) because a single device on AWS ENA cannot support
+/// multi-queue mode (no rte_flow support).
 fn dpdk_rt_with_device(pci_address: &str) -> Runtime {
     tokio::runtime::Builder::new_dpdk()
         .dpdk_pci_addresses(&[pci_address])
+        .worker_threads(1)
         .enable_all()
         .build()
         .unwrap_or_else(|e| {
@@ -156,10 +159,7 @@ fn test_different_device_lock_available() {
     use std::os::unix::io::AsRawFd;
 
     let all_devices = get_all_dpdk_devices();
-    if all_devices.len() < 2 {
-        println!("SKIPPED: need 2+ devices");
-        return;
-    }
+    assert!(all_devices.len() >= 2, "need 2+ DPDK devices, found {}", all_devices.len());
 
     let _rt = dpdk_rt_with_device(&all_devices[0]);
 
@@ -327,21 +327,39 @@ fn test_e2e_multiple_connections() {
 }
 
 /// Test: Concurrent workers handling traffic.
+/// Uses the default runtime (all available devices) to get multiple workers.
+/// Asserts that multiple workers are available — fails if not.
 #[serial_isolation_test::serial_isolation_test]
 #[test]
 fn test_e2e_concurrent_workers_traffic() {
-    let device = get_first_dpdk_device();
-    let rt = dpdk_rt_with_device(&device);
+    use tokio::runtime::dpdk;
+
+    // Use default runtime to get multiple workers across all NICs
+    let rt = tokio::runtime::Builder::new_dpdk()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("DPDK runtime creation failed");
 
     rt.block_on(async {
+        let workers = dpdk::workers();
+        assert!(
+            workers.len() >= 2,
+            "Test requires at least 2 workers, got {}. \
+             Ensure env.json has enough DPDK devices with IPs and cores.",
+            workers.len()
+        );
+
         use std::collections::HashSet;
 
         let thread_ids = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let mut handles = Vec::new();
 
-        for _ in 0..8 {
+        // Distribute tasks across workers explicitly
+        for i in 0..8 {
             let thread_ids = thread_ids.clone();
-            handles.push(tokio::spawn(async move {
+            let worker = workers[i % workers.len()];
+            handles.push(dpdk::spawn_on(worker, async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 use tokio::net::TcpDpdkStream;
 
@@ -364,7 +382,11 @@ fn test_e2e_concurrent_workers_traffic() {
         }
 
         let ids = thread_ids.lock().unwrap();
-        assert!(!ids.is_empty(), "Tasks should have executed");
+        assert!(
+            ids.len() >= 2,
+            "Tasks should have executed on at least 2 different workers, got {} thread IDs",
+            ids.len()
+        );
     });
 }
 

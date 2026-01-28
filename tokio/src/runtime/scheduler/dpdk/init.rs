@@ -8,30 +8,9 @@
 
 use std::ffi::CString;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use std::sync::{RwLock, Weak};
 
 use super::device::DpdkDevice;
 use super::ffi;
-use super::handle::Handle;
-
-// Flag to ensure panic hook is only registered once
-static PANIC_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
-
-// Weak reference to the DPDK Handle for panic hook to trigger shutdown.
-// When a panic occurs, the hook will try to upgrade this and call close()
-// to signal all workers to stop, allowing proper resource cleanup.
-static DPDK_HANDLE: RwLock<Option<Weak<Handle>>> = RwLock::new(None);
-
-/// Register a Handle reference for panic shutdown support.
-/// This should be called after Handle is created.
-/// The panic hook will use this to trigger worker shutdown.
-pub(super) fn register_handle_for_panic(handle: &std::sync::Arc<Handle>) {
-    if let Ok(mut guard) = DPDK_HANDLE.write() {
-        *guard = Some(std::sync::Arc::downgrade(handle));
-    }
-}
 
 /// A fully initialized DPDK worker for multi-queue mode.
 ///
@@ -109,9 +88,6 @@ impl Drop for DpdkResourcesCleaner {
 /// Initialize DPDK EAL (Environment Abstraction Layer).
 ///
 /// This must be called before any other DPDK functions.
-///
-/// Registers an atexit handler to ensure rte_eal_cleanup() is called even if
-/// the process exits due to panic or other unexpected termination.
 pub(crate) fn init_eal(args: &[String]) -> io::Result<()> {
     let c_args: Vec<CString> = args
         .iter()
@@ -127,26 +103,6 @@ pub(crate) fn init_eal(args: &[String]) -> io::Result<()> {
             io::ErrorKind::Other,
             format!("rte_eal_init failed with code: {}", ret),
         ));
-    }
-
-    // Register panic hook to signal all workers to shutdown on panic.
-    // This uses the registered Handle weak reference to call close(),
-    // which sets remote.shutdown flags that workers already check.
-    if !PANIC_HOOK_REGISTERED.swap(true, Ordering::SeqCst) {
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            // Try to get the Handle and trigger shutdown
-            if let Ok(guard) = DPDK_HANDLE.read() {
-                if let Some(weak) = guard.as_ref() {
-                    if let Some(handle) = weak.upgrade() {
-                        // Call close() to set all remote.shutdown flags
-                        handle.close();
-                    }
-                }
-            }
-            // Call the previous hook (default: print panic message)
-            prev_hook(info);
-        }));
     }
 
     Ok(())
@@ -265,6 +221,15 @@ pub(crate) fn init_port(
         // Non-fatal, just log
         eprintln!(
             "Warning: Failed to enable promiscuous mode for port {}",
+            port_id
+        );
+    }
+
+    // Enable allmulticast mode (required for IPv6 NDP neighbor discovery)
+    let ret = unsafe { ffi::rte_eth_allmulticast_enable(port_id) };
+    if ret != 0 {
+        eprintln!(
+            "Warning: Failed to enable allmulticast mode for port {} (IPv6 may not work)",
             port_id
         );
     }

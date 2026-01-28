@@ -69,6 +69,7 @@ bindgen "$OUT_DIR/dpdk_wrapper.h" \
     --allowlist-function "rte_eth_rx_queue_setup" \
     --allowlist-function "rte_eth_tx_queue_setup" \
     --allowlist-function "rte_eth_promiscuous_enable" \
+    --allowlist-function "rte_eth_allmulticast_enable" \
     --allowlist-function "rte_eth_dev_socket_id" \
     --allowlist-function "rte_eth_dev_info_get" \
     --allowlist-function "rte_eth_macaddr_get" \

@@ -423,9 +423,6 @@ pub(super) fn create(
         }));
     }
 
-    // Register handle for panic shutdown support
-    super::init::register_handle_for_panic(&handle);
-
     (handle, launch)
 }
 
@@ -490,6 +487,25 @@ impl Launch {
 
 /// Worker thread entry point
 pub(crate) fn run(worker: Arc<Worker>) {
+    // Abort on worker thread panic. Worker thread panics mean the scheduler
+    // itself has a bug (task panics are already caught by the task harness).
+    // A dead worker would leave the runtime in an inconsistent state and
+    // could cause barrier deadlocks if worker 0 dies before a block_on call.
+    #[allow(dead_code)]
+    struct AbortOnPanic;
+
+    impl Drop for AbortOnPanic {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("DPDK worker thread panicking; aborting process");
+                std::process::abort();
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    let _abort_on_panic = AbortOnPanic;
+
     // Take ownership of the core
     let core = match worker.core.take() {
         Some(core) => core,
@@ -550,6 +566,52 @@ pub(crate) fn run_with_future<F: std::future::Future>(
 ) -> F::Output {
     use std::cell::UnsafeCell;
     use std::pin::Pin;
+
+    /// RAII guard ensuring worker 0 is always unblocked from resume_barrier,
+    /// even if the block_on future panics during Phase 5.
+    ///
+    /// On normal completion, Phase 6+7 run explicitly and the guard is defused.
+    /// On panic, the guard's Drop recovers the Core, signals the barrier, and
+    /// restores CPU affinity, allowing the panic to propagate to the caller.
+    struct TransferGuard<'a> {
+        worker: &'a Arc<Worker>,
+        /// RefCell holding Core inside the scheduler Context (populated during event loop)
+        core_cell: &'a RefCell<Option<Box<Core>>>,
+        /// RefCell holding Core after event loop returns normally
+        returned_core: &'a RefCell<Option<Box<Core>>>,
+        #[cfg(target_os = "linux")]
+        original_cpuset: &'a libc::cpu_set_t,
+        defused: bool,
+    }
+
+    impl Drop for TransferGuard<'_> {
+        fn drop(&mut self) {
+            if self.defused {
+                return;
+            }
+
+            // Panic path: Phase 6 was skipped due to unwinding.
+            // Recover Core from either returned_core or the Context's core cell.
+            let core = self
+                .returned_core
+                .borrow_mut()
+                .take()
+                .or_else(|| self.core_cell.borrow_mut().take());
+
+            if let Some(mut core) = core {
+                core.is_shutdown = false;
+                self.worker.handle.shared.transfer_core.set(core);
+            }
+
+            // Always signal resume_barrier so worker 0 is unblocked.
+            // If Core was not recovered, worker 0 will find transfer_core
+            // empty and exit gracefully via shutdown_core().
+            self.worker.handle.shared.remotes[0].resume_barrier.wait();
+
+            #[cfg(target_os = "linux")]
+            restore_cpu_affinity(self.original_cpuset);
+        }
+    }
 
     // ========================================================================
     // Phase 1: Save main thread's CPU affinity
@@ -631,7 +693,7 @@ pub(crate) fn run_with_future<F: std::future::Future>(
     // Track the returned core for respawn
     let returned_core: std::cell::RefCell<Option<Box<Core>>> = std::cell::RefCell::new(None);
 
-    let sched_handle = crate::runtime::scheduler::Handle::Dpdk(worker.handle.clone());
+    let _sched_handle = crate::runtime::scheduler::Handle::Dpdk(worker.handle.clone());
 
     // Create thread-local context with block_on_state
     // Note: enter_runtime is already called by Dpdk::block_on, so we only need set_scheduler
@@ -642,12 +704,25 @@ pub(crate) fn run_with_future<F: std::future::Future>(
         block_on_state: RefCell::new(Some(block_on_state)),
     });
 
+    // Extract cx_ref before set_scheduler so TransferGuard can reference cx.core
+    let cx_ref = match &cx {
+        crate::runtime::scheduler::Context::Dpdk(c) => c,
+        _ => unreachable!(),
+    };
+
+    // Create guard BEFORE entering the event loop. If Phase 5 panics,
+    // the guard's Drop will fire during unwind and handle cleanup.
+    let mut transfer_guard = TransferGuard {
+        worker: &worker,
+        core_cell: &cx_ref.core,
+        returned_core: &returned_core,
+        #[cfg(target_os = "linux")]
+        original_cpuset: &original_cpuset,
+        defused: false,
+    };
+
     crate::runtime::context::set_scheduler(&cx, || {
         CURRENT.with(|current| {
-            let cx_ref = match &cx {
-                crate::runtime::scheduler::Context::Dpdk(c) => c,
-                _ => unreachable!(),
-            };
             current.set(cx_ref as *const Context as *const ());
 
             // Run the unified event loop - it will poll block_on_state
@@ -669,9 +744,6 @@ pub(crate) fn run_with_future<F: std::future::Future>(
         });
     });
 
-    // Explicitly drop sched_handle to avoid unused variable warning
-    drop(sched_handle);
-
     // ========================================================================
     // Phase 6: Put Core back and resume worker 0
     // ========================================================================
@@ -691,6 +763,9 @@ pub(crate) fn run_with_future<F: std::future::Future>(
     // ========================================================================
     #[cfg(target_os = "linux")]
     restore_cpu_affinity(&original_cpuset);
+
+    // Phase 6+7 completed normally — defuse the guard so Drop is a no-op.
+    transfer_guard.defused = true;
 
     // ========================================================================
     // Phase 8: Return the result
@@ -783,17 +858,18 @@ impl Context {
                     }
 
                     // Take Core back from transfer_core
-                    let core = self
-                        .worker
-                        .handle
-                        .shared
-                        .transfer_core
-                        .take()
-                        .expect("main thread must put Core back");
-                    *self.core.borrow_mut() = Some(core);
-
-                    // Continue event loop
-                    continue;
+                    match self.worker.handle.shared.transfer_core.take() {
+                        Some(core) => {
+                            *self.core.borrow_mut() = Some(core);
+                            // Continue event loop
+                            continue;
+                        }
+                        None => {
+                            // Core was lost (main thread panicked and could not
+                            // recover it). Shut down this worker gracefully.
+                            return self.shutdown_core();
+                        }
+                    }
                 }
                 return self.shutdown_core();
             }
@@ -845,7 +921,12 @@ impl Context {
                         // Use real waker from Handle to ensure spawned tasks can wake
                         let waker = Handle::waker_ref(&self.worker.handle);
                         let mut cx = std::task::Context::from_waker(&waker);
-                        if (state.poll_fn)(&mut cx).is_ready() {
+                        // Wrap in coop budget so the block_on future yields
+                        // fairly with spawned tasks.
+                        let poll_result = crate::task::coop::budget(|| {
+                            (state.poll_fn)(&mut cx)
+                        });
+                        if poll_result.is_ready() {
                             state.completed = true;
                             // Signal shutdown to exit the loop
                             drop(state_opt); // Drop borrow before borrowing core
@@ -1034,10 +1115,13 @@ impl Context {
             return Err(());
         }
 
-        // Poll the task using the owned tasks assert_owner pattern
-        // Safety: we own this task on this worker
+        // Poll the task with cooperative budget so a single task cannot
+        // monopolize the worker. IO operations and sync primitives call
+        // poll_proceed() internally, which decrements this budget.
         let task = self.worker.handle.shared.owned.assert_owner(task);
-        task.run();
+        crate::task::coop::budget(|| {
+            task.run();
+        });
 
         // End poll tracking and reset LIFO
         if let Some(core) = self.core.borrow_mut().as_mut() {

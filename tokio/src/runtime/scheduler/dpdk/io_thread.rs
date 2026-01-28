@@ -130,6 +130,21 @@ impl IoThread {
         let join_handle = std::thread::Builder::new()
             .name("dpdk-io".to_string())
             .spawn(move || {
+                #[allow(dead_code)]
+                struct AbortOnPanic;
+
+                impl Drop for AbortOnPanic {
+                    fn drop(&mut self) {
+                        if std::thread::panicking() {
+                            eprintln!("DPDK I/O thread panicking; aborting process");
+                            std::process::abort();
+                        }
+                    }
+                }
+
+                #[cfg(debug_assertions)]
+                let _abort_on_panic = AbortOnPanic;
+
                 self.run();
             })
             .expect("failed to spawn I/O thread");

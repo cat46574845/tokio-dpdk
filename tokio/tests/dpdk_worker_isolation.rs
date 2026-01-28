@@ -212,6 +212,7 @@ async fn handle_client(socket: tokio::net::TcpStream, _peer: SocketAddr, conn_id
 
 fn dpdk_rt() -> Runtime {
     tokio::runtime::Builder::new_dpdk()
+        .worker_threads(1)
         .enable_all()
         .build()
         .expect("DPDK runtime creation failed")

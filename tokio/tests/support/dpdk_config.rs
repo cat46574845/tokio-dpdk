@@ -109,6 +109,14 @@ impl Device {
             .collect()
     }
 
+    /// Get the first IPv6 address (without CIDR suffix)
+    pub fn first_ipv6(&self) -> Option<String> {
+        self.addresses
+            .iter()
+            .find(|a| a.contains(':'))
+            .map(|a| a.split('/').next().unwrap_or(a).to_string())
+    }
+
     /// Get all IPv6 addresses (without CIDR suffix)
     pub fn ipv6_addresses(&self) -> Vec<String> {
         self.addresses
@@ -127,6 +135,16 @@ pub fn get_dpdk_device() -> String {
         .expect("No DPDK device found in env.json")
         .pci_address
         .clone()
+}
+
+/// Get the DPDK device with the most IP addresses (for multi-IP tests).
+/// Panics if not configured.
+pub fn get_dpdk_device_most_ips() -> &'static Device {
+    DpdkEnv::get()
+        .dpdk_devices()
+        .into_iter()
+        .max_by_key(|d| d.addresses.len())
+        .expect("No DPDK device found in env.json")
 }
 
 /// Get the primary kernel IP address for tests

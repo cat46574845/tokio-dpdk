@@ -78,8 +78,6 @@ impl TcpDpdkSocket {
     }
 
     /// Creates a new IPv6 TCP socket.
-    ///
-    /// Note: IPv6 is not yet fully supported in the DPDK implementation.
     pub fn new_v6() -> io::Result<Self> {
         Ok(Self {
             is_ipv4: false,

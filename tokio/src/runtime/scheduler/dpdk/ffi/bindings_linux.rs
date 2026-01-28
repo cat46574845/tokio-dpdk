@@ -140,13 +140,13 @@ where
         }
     }
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eal_init(
         argc: ::core::ffi::c_int,
         argv: *mut *mut ::core::ffi::c_char,
     ) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eal_cleanup() -> ::core::ffi::c_int;
 }
 pub type rte_iova_t = u64;
@@ -157,7 +157,7 @@ pub type RTE_MARKER64 = [u64; 0usize];
 pub struct rte_device {
     _unused: [u8; 0],
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_socket_id() -> ::core::ffi::c_uint;
 }
 #[repr(C)]
@@ -943,7 +943,7 @@ const _: () = {
     ["Offset of field: rte_mempool::mem_list"]
         [::core::mem::offset_of!(rte_mempool, mem_list) - 136usize];
 };
-extern "C" {
+unsafe extern "C" {
     pub fn rte_mempool_free(mp: *mut rte_mempool);
 }
 pub type rte_be16_t = u16;
@@ -1783,7 +1783,7 @@ const _: () = {
     ["Offset of field: rte_mbuf_ext_shared_info::refcnt"]
         [::core::mem::offset_of!(rte_mbuf_ext_shared_info, refcnt) - 16usize];
 };
-extern "C" {
+unsafe extern "C" {
     pub fn rte_pktmbuf_pool_create(
         name: *const ::core::ffi::c_char,
         n: ::core::ffi::c_uint,
@@ -2940,7 +2940,7 @@ const _: () = {
     ["Offset of field: rte_flow_error::message"]
         [::core::mem::offset_of!(rte_flow_error, message) - 16usize];
 };
-extern "C" {
+unsafe extern "C" {
     pub fn rte_flow_validate(
         port_id: u16,
         attr: *const rte_flow_attr,
@@ -2949,7 +2949,7 @@ extern "C" {
         error: *mut rte_flow_error,
     ) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_flow_create(
         port_id: u16,
         attr: *const rte_flow_attr,
@@ -2958,14 +2958,14 @@ extern "C" {
         error: *mut rte_flow_error,
     ) -> *mut rte_flow;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_flow_destroy(
         port_id: u16,
         flow: *mut rte_flow,
         error: *mut rte_flow_error,
     ) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_flow_flush(port_id: u16, error: *mut rte_flow_error) -> ::core::ffi::c_int;
 }
 #[repr(C)]
@@ -3496,10 +3496,10 @@ const _: () = {
     ["Offset of field: rte_eth_dev_info::reserved_ptrs"]
         [::core::mem::offset_of!(rte_eth_dev_info, reserved_ptrs) - 360usize];
 };
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eth_dev_count_avail() -> u16;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eth_dev_configure(
         port_id: u16,
         nb_rx_queue: u16,
@@ -3507,7 +3507,7 @@ extern "C" {
         eth_conf: *const rte_eth_conf,
     ) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eth_rx_queue_setup(
         port_id: u16,
         rx_queue_id: u16,
@@ -3517,7 +3517,7 @@ extern "C" {
         mb_pool: *mut rte_mempool,
     ) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eth_tx_queue_setup(
         port_id: u16,
         tx_queue_id: u16,
@@ -3526,31 +3526,34 @@ extern "C" {
         tx_conf: *const rte_eth_txconf,
     ) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eth_dev_socket_id(port_id: u16) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eth_dev_start(port_id: u16) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eth_dev_stop(port_id: u16) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eth_dev_close(port_id: u16) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eth_promiscuous_enable(port_id: u16) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
+    pub fn rte_eth_allmulticast_enable(port_id: u16) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn rte_eth_macaddr_get(port_id: u16, mac_addr: *mut rte_ether_addr) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn rte_eth_dev_info_get(
         port_id: u16,
         dev_info: *mut rte_eth_dev_info,
     ) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_eth_rx_burst(
         port_id: u16,
         queue_id: u16,
@@ -3558,7 +3561,7 @@ extern "C" {
         nb_pkts: u16,
     ) -> u16;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_eth_tx_burst(
         port_id: u16,
         queue_id: u16,
@@ -3566,31 +3569,31 @@ extern "C" {
         nb_pkts: u16,
     ) -> u16;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_pktmbuf_alloc(mp: *mut rte_mempool) -> *mut rte_mbuf;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_pktmbuf_free(m: *mut rte_mbuf);
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_pktmbuf_mtod(m: *mut rte_mbuf) -> *mut ::core::ffi::c_void;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_pktmbuf_data_len(m: *const rte_mbuf) -> u16;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_pktmbuf_pkt_len(m: *const rte_mbuf) -> u32;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_pktmbuf_append(m: *mut rte_mbuf, len: u16) -> *mut ::core::ffi::c_char;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_pktmbuf_headroom(m: *const rte_mbuf) -> u16;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_pktmbuf_tailroom(m: *const rte_mbuf) -> u16;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_flow_create_queue_rule(
         port_id: u16,
         priority: u32,
@@ -3601,7 +3604,7 @@ extern "C" {
         error: *mut rte_flow_error,
     ) -> *mut rte_flow;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_flow_validate_queue_rule(
         port_id: u16,
         priority: u32,
@@ -3612,14 +3615,14 @@ extern "C" {
         error: *mut rte_flow_error,
     ) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_flow_destroy(
         port_id: u16,
         flow: *mut rte_flow,
         error: *mut rte_flow_error,
     ) -> ::core::ffi::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_flow_flush(port_id: u16, error: *mut rte_flow_error)
         -> ::core::ffi::c_int;
 }

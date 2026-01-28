@@ -3,17 +3,25 @@
 #![cfg(feature = "full")]
 #![cfg(not(miri))]
 
+#[path = "support/dpdk_config.rs"]
+mod dpdk_config;
+
+use dpdk_config::*;
 use tokio::runtime::dpdk;
 
 #[serial_isolation_test::serial_isolation_test]
 #[test]
 fn check_multi_ip_device() {
-    // Use device 0000:28:00.0 which has many IPv6 addresses in env.json
-    let device = "0000:28:00.0";
-    println!("Using device: {}", device);
+    // Dynamically find the DPDK device with the most IP addresses
+    let device_info = get_dpdk_device_most_ips();
+    let device = &device_info.pci_address;
+    println!("Using device: {} ({} IPs)", device, device_info.addresses.len());
 
+    // Use worker_threads(1) to avoid multi-queue mode which requires rte_flow
+    // (AWS ENA does not support rte_flow). This test focuses on IP distribution info.
     let rt = tokio::runtime::Builder::new_dpdk()
-        .dpdk_pci_addresses(&[device])
+        .dpdk_pci_addresses(&[device.as_str()])
+        .worker_threads(1)
         .enable_all()
         .build()
         .expect("Failed to create DPDK runtime");
