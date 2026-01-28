@@ -156,9 +156,9 @@ rustflags = ["-C", "target-cpu=native"]
 tokio-dpdk runtime 依賴一個配置文件來獲取裝置的網路配置（IP、MAC、Gateway）。典型流程：
 
 ```
-1. 執行 setup.sh wizard    →  生成 /etc/dpdk/env.json
-2. 在代碼中建立 runtime    →  自動從 env.json 讀取裝置配置（或用 dpdk_pci_addresses() 指定）
-3. runtime 啟動            →  使用配置初始化 DPDK 和 smoltcp
+1. 執行 setup.sh wizard    →  生成 /etc/dpdk/env.json（包含 NIC、IP、MAC、核心等所有配置）
+2. 在代碼中建立 runtime    →  Builder::new_dpdk().enable_all().build()
+3. runtime 啟動            →  自動從 env.json 讀取配置，初始化 DPDK 和 smoltcp
 ```
 
 ### 配置文件
@@ -175,18 +175,18 @@ Runtime 在以下位置搜索配置文件（按順序）：
 
 **前提條件**：確保已執行 `setup.sh` 生成配置文件（`/etc/dpdk/env.json`）。
 
-**核心原則：不要在代碼中硬編碼 PCI 地址。** Runtime 會自動從 `env.json` 讀取所有裝置和網路配置（IP、MAC、Gateway、核心分配）。PCI 地址是機器特定的，硬編碼會導致代碼無法在不同機器上運行。
+Runtime 會**自動**從 `env.json` 讀取所有 NIC 裝置、IP、MAC、Gateway、核心分配。你的代碼中**不需要處理任何硬體細節** — 只需要決定要幾個 worker：
 
 ```rust
 use tokio::runtime::Builder;
 
-// ✅ 標準用法 - 自動使用 env.json 中所有 DPDK 裝置和核心
+// 使用所有可用裝置和核心
 let rt = Builder::new_dpdk()
     .enable_all()
     .build()
     .expect("DPDK runtime creation failed");
 
-// ✅ 限制 worker 數量（不指定 PCI，仍然自動選裝置）
+// 指定 worker 數量
 let rt = Builder::new_dpdk()
     .worker_threads(1)
     .enable_all()
@@ -194,29 +194,7 @@ let rt = Builder::new_dpdk()
     .expect("DPDK runtime creation failed");
 ```
 
-> **`dpdk_pci_addresses()` 何時使用？**
-> 僅在多進程場景下，需要不同進程使用不同 NIC 時才需要。即便如此，PCI 地址也應該從 `env.json` 讀取，而非硬編碼在源碼中。大多數情況下，資源鎖機制會自動處理多進程的裝置分配。
-
-```rust
-// ⚠️ 進階：多進程手動分配裝置（PCI 從配置或命令列參數取得，不要硬編碼）
-let pci = std::env::var("MY_APP_PCI_ADDR")
-    .expect("Set MY_APP_PCI_ADDR to the PCI address of the NIC to use");
-let rt = Builder::new_dpdk()
-    .dpdk_pci_addresses(&[pci.as_str()])
-    .worker_threads(1)
-    .enable_all()
-    .build()
-    .expect("DPDK runtime creation failed");
-
-// ⚠️ 進階：調整記憶體池和隊列參數
-let rt = Builder::new_dpdk()
-    .dpdk_mempool_size(16384)       // mbuf 數量（預設 8192）
-    .dpdk_cache_size(512)           // 每核心快取大小（預設 256）
-    .dpdk_queue_descriptors(256)    // RX/TX 描述符數量（預設 128）
-    .enable_all()
-    .build()
-    .expect("DPDK runtime creation failed");
-```
+**就這樣。** 不需要指定 PCI 地址、IP、MAC 或任何硬體配置。`env.json` 已經包含一切，runtime 會自動處理裝置發現和資源分配。
 
 ### 多進程資源隔離
 
@@ -226,16 +204,21 @@ let rt = Builder::new_dpdk()
 - **核心鎖定**：從 `dpdk_cores` 列表中自動選取未被鎖定的核心
 - **自動釋放**：進程崩潰時 OS 自動釋放鎖，新進程可立即接管
 
+多進程場景下也不需要手動指定 PCI 地址。資源鎖機制會讓每個進程自動搶佔未使用的裝置和核心。
+
 ### Builder 方法
 
 | 方法 | 說明 |
 |------|------|
-| `new_dpdk()` | 建立新的 DPDK runtime builder |
-| `dpdk_pci_addresses(&[&str])` | 指定裝置 PCI 位址（可選；不指定時使用 env.json 中所有 DPDK 裝置） |
-| `worker_threads(usize)` | 指定 worker 數量（支援多隊列模式，多個 worker 共用同一 NIC） |
+| `new_dpdk()` | 建立 DPDK runtime builder |
+| `worker_threads(usize)` | 指定 worker 數量（預設使用 `env.json` 中所有 `dpdk_cores`） |
+| `dpdk_eal_arg(&str)` | 添加單個 EAL 參數 |
+| `dpdk_eal_args(&[&str])` | 添加多個 EAL 參數 |
 | `dpdk_mempool_size(u32)` | 設定 DPDK 記憶體池大小（mbuf 數量，預設 8192） |
 | `dpdk_cache_size(u32)` | 設定每核心記憶體池快取大小（預設 256） |
 | `dpdk_queue_descriptors(u16)` | 設定每個隊列的 RX/TX 描述符數量（預設 128） |
+| `enable_all()` | 啟用所有功能（I/O、time） |
+| `dpdk_pci_addresses(&[&str])` | **極少使用。** 過濾到特定 PCI 裝置。省略時自動使用 env.json 中全部 DPDK 裝置 |
 | `dpdk_eal_arg(&str)` | 添加單個 EAL 參數 |
 | `dpdk_eal_args(&[&str])` | 添加多個 EAL 參數 |
 | `enable_all()` | 啟用所有功能（I/O、time 等） |
