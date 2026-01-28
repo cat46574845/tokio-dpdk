@@ -357,21 +357,22 @@ impl Dpdk {
     /// Shuts down the scheduler.
     ///
     /// ## Shutdown Flow (per user specification):
-    /// 1. Each worker cleans up all tasks on its own core (CPU affinity preserved)
-    /// 2. After worker 0 (main thread) finishes cleanup, join all other workers
-    /// 3. Main thread cleans up global (inject queue)
-    /// 4. Finalize shutdown
+    /// 1. Signal shutdown to all workers (setting scheduler is_shutdown flag)
+    /// 2. Worker 0 (main thread) drains its own queues
+    /// 3. Join all other worker threads (wait for them to exit)
+    /// 4. Shut down the I/O thread (setting time driver is_shutdown flag)
+    /// 5. Clean up global (inject queue)
+    ///
+    /// CRITICAL: The I/O thread must be shut down AFTER workers have exited.
+    /// If we shutdown the I/O thread first, it sets time::is_shutdown=true,
+    /// but workers may still be polling tasks with timers, causing panics in
+    /// TimerEntry::poll_elapsed() when it asserts !is_shutdown().
     pub(crate) fn shutdown(&mut self, _handle: &scheduler::Handle) {
-        // Step 1: Shut down the I/O thread first so it stops processing events
-        if let Some(mut io_handle) = self.io_thread_handle.take() {
-            io_handle.shutdown_and_join();
-        }
-
-        // Step 2: Signal shutdown to all workers
-        // This closes inject queue and owned tasks, setting is_shutdown flag
+        // Step 1: Signal shutdown to all workers
+        // This closes inject queue and owned tasks, setting scheduler is_shutdown flag
         self.handle.shutdown();
 
-        // Step 3: Worker 0 (main thread) drains its own queues
+        // Step 2: Worker 0 (main thread) drains its own queues
         // The main thread still has CPU affinity from block_on, so this is correct.
         if let Some(ref worker_0) = self.worker_0 {
             if let Some(mut core) = worker_0.core.take() {
@@ -391,9 +392,17 @@ impl Dpdk {
             }
         }
 
-        // Step 4: Wait for all other worker threads to complete
+        // Step 3: Wait for all other worker threads to complete
+        // This ensures no worker is polling tasks when we shutdown the time driver
         for handle in self.worker_handles.drain(..) {
             let _ = handle.join();
+        }
+
+        // Step 4: Shut down the I/O thread (sets time driver is_shutdown flag)
+        // IMPORTANT: This must happen AFTER all workers have exited (Step 3)
+        // to avoid workers polling timers while time driver is shutting down
+        if let Some(mut io_handle) = self.io_thread_handle.take() {
+            io_handle.shutdown_and_join();
         }
 
         // Step 5: Clean up global queues
