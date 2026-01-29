@@ -25,7 +25,10 @@ use super::device::DpdkDevice;
 // =============================================================================
 
 /// Default TCP RX buffer size
-const TCP_RX_BUFFER_SIZE: usize = 65536;
+/// Increased from 64KB to 512KB to reduce window-zero situations
+/// which can cause ~RTT delays when buffer fills up.
+/// Larger buffer provides more headroom for bursty traffic.
+const TCP_RX_BUFFER_SIZE: usize = 524288;
 
 /// Default TCP TX buffer size
 const TCP_TX_BUFFER_SIZE: usize = 65536;
@@ -289,7 +292,19 @@ impl DpdkDriver {
         let rx_buffer = LinearBuffer::with_reserve(rx_buf, WINDOW_RESERVE);
         let tx_buffer = LinearBuffer::with_reserve(tx_buf, WINDOW_RESERVE);
 
-        let socket: TcpSocket<'_, LinearBuffer<'_>> = TcpSocket::new(rx_buffer, tx_buffer);
+        let mut socket: TcpSocket<'_, LinearBuffer<'_>> = TcpSocket::new(rx_buffer, tx_buffer);
+
+        // Disable delayed ACK to reduce latency.
+        // By default smoltcp has ACK_DELAY_DEFAULT = 10ms, which adds latency
+        // for small packets. For low-latency trading, immediate ACKs are preferred.
+        socket.set_ack_delay(None);
+
+        // Disable Nagle's algorithm (equivalent to TCP_NODELAY).
+        // By default smoltcp enables Nagle, which delays small packets until
+        // either a full MSS is accumulated or the previous packet is ACKed.
+        // This adds significant latency for request-response patterns.
+        socket.set_nagle_enabled(false);
+
         Some(self.sockets.add(socket))
     }
 
