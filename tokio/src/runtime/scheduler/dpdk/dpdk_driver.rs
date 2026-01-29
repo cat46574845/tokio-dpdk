@@ -281,11 +281,13 @@ impl DpdkDriver {
         // Acquire pre-allocated buffers from pool
         let (rx_buf, tx_buf) = self.buffer_pool.acquire()?;
 
-        // Use LinearBuffer with compaction threshold = 16384 (max TLS record size)
-        // Compaction only triggers when buffer is full and data < threshold
-        const COMPACT_THRESHOLD: usize = 16384;
-        let rx_buffer = LinearBuffer::with_threshold(rx_buf, COMPACT_THRESHOLD);
-        let tx_buffer = LinearBuffer::with_threshold(tx_buf, COMPACT_THRESHOLD);
+        // Use LinearBuffer with on-demand compaction and virtual window.
+        // window_reserve: head space beyond this is added to advertised TCP window.
+        // Small reserve = more aggressive window advertisement (less compaction).
+        // Compaction only triggers when write would exceed capacity.
+        const WINDOW_RESERVE: usize = 4096;
+        let rx_buffer = LinearBuffer::with_reserve(rx_buf, WINDOW_RESERVE);
+        let tx_buffer = LinearBuffer::with_reserve(tx_buf, WINDOW_RESERVE);
 
         let socket: TcpSocket<'_, LinearBuffer<'_>> = TcpSocket::new(rx_buffer, tx_buffer);
         Some(self.sockets.add(socket))

@@ -192,8 +192,10 @@ impl DpdkDevice {
 
         let mut sent_count = 0usize;
         let total = self.tx_buffer.len();
+        let mut retry_count = 0;
+        const MAX_RETRIES: usize = 10;
 
-        // Try to send all buffered packets
+        // Try to send all buffered packets with retry
         while sent_count < total {
             let n = unsafe {
                 dpdk_wrappers::tx_burst(
@@ -205,16 +207,28 @@ impl DpdkDevice {
             };
 
             if n == 0 {
-                // Failed to send, free remaining mbufs
-                for mbuf in &self.tx_buffer[sent_count..] {
-                    unsafe {
-                        dpdk_wrappers::pktmbuf_free(*mbuf);
+                retry_count += 1;
+                if retry_count >= MAX_RETRIES {
+                    // Failed to send after max retries, log and free remaining mbufs
+                    eprintln!(
+                        "[DPDK TX WARNING] Failed to send {} packets after {} retries, dropping",
+                        total - sent_count,
+                        MAX_RETRIES
+                    );
+                    for mbuf in &self.tx_buffer[sent_count..] {
+                        unsafe {
+                            dpdk_wrappers::pktmbuf_free(*mbuf);
+                        }
                     }
+                    break;
                 }
-                break;
+                // Brief pause before retry (yield CPU)
+                std::hint::spin_loop();
+                continue;
             }
 
             sent_count += n as usize;
+            retry_count = 0; // Reset retry count on successful send
         }
 
         self.tx_buffer.clear();
