@@ -1193,23 +1193,52 @@ impl Context {
             #[cfg(feature = "dpdk-debug")]
             debug::record_next_task_start();
 
-            // Poll for next task with LIFO starvation prevention
-            if let Some(task) = self.next_task_with_fairness(&mut lifo_polls) {
-                // Debug: record next_task end and run_task start
-                #[cfg(feature = "dpdk-debug")]
-                {
-                    debug::record_next_task_end();
-                    debug::record_run_task_start();
+            // Execute multiple tasks per tick to reduce scheduling latency.
+            // With ~320ns per tick, executing 1 task at a time means 64 tasks
+            // would take 64 ticks = 20μs. By batching, we can reduce this.
+            // Limit: max 32 tasks or 10μs per tick to maintain DPDK responsiveness.
+            const MAX_TASKS_PER_TICK: usize = 32;
+            const MAX_TASK_TIME_NS: u64 = 10_000; // 10μs
+
+            let task_batch_start = {
+                let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
+                ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+            };
+            let mut tasks_in_batch = 0;
+
+            while tasks_in_batch < MAX_TASKS_PER_TICK {
+                if let Some(task) = self.next_task_with_fairness(&mut lifo_polls) {
+                    // Debug: record for first task only
+                    #[cfg(feature = "dpdk-debug")]
+                    if tasks_in_batch == 0 {
+                        debug::record_next_task_end();
+                        debug::record_run_task_start();
+                    }
+
+                    self.run_task(task)?;
+                    tasks_in_batch += 1;
+
+                    // Check timeout to maintain DPDK poll responsiveness
+                    let now = {
+                        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
+                        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+                    };
+                    if now - task_batch_start > MAX_TASK_TIME_NS {
+                        break;
+                    }
+                } else {
+                    break;
                 }
+            }
 
-                self.run_task(task)?;
-
-                // Debug: record run_task end
-                #[cfg(feature = "dpdk-debug")]
+            // Debug: record run_task end (for batched tasks)
+            #[cfg(feature = "dpdk-debug")]
+            if tasks_in_batch > 0 {
                 debug::record_run_task_end();
             } else {
-                // Debug: record next_task end (no task)
-                #[cfg(feature = "dpdk-debug")]
+                // No tasks executed
                 debug::record_next_task_end();
             }
 
