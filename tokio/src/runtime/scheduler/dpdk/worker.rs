@@ -149,7 +149,9 @@ pub mod debug {
 
     pub fn record_tick_end() {
         PHASE_TIMINGS.with(|t| {
-            let timings = t.get();
+            let mut timings = t.get();
+            timings.tick_end_ns = now_ns();
+            t.set(timings);
             TIMING_HISTORY.with(|h| {
                 let mut history = h.borrow_mut();
                 if history.samples.len() < history.capacity {
