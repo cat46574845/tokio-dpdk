@@ -593,6 +593,11 @@ cfg_rt! {
     pub(crate) mod metrics;
     pub use metrics::RuntimeMetrics;
 
+    // DPDK scheduler debug APIs
+    cfg_rt_multi_thread! {
+        pub use scheduler::dpdk::{current_tick, current_scheduler_stats, DpdkSchedulerStats};
+    }
+
     cfg_unstable_metrics! {
         pub use metrics::{HistogramScale, HistogramConfiguration, LogHistogram, LogHistogramBuilder, InvalidHistogramConfiguration} ;
 

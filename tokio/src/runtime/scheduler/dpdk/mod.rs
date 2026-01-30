@@ -33,6 +33,9 @@ pub(crate) use worker::Context;
 // Re-export worker context API for TcpDpdkStream
 pub(crate) use worker::{current_worker_index, with_current_driver};
 
+// Re-export debug APIs
+pub use worker::{current_tick, current_scheduler_stats, DpdkSchedulerStats};
+
 // Re-export config for builder
 pub(crate) use config::DpdkBuilder;
 

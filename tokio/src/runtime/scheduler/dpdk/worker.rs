@@ -358,7 +358,9 @@ pub(super) fn create(
         cores.push(Box::new(Core {
             tick: 0,
             lifo_slot: None,
-            lifo_enabled: !config.disable_lifo_slot,
+            // DPDK scheduler: disable LIFO by default for fair multi-connection scheduling
+            // LIFO causes unfair task scheduling when multiple wakers are woken in same poll
+            lifo_enabled: false,
             run_queue,
             is_shutdown: false,
             global_queue_interval: stats.tuned_global_queue_interval(&config),
@@ -790,6 +792,53 @@ pub(crate) fn with_current<R>(f: impl FnOnce(Option<&Context>) -> R) -> R {
     })
 }
 
+/// Get the current DPDK worker's tick count for debugging.
+///
+/// Returns `None` if not on a DPDK worker thread.
+///
+/// The tick is incremented once per iteration of the event loop.
+/// This is useful for debugging scheduling frequency and identifying
+/// scheduling issues.
+pub fn current_tick() -> Option<u32> {
+    with_current(|ctx| {
+        let ctx = ctx?;
+        let core = ctx.core.borrow();
+        core.as_ref().map(|c| c.tick)
+    })
+}
+
+/// Get DPDK scheduler debug statistics.
+///
+/// Returns `None` if not on a DPDK worker thread.
+///
+/// This includes:
+/// - `tick`: Current event loop iteration count
+/// - `lifo_enabled`: Whether LIFO slot is enabled
+/// - `local_queue_len`: Number of tasks in local run queue
+/// - `overflow_len`: Number of tasks in overflow queue
+#[derive(Debug, Clone, Copy)]
+pub struct DpdkSchedulerStats {
+    pub tick: u32,
+    pub lifo_enabled: bool,
+    pub local_queue_len: usize,
+    pub overflow_len: usize,
+}
+
+/// Get DPDK scheduler statistics for the current worker.
+pub fn current_scheduler_stats() -> Option<DpdkSchedulerStats> {
+    with_current(|ctx| {
+        let ctx = ctx?;
+        let core = ctx.core.borrow();
+        let c = core.as_ref()?;
+        Some(DpdkSchedulerStats {
+            tick: c.tick,
+            lifo_enabled: c.lifo_enabled,
+            local_queue_len: c.run_queue.len(),
+            overflow_len: c.local_overflow.len(),
+        })
+    })
+}
+
 /// Access the current worker's DpdkDriver.
 ///
 /// Returns `None` if:
@@ -1123,11 +1172,11 @@ impl Context {
             task.run();
         });
 
-        // End poll tracking and reset LIFO
+        // End poll tracking (LIFO stays disabled in DPDK scheduler)
         if let Some(core) = self.core.borrow_mut().as_mut() {
             core.stats.end_poll();
-            // Reset LIFO enabled after each task
-            core.lifo_enabled = !self.worker.handle.shared.config.disable_lifo_slot;
+            // LIFO stays disabled in DPDK for fair multi-connection scheduling
+            // core.lifo_enabled = false; // already false, no need to reset
         }
 
         // Core remains in self.core
@@ -1255,10 +1304,10 @@ impl Context {
     }
 
     /// Reset LIFO enabled state
+    /// Note: LIFO is always disabled in DPDK scheduler for fair scheduling
     pub(crate) fn reset_lifo_enabled(&self) {
-        if let Some(core) = self.core.borrow_mut().as_mut() {
-            core.lifo_enabled = !self.worker.handle.shared.config.disable_lifo_slot;
-        }
+        // In DPDK scheduler, LIFO stays disabled for fair multi-connection scheduling
+        // No-op since lifo_enabled is always false
     }
 
     /// Process pending factory closures from the local_spawn_queue.
