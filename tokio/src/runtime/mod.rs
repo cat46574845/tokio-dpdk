@@ -596,6 +596,10 @@ cfg_rt! {
     // DPDK scheduler debug APIs
     cfg_rt_multi_thread! {
         pub use scheduler::dpdk::{current_tick, current_exec_count, current_scheduler_stats, DpdkSchedulerStats};
+
+        // Detailed timing debug APIs (only with dpdk-debug feature)
+        #[cfg(feature = "dpdk-debug")]
+        pub use scheduler::dpdk::{get_timing_stats, clear_timing_history, TimingStats};
     }
 
     cfg_unstable_metrics! {

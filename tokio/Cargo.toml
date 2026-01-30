@@ -84,6 +84,8 @@ signal = [
 sync = []
 test-util = ["rt", "sync", "time"]
 time = []
+# DPDK scheduler debugging - enables detailed timing measurements
+dpdk-debug = []
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.
 io-uring = ["dep:io-uring", "libc", "mio/os-poll", "mio/os-ext", "dep:slab"]
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.

@@ -29,6 +29,201 @@ use std::task::Poll;
 use std::time::Instant;
 
 // =============================================================================
+// DPDK Debug Module (enabled with `dpdk-debug` feature)
+// =============================================================================
+
+#[cfg(feature = "dpdk-debug")]
+pub mod debug {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::cell::Cell;
+
+    /// Thread-local timing storage for event loop phases
+    thread_local! {
+        static PHASE_TIMINGS: Cell<PhaseTimings> = const { Cell::new(PhaseTimings::new()) };
+        static TIMING_HISTORY: std::cell::RefCell<TimingHistory> = std::cell::RefCell::new(TimingHistory::new());
+    }
+
+    #[derive(Clone, Copy, Default)]
+    pub struct PhaseTimings {
+        pub tick_start_ns: u64,
+        pub poll_driver_start_ns: u64,
+        pub poll_driver_end_ns: u64,
+        pub next_task_start_ns: u64,
+        pub next_task_end_ns: u64,
+        pub run_task_start_ns: u64,
+        pub run_task_end_ns: u64,
+        pub tick_end_ns: u64,
+    }
+
+    impl PhaseTimings {
+        const fn new() -> Self {
+            Self {
+                tick_start_ns: 0,
+                poll_driver_start_ns: 0,
+                poll_driver_end_ns: 0,
+                next_task_start_ns: 0,
+                next_task_end_ns: 0,
+                run_task_start_ns: 0,
+                run_task_end_ns: 0,
+                tick_end_ns: 0,
+            }
+        }
+    }
+
+    pub struct TimingHistory {
+        pub samples: Vec<PhaseTimings>,
+        pub capacity: usize,
+    }
+
+    impl TimingHistory {
+        fn new() -> Self {
+            Self {
+                samples: Vec::with_capacity(100_000),
+                capacity: 100_000,
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn now_ns() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    pub fn record_tick_start() {
+        PHASE_TIMINGS.with(|t| {
+            let mut timings = t.get();
+            timings.tick_start_ns = now_ns();
+            t.set(timings);
+        });
+    }
+
+    pub fn record_poll_driver_start() {
+        PHASE_TIMINGS.with(|t| {
+            let mut timings = t.get();
+            timings.poll_driver_start_ns = now_ns();
+            t.set(timings);
+        });
+    }
+
+    pub fn record_poll_driver_end() {
+        PHASE_TIMINGS.with(|t| {
+            let mut timings = t.get();
+            timings.poll_driver_end_ns = now_ns();
+            t.set(timings);
+        });
+    }
+
+    pub fn record_next_task_start() {
+        PHASE_TIMINGS.with(|t| {
+            let mut timings = t.get();
+            timings.next_task_start_ns = now_ns();
+            t.set(timings);
+        });
+    }
+
+    pub fn record_next_task_end() {
+        PHASE_TIMINGS.with(|t| {
+            let mut timings = t.get();
+            timings.next_task_end_ns = now_ns();
+            t.set(timings);
+        });
+    }
+
+    pub fn record_run_task_start() {
+        PHASE_TIMINGS.with(|t| {
+            let mut timings = t.get();
+            timings.run_task_start_ns = now_ns();
+            t.set(timings);
+        });
+    }
+
+    pub fn record_run_task_end() {
+        PHASE_TIMINGS.with(|t| {
+            let mut timings = t.get();
+            timings.run_task_end_ns = now_ns();
+            t.set(timings);
+        });
+    }
+
+    pub fn record_tick_end() {
+        PHASE_TIMINGS.with(|t| {
+            let timings = t.get();
+            TIMING_HISTORY.with(|h| {
+                let mut history = h.borrow_mut();
+                if history.samples.len() < history.capacity {
+                    history.samples.push(timings);
+                }
+            });
+        });
+    }
+
+    /// Get timing statistics for the event loop phases
+    pub fn get_timing_stats() -> Option<TimingStats> {
+        TIMING_HISTORY.with(|h| {
+            let history = h.borrow();
+            if history.samples.is_empty() {
+                return None;
+            }
+
+            let mut poll_driver_durations: Vec<u64> = history.samples.iter()
+                .map(|t| t.poll_driver_end_ns.saturating_sub(t.poll_driver_start_ns))
+                .collect();
+            let mut run_task_durations: Vec<u64> = history.samples.iter()
+                .filter(|t| t.run_task_end_ns > 0)
+                .map(|t| t.run_task_end_ns.saturating_sub(t.run_task_start_ns))
+                .collect();
+            let mut tick_durations: Vec<u64> = history.samples.iter()
+                .map(|t| t.tick_end_ns.saturating_sub(t.tick_start_ns))
+                .collect();
+
+            poll_driver_durations.sort();
+            run_task_durations.sort();
+            tick_durations.sort();
+
+            Some(TimingStats {
+                sample_count: history.samples.len(),
+                poll_driver_p50_ns: percentile(&poll_driver_durations, 0.50),
+                poll_driver_p99_ns: percentile(&poll_driver_durations, 0.99),
+                run_task_p50_ns: percentile(&run_task_durations, 0.50),
+                run_task_p99_ns: percentile(&run_task_durations, 0.99),
+                tick_p50_ns: percentile(&tick_durations, 0.50),
+                tick_p99_ns: percentile(&tick_durations, 0.99),
+                run_task_count: run_task_durations.len(),
+            })
+        })
+    }
+
+    fn percentile(sorted: &[u64], p: f64) -> u64 {
+        if sorted.is_empty() { return 0; }
+        let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct TimingStats {
+        pub sample_count: usize,
+        pub poll_driver_p50_ns: u64,
+        pub poll_driver_p99_ns: u64,
+        pub run_task_p50_ns: u64,
+        pub run_task_p99_ns: u64,
+        pub tick_p50_ns: u64,
+        pub tick_p99_ns: u64,
+        pub run_task_count: usize,
+    }
+
+    pub fn clear_timing_history() {
+        TIMING_HISTORY.with(|h| {
+            h.borrow_mut().samples.clear();
+        });
+    }
+}
+
+#[cfg(feature = "dpdk-debug")]
+pub use debug::{get_timing_stats, clear_timing_history, TimingStats};
+
+// =============================================================================
 // CPU Affinity Helpers
 // =============================================================================
 
@@ -966,11 +1161,23 @@ impl Context {
                 return self.shutdown_core();
             }
 
+            // Debug: record tick start
+            #[cfg(feature = "dpdk-debug")]
+            debug::record_tick_start();
+
             // Increment tick
             self.tick();
 
+            // Debug: record poll_dpdk_driver start
+            #[cfg(feature = "dpdk-debug")]
+            debug::record_poll_driver_start();
+
             // Poll DPDK network stack (receive packets, process TCP/IP, wake socket tasks)
             self.poll_dpdk_driver();
+
+            // Debug: record poll_dpdk_driver end
+            #[cfg(feature = "dpdk-debug")]
+            debug::record_poll_driver_end();
 
             // Process any pending factory closures from spawn_local_on
             self.process_local_spawn_queue();
@@ -980,9 +1187,28 @@ impl Context {
                 core.stats.start_processing_scheduled_tasks();
             }
 
+            // Debug: record next_task start
+            #[cfg(feature = "dpdk-debug")]
+            debug::record_next_task_start();
+
             // Poll for next task with LIFO starvation prevention
             if let Some(task) = self.next_task_with_fairness(&mut lifo_polls) {
+                // Debug: record next_task end and run_task start
+                #[cfg(feature = "dpdk-debug")]
+                {
+                    debug::record_next_task_end();
+                    debug::record_run_task_start();
+                }
+
                 self.run_task(task)?;
+
+                // Debug: record run_task end
+                #[cfg(feature = "dpdk-debug")]
+                debug::record_run_task_end();
+            } else {
+                // Debug: record next_task end (no task)
+                #[cfg(feature = "dpdk-debug")]
+                debug::record_next_task_end();
             }
 
             // End tracking scheduled task processing
@@ -1019,6 +1245,10 @@ impl Context {
 
             // Maintenance every event_interval ticks (includes defer.wake())
             self.maybe_maintenance();
+
+            // Debug: record tick end
+            #[cfg(feature = "dpdk-debug")]
+            debug::record_tick_end();
         }
     }
 

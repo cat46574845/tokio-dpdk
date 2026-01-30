@@ -36,6 +36,10 @@ pub(crate) use worker::{current_worker_index, with_current_driver};
 // Re-export debug APIs
 pub use worker::{current_tick, current_exec_count, current_scheduler_stats, DpdkSchedulerStats};
 
+// Re-export detailed timing debug APIs (only with dpdk-debug feature)
+#[cfg(feature = "dpdk-debug")]
+pub use worker::{get_timing_stats, clear_timing_history, TimingStats};
+
 // Re-export config for builder
 pub(crate) use config::DpdkBuilder;
 
