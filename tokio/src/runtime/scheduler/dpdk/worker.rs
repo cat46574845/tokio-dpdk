@@ -149,7 +149,13 @@ pub(crate) struct Worker {
 /// Core data - each worker owns one
 pub(crate) struct Core {
     /// Used to schedule bookkeeping tasks every so often.
+    /// Incremented on every event loop iteration (including idle).
     pub(crate) tick: u32,
+
+    /// Counter for actual task executions.
+    /// Only incremented when a task is actually polled/executed.
+    /// Useful for distinguishing real work from idle polling.
+    pub(crate) exec_count: u64,
 
     /// LIFO optimization slot - last scheduled task runs first.
     pub(crate) lifo_slot: Option<Notified>,
@@ -357,6 +363,7 @@ pub(super) fn create(
 
         cores.push(Box::new(Core {
             tick: 0,
+            exec_count: 0,
             lifo_slot: None,
             // DPDK scheduler: disable LIFO by default for fair multi-connection scheduling
             // LIFO causes unfair task scheduling when multiple wakers are woken in same poll
@@ -807,20 +814,42 @@ pub fn current_tick() -> Option<u32> {
     })
 }
 
+/// Get the current DPDK worker's execution count for debugging.
+///
+/// Returns `None` if not on a DPDK worker thread.
+///
+/// Unlike `tick` which increments on every event loop iteration (including idle),
+/// `exec_count` only increments when a task is actually executed.
+/// This is useful for measuring actual work vs idle polling.
+pub fn current_exec_count() -> Option<u64> {
+    with_current(|ctx| {
+        let ctx = ctx?;
+        let core = ctx.core.borrow();
+        core.as_ref().map(|c| c.exec_count)
+    })
+}
+
 /// Get DPDK scheduler debug statistics.
 ///
 /// Returns `None` if not on a DPDK worker thread.
 ///
 /// This includes:
-/// - `tick`: Current event loop iteration count
+/// - `tick`: Current event loop iteration count (includes idle)
+/// - `exec_count`: Actual task execution count (only incremented on task run)
 /// - `lifo_enabled`: Whether LIFO slot is enabled
 /// - `local_queue_len`: Number of tasks in local run queue
 /// - `overflow_len`: Number of tasks in overflow queue
 #[derive(Debug, Clone, Copy)]
 pub struct DpdkSchedulerStats {
+    /// Event loop iteration count (increments on every loop, including idle)
     pub tick: u32,
+    /// Actual task execution count (only increments when a task is polled)
+    pub exec_count: u64,
+    /// Whether LIFO slot optimization is enabled
     pub lifo_enabled: bool,
+    /// Number of tasks in local run queue
     pub local_queue_len: usize,
+    /// Number of tasks in overflow queue
     pub overflow_len: usize,
 }
 
@@ -832,6 +861,7 @@ pub fn current_scheduler_stats() -> Option<DpdkSchedulerStats> {
         let c = core.as_ref()?;
         Some(DpdkSchedulerStats {
             tick: c.tick,
+            exec_count: c.exec_count,
             lifo_enabled: c.lifo_enabled,
             local_queue_len: c.run_queue.len(),
             overflow_len: c.local_overflow.len(),
@@ -1156,9 +1186,11 @@ impl Context {
     }
 
     fn run_task(&self, task: Notified) -> Result<(), ()> {
-        // Start poll tracking
+        // Start poll tracking and increment execution counter
         if let Some(core) = self.core.borrow_mut().as_mut() {
             core.stats.start_poll();
+            // Increment exec_count - only counts actual task executions
+            core.exec_count = core.exec_count.wrapping_add(1);
         } else {
             // No core available - should not happen
             return Err(());
