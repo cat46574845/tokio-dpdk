@@ -943,6 +943,267 @@ cmd_verify() {
 # Refresh Configuration (IP changes)
 # =============================================================================
 
+# =============================================================================
+# Uninstall DPDK Environment
+# =============================================================================
+
+cmd_uninstall() {
+    check_root
+    log_section "DPDK Environment Uninstall"
+
+    echo "This will remove the DPDK low-latency environment configuration."
+    echo ""
+    echo "Components that can be removed:"
+    echo "  1. Unbind NICs from DPDK (restore to kernel driver)"
+    echo "  2. Remove systemd service (dpdk-low-latency.service)"
+    echo "  3. Remove GRUB parameters (isolcpus, nohz_full, etc.)"
+    echo "  4. Remove sysctl configuration"
+    echo "  5. Remove configuration files (/etc/dpdk/)"
+    echo "  6. Uninstall DPDK itself (optional)"
+    echo ""
+
+    local confirm=$(read_yn "Proceed with uninstall?" "N")
+    if [[ "$confirm" != "yes" ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+    echo ""
+
+    # Step 1: Unbind NICs from DPDK
+    log_section "Step 1: Unbinding NICs from DPDK"
+    cmd_dpdk_unbind_internal
+
+    # Step 2: Remove systemd service
+    log_section "Step 2: Removing systemd service"
+    if [[ -f "$SERVICE_FILE" ]]; then
+        log_info "Stopping and disabling dpdk-low-latency service..."
+        systemctl stop dpdk-low-latency.service 2>/dev/null || true
+        systemctl disable dpdk-low-latency.service 2>/dev/null || true
+        rm -f "$SERVICE_FILE"
+        systemctl daemon-reload
+        log_success "Removed $SERVICE_FILE"
+    else
+        log_info "Service file not found, skipping"
+    fi
+
+    # Step 3: Remove GRUB parameters
+    log_section "Step 3: Removing GRUB parameters"
+    if [[ -f "$GRUB_CONF" ]]; then
+        log_info "Removing low-latency parameters from GRUB..."
+
+        # Read current GRUB_CMDLINE_LINUX
+        local current=$(grep "^GRUB_CMDLINE_LINUX=" "$GRUB_CONF" | cut -d'"' -f2)
+
+        # Remove low-latency params
+        local cleaned=$(echo "$current" | sed -E 's/isolcpus=[^ ]*//g; s/nohz_full=[^ ]*//g; s/rcu_nocbs=[^ ]*//g; s/rcu_nocb_poll//g; s/irqaffinity=[^ ]*//g')
+        cleaned=$(echo "$cleaned" | sed -E 's/default_hugepagesz=[^ ]*//g; s/hugepagesz=[^ ]*//g; s/hugepages=[^ ]*//g')
+        cleaned=$(echo "$cleaned" | tr -s ' ' | sed 's/^ *//; s/ *$//')
+
+        # Update GRUB
+        sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"$cleaned\"|" "$GRUB_CONF"
+
+        # Regenerate GRUB
+        if command -v update-grub &>/dev/null; then
+            update-grub 2>/dev/null
+        elif command -v grub2-mkconfig &>/dev/null; then
+            grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null
+        fi
+
+        log_success "GRUB parameters removed"
+        log_warning "Reboot required for GRUB changes to take effect"
+    else
+        log_info "GRUB config not found, skipping"
+    fi
+
+    # Step 4: Remove sysctl configuration
+    log_section "Step 4: Removing sysctl configuration"
+    if [[ -f "$SYSCTL_CONF" ]]; then
+        rm -f "$SYSCTL_CONF"
+        sysctl --system >/dev/null 2>&1 || true
+        log_success "Removed $SYSCTL_CONF"
+    else
+        log_info "Sysctl config not found, skipping"
+    fi
+
+    # Step 5: Remove configuration files
+    log_section "Step 5: Removing configuration files"
+    local remove_config=$(read_yn "Remove /etc/dpdk/ configuration directory?" "Y")
+    if [[ "$remove_config" == "yes" ]]; then
+        if [[ -d "$CONFIG_DIR" ]]; then
+            rm -rf "$CONFIG_DIR"
+            log_success "Removed $CONFIG_DIR"
+        else
+            log_info "Config directory not found, skipping"
+        fi
+    else
+        log_info "Keeping configuration files"
+    fi
+
+    # Step 6: Uninstall DPDK (optional)
+    log_section "Step 6: DPDK Uninstall (Optional)"
+    local uninstall_dpdk=$(read_yn "Uninstall DPDK itself?" "N")
+    if [[ "$uninstall_dpdk" == "yes" ]]; then
+        cmd_dpdk_uninstall_internal
+    else
+        log_info "Keeping DPDK installation"
+    fi
+
+    # Step 7: Re-enable irqbalance
+    log_section "Step 7: Restoring system services"
+    log_info "Re-enabling irqbalance..."
+    systemctl enable irqbalance 2>/dev/null || true
+    systemctl start irqbalance 2>/dev/null || true
+    log_success "irqbalance re-enabled"
+
+    log_section "Uninstall Complete"
+    echo "DPDK low-latency environment has been removed."
+    echo ""
+    if [[ -f "$GRUB_CONF" ]]; then
+        echo -e "${YELLOW}IMPORTANT: Reboot required for GRUB changes to take effect.${NC}"
+        local reboot_now=$(read_yn "Reboot now?" "N")
+        if [[ "$reboot_now" == "yes" ]]; then
+            echo "Rebooting in 5 seconds..."
+            sleep 5
+            reboot
+        fi
+    fi
+}
+
+# Internal function to unbind NICs from DPDK
+cmd_dpdk_unbind_internal() {
+    # Find dpdk-devbind.py
+    local dpdk_devbind=""
+    if command -v dpdk-devbind.py &>/dev/null; then
+        dpdk_devbind="dpdk-devbind.py"
+    elif [[ -x "$DPDK_PREFIX/bin/dpdk-devbind.py" ]]; then
+        dpdk_devbind="$DPDK_PREFIX/bin/dpdk-devbind.py"
+    fi
+
+    if [[ -z "$dpdk_devbind" ]]; then
+        log_warning "dpdk-devbind.py not found, cannot unbind NICs"
+        return 0
+    fi
+
+    # Find NICs bound to DPDK
+    log_info "Looking for DPDK-bound devices..."
+    local dpdk_devices=()
+    local in_dpdk_section=false
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Network\ devices\ using\ DPDK-compatible\ driver ]]; then
+            in_dpdk_section=true
+            continue
+        elif [[ "$line" =~ ^Network\ devices\ using\ kernel\ driver ]] || \
+             [[ "$line" =~ ^Other\ Network\ devices ]] || \
+             [[ "$line" =~ ^Crypto\ devices ]] || \
+             [[ "$line" =~ ^[A-Z] ]]; then
+            in_dpdk_section=false
+            continue
+        fi
+
+        if [[ "$in_dpdk_section" == "true" ]] && [[ "$line" =~ ^[0-9a-fA-F]{4}: ]]; then
+            local pci=$(echo "$line" | awk '{print $1}')
+            dpdk_devices+=("$pci")
+        fi
+    done < <($dpdk_devbind --status 2>/dev/null)
+
+    if [[ ${#dpdk_devices[@]} -eq 0 ]]; then
+        log_info "No devices currently bound to DPDK"
+        return 0
+    fi
+
+    echo "Found ${#dpdk_devices[@]} device(s) bound to DPDK:"
+    for pci in "${dpdk_devices[@]}"; do
+        echo "  - $pci"
+    done
+    echo ""
+
+    local unbind=$(read_yn "Unbind these devices and restore to kernel driver?" "Y")
+    if [[ "$unbind" != "yes" ]]; then
+        log_info "Keeping devices bound to DPDK"
+        return 0
+    fi
+
+    # Determine appropriate kernel driver
+    # For most Intel NICs, it's either ixgbe, i40e, or ice
+    # For AWS ENA, it's ena
+    local kernel_driver="ena"  # Default for AWS
+
+    # Try to detect the appropriate driver
+    if [[ -f "$LL_CONFIG_FILE" ]]; then
+        source "$LL_CONFIG_FILE"
+    fi
+
+    for pci in "${dpdk_devices[@]}"; do
+        log_info "Unbinding $pci from DPDK..."
+
+        # Try common kernel drivers in order
+        local success=false
+        for driver in ena ixgbe i40e ice e1000e igb; do
+            if $dpdk_devbind --bind="$driver" "$pci" 2>/dev/null; then
+                log_success "  $pci bound to $driver"
+                success=true
+                break
+            fi
+        done
+
+        if [[ "$success" != "true" ]]; then
+            log_warning "  Could not find suitable kernel driver for $pci"
+            log_info "  You may need to manually bind it using: dpdk-devbind.py --bind=<driver> $pci"
+        fi
+    done
+}
+
+# Internal function to uninstall DPDK
+cmd_dpdk_uninstall_internal() {
+    log_info "Checking DPDK installation..."
+
+    if ! pkg-config --exists libdpdk 2>/dev/null; then
+        log_info "DPDK not found via pkg-config"
+        return 0
+    fi
+
+    local dpdk_prefix=$(pkg-config --variable=prefix libdpdk 2>/dev/null)
+    local dpdk_version=$(pkg-config --modversion libdpdk 2>/dev/null)
+
+    echo "Found DPDK $dpdk_version installed at $dpdk_prefix"
+    echo ""
+
+    local confirm=$(read_yn "Remove DPDK installation from $dpdk_prefix?" "N")
+    if [[ "$confirm" != "yes" ]]; then
+        log_info "Keeping DPDK installation"
+        return 0
+    fi
+
+    log_info "Removing DPDK..."
+
+    # Remove libraries
+    rm -rf "$dpdk_prefix/lib/librte_"* 2>/dev/null || true
+    rm -rf "$dpdk_prefix/lib/x86_64-linux-gnu/librte_"* 2>/dev/null || true
+    rm -rf "$dpdk_prefix/lib/x86_64-linux-gnu/pkgconfig/libdpdk"* 2>/dev/null || true
+    rm -rf "$dpdk_prefix/lib/pkgconfig/libdpdk"* 2>/dev/null || true
+
+    # Remove headers
+    rm -rf "$dpdk_prefix/include/rte_"* 2>/dev/null || true
+    rm -rf "$dpdk_prefix/include/generic/" 2>/dev/null || true
+
+    # Remove binaries
+    rm -f "$dpdk_prefix/bin/dpdk-"* 2>/dev/null || true
+
+    # Remove share files
+    rm -rf "$dpdk_prefix/share/dpdk" 2>/dev/null || true
+
+    # Update library cache
+    ldconfig 2>/dev/null || true
+
+    # Verify removal
+    if pkg-config --exists libdpdk 2>/dev/null; then
+        log_warning "DPDK may not be completely removed. Some files may remain."
+    else
+        log_success "DPDK uninstalled"
+    fi
+}
+
 cmd_refresh_config() {
     check_root
     log_section "Refreshing DPDK Environment Configuration"
@@ -1027,6 +1288,10 @@ show_help() {
     echo -e "${BOLD}${BLUE}${ICON_STATUS} Status${NC}"
     echo -e "  ${GREEN}verify${NC}         ${GRAY}─${NC} Verify current setup"
     echo ""
+
+    echo -e "${BOLD}${BLUE}${ICON_FAIL} Removal${NC}"
+    echo -e "  ${GREEN}uninstall${NC}      ${GRAY}─${NC} Remove DPDK environment configuration"
+    echo ""
     
     echo -e "${BOLD}${WHITE}Environment Variables:${NC}"
     echo -e "  ${YELLOW}DPDK_VERSION${NC}   ${GRAY}─${NC} DPDK version to install ${DIM}(default: ${DPDK_VERSION})${NC}"
@@ -1052,6 +1317,7 @@ case "${1:-}" in
     dpdk-bind)      cmd_dpdk_bind ;;
     refresh-config) cmd_refresh_config ;;
     verify)         cmd_verify ;;
+    uninstall)      cmd_uninstall ;;
     -h|--help|help|"") show_help ;;
     *)              show_help; exit 1 ;;
 esac
