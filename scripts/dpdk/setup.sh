@@ -32,7 +32,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="/etc/dpdk"
 CONFIG_FILE="$CONFIG_DIR/env.json"
 LL_CONFIG_FILE="$CONFIG_DIR/low-latency.conf"
-GRUB_CONF="/etc/default/grub"
 SYSCTL_CONF="/etc/sysctl.d/99-dpdk-low-latency.conf"
 SERVICE_FILE="/etc/systemd/system/dpdk-low-latency.service"
 
@@ -87,6 +86,38 @@ check_root() {
         exit 1
     fi
 }
+
+# =============================================================================
+# OS Detection + Platform Loading
+# =============================================================================
+
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        local id=$(. /etc/os-release && echo "$ID")
+        case "$id" in
+            ubuntu|debian) echo "ubuntu" ;;
+            amzn|fedora|rhel|centos) echo "amazon-linux" ;;
+            *) log_error "Unsupported OS: $id"; exit 1 ;;
+        esac
+    else
+        log_error "/etc/os-release not found"; exit 1
+    fi
+}
+
+load_os_platform() {
+    local os_type=$(detect_os)
+    local platform_file="$SCRIPT_DIR/platforms/os-${os_type}.sh"
+    if [[ ! -f "$platform_file" ]]; then
+        log_error "Platform file not found: $platform_file"
+        exit 1
+    fi
+    source "$platform_file"
+    os_setup_paths
+    log_info "Loaded platform: $os_type"
+}
+
+# Load platform on startup
+load_os_platform
 
 # =============================================================================
 # Hardware Detection
@@ -566,41 +597,12 @@ cmd_persist() {
     fi
     source "$LL_CONFIG_FILE"
     
-    # 1. Update GRUB
-    log_info "Updating GRUB configuration..."
-    if [[ -f "$GRUB_CONF" ]]; then
-        # Build new parameters
-        local new_params="isolcpus=$ISOLCPUS nohz_full=$ISOLCPUS rcu_nocbs=$ISOLCPUS rcu_nocb_poll irqaffinity=$IRQAFFINITY"
-        new_params="$new_params default_hugepagesz=2M hugepagesz=2M hugepages=$HUGEPAGES"
-        new_params="$new_params intel_idle.max_cstate=1 processor.max_cstate=1 mitigations=off"
-        
-        # Read current GRUB_CMDLINE_LINUX
-        local current=$(grep "^GRUB_CMDLINE_LINUX=" "$GRUB_CONF" | cut -d'"' -f2)
-        
-        # Remove old low-latency params
-        current=$(echo "$current" | sed -E 's/isolcpus=[^ ]*//g; s/nohz_full=[^ ]*//g; s/rcu_nocbs=[^ ]*//g; s/rcu_nocb_poll//g; s/irqaffinity=[^ ]*//g')
-        current=$(echo "$current" | sed -E 's/default_hugepagesz=[^ ]*//g; s/hugepagesz=[^ ]*//g; s/hugepages=[^ ]*//g')
-        current=$(echo "$current" | sed -E 's/intel_idle\.max_cstate=[^ ]*//g; s/processor\.max_cstate=[^ ]*//g; s/mitigations=[^ ]*//g; s/idle=poll//g')
-        current=$(echo "$current" | tr -s ' ')
-        
-        # Combine
-        local final="$current $new_params"
-        final=$(echo "$final" | sed 's/^ *//; s/ *$//')
-        
-        # Update GRUB
-        sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"$final\"|" "$GRUB_CONF"
-        
-        # Regenerate GRUB
-        if command -v update-grub &>/dev/null; then
-            update-grub 2>/dev/null
-        elif command -v grub2-mkconfig &>/dev/null; then
-            grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null
-        fi
-        
-        log_success "GRUB updated"
-    else
-        log_warning "GRUB config not found: $GRUB_CONF"
-    fi
+    # 1. Update boot parameters
+    log_info "Updating boot parameters..."
+    local new_params="isolcpus=$ISOLCPUS nohz_full=$ISOLCPUS rcu_nocbs=$ISOLCPUS rcu_nocb_poll irqaffinity=$IRQAFFINITY"
+    new_params="$new_params default_hugepagesz=2M hugepagesz=2M hugepages=$HUGEPAGES"
+    new_params="$new_params intel_idle.max_cstate=1 processor.max_cstate=1 mitigations=off"
+    os_persist_boot_params "$new_params"
     
     # 2. Create sysctl config
     log_info "Creating sysctl configuration..."
@@ -656,10 +658,7 @@ cmd_dpdk_install() {
     
     # Step 1: Install dependencies
     log_info "[1/5] Installing build dependencies..."
-    apt-get update -qq
-    local deps="build-essential meson ninja-build python3-pyelftools libnuma-dev pkg-config python3-pip wget curl"
-    echo "  Packages: $deps"
-    apt-get install -y -qq $deps >/dev/null 2>&1
+    os_install_deps
     log_success "Dependencies installed"
     
     # Check if already installed
@@ -687,7 +686,8 @@ cmd_dpdk_install() {
     cd "dpdk-${DPDK_VERSION}"
     echo "  Source directory: $(pwd)"
     echo "  Install prefix: $DPDK_PREFIX"
-    meson setup build --prefix="$DPDK_PREFIX" -Ddefault_library=shared 2>&1 | tail -5
+    local extra_args=$(os_meson_extra_args)
+    meson setup build --prefix="$DPDK_PREFIX" -Ddefault_library=shared $extra_args 2>&1 | tail -5
     log_success "Configuration complete"
     
     # Step 4: Build
@@ -701,6 +701,7 @@ cmd_dpdk_install() {
     # Step 5: Install
     log_info "[5/5] Installing to $DPDK_PREFIX..."
     ninja -C build install >/dev/null 2>&1
+    os_setup_paths
     ldconfig
     echo "  Libraries: $(pkg-config --libs-only-L libdpdk 2>/dev/null || echo 'N/A')"
     echo "  Headers: $(pkg-config --variable=includedir libdpdk 2>/dev/null || echo 'N/A')"
@@ -998,35 +999,11 @@ cmd_uninstall() {
         log_info "Service file not found, skipping"
     fi
 
-    # Step 3: Remove GRUB parameters
-    log_section "Step 3: Removing GRUB parameters"
-    if [[ -f "$GRUB_CONF" ]]; then
-        log_info "Removing low-latency parameters from GRUB..."
-
-        # Read current GRUB_CMDLINE_LINUX
-        local current=$(grep "^GRUB_CMDLINE_LINUX=" "$GRUB_CONF" | cut -d'"' -f2)
-
-        # Remove low-latency params
-        local cleaned=$(echo "$current" | sed -E 's/isolcpus=[^ ]*//g; s/nohz_full=[^ ]*//g; s/rcu_nocbs=[^ ]*//g; s/rcu_nocb_poll//g; s/irqaffinity=[^ ]*//g')
-        cleaned=$(echo "$cleaned" | sed -E 's/default_hugepagesz=[^ ]*//g; s/hugepagesz=[^ ]*//g; s/hugepages=[^ ]*//g')
-        cleaned=$(echo "$cleaned" | sed -E 's/intel_idle\.max_cstate=[^ ]*//g; s/processor\.max_cstate=[^ ]*//g; s/mitigations=[^ ]*//g; s/idle=poll//g')
-        cleaned=$(echo "$cleaned" | tr -s ' ' | sed 's/^ *//; s/ *$//')
-
-        # Update GRUB
-        sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"$cleaned\"|" "$GRUB_CONF"
-
-        # Regenerate GRUB
-        if command -v update-grub &>/dev/null; then
-            update-grub 2>/dev/null
-        elif command -v grub2-mkconfig &>/dev/null; then
-            grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null
-        fi
-
-        log_success "GRUB parameters removed"
-        log_warning "Reboot required for GRUB changes to take effect"
-    else
-        log_info "GRUB config not found, skipping"
-    fi
+    # Step 3: Remove boot parameters
+    log_section "Step 3: Removing boot parameters"
+    log_info "Removing low-latency parameters..."
+    os_persist_boot_params ""
+    log_warning "Reboot required for boot parameter changes to take effect"
 
     # Step 4: Remove sysctl configuration
     log_section "Step 4: Removing sysctl configuration"
@@ -1071,14 +1048,12 @@ cmd_uninstall() {
     log_section "Uninstall Complete"
     echo "DPDK low-latency environment has been removed."
     echo ""
-    if [[ -f "$GRUB_CONF" ]]; then
-        echo -e "${YELLOW}IMPORTANT: Reboot required for GRUB changes to take effect.${NC}"
-        local reboot_now=$(read_yn "Reboot now?" "N")
-        if [[ "$reboot_now" == "yes" ]]; then
-            echo "Rebooting in 5 seconds..."
-            sleep 5
-            reboot
-        fi
+    echo -e "${YELLOW}IMPORTANT: Reboot required for boot parameter changes to take effect.${NC}"
+    local reboot_now=$(read_yn "Reboot now?" "N")
+    if [[ "$reboot_now" == "yes" ]]; then
+        echo "Rebooting in 5 seconds..."
+        sleep 5
+        reboot
     fi
 }
 
