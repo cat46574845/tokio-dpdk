@@ -514,8 +514,18 @@ cmd_apply() {
     else
         log_warning "cpupower not available, skipping"
     fi
-    
-    # 6. Bind IRQs for KERNEL NICs to system cores
+
+    # 6. Disable ENA interrupt moderation on kernel NICs (reduce rx latency)
+    log_info "Disabling ENA interrupt moderation on kernel NICs..."
+    for nic in $KERNEL_NICS; do
+        if [[ -d "/sys/class/net/$nic" ]]; then
+            ethtool -C "$nic" adaptive-rx off rx-usecs 0 tx-usecs 0 2>/dev/null && \
+                log_success "  $nic: adaptive-rx off, rx-usecs 0, tx-usecs 0" || \
+                log_warning "  $nic: ethtool -C not supported"
+        fi
+    done
+
+    # 7. Bind IRQs for KERNEL NICs to system cores
     log_info "Binding kernel NIC IRQs to system cores..."
     local system_cpus_list="${SYSTEM_CPUS// /,}"
     for nic in $KERNEL_NICS; do
@@ -528,7 +538,7 @@ cmd_apply() {
         fi
     done
     
-    # 7. Bind ALL other device IRQs to system cores
+    # 8. Bind ALL other device IRQs to system cores
     log_info "Binding other device IRQs to system cores..."
     for irq_dir in /proc/irq/*/; do
         irq=$(basename "$irq_dir")
@@ -562,6 +572,7 @@ cmd_persist() {
         # Build new parameters
         local new_params="isolcpus=$ISOLCPUS nohz_full=$ISOLCPUS rcu_nocbs=$ISOLCPUS rcu_nocb_poll irqaffinity=$IRQAFFINITY"
         new_params="$new_params default_hugepagesz=2M hugepagesz=2M hugepages=$HUGEPAGES"
+        new_params="$new_params intel_idle.max_cstate=1 processor.max_cstate=1 mitigations=off"
         
         # Read current GRUB_CMDLINE_LINUX
         local current=$(grep "^GRUB_CMDLINE_LINUX=" "$GRUB_CONF" | cut -d'"' -f2)
@@ -569,6 +580,7 @@ cmd_persist() {
         # Remove old low-latency params
         current=$(echo "$current" | sed -E 's/isolcpus=[^ ]*//g; s/nohz_full=[^ ]*//g; s/rcu_nocbs=[^ ]*//g; s/rcu_nocb_poll//g; s/irqaffinity=[^ ]*//g')
         current=$(echo "$current" | sed -E 's/default_hugepagesz=[^ ]*//g; s/hugepagesz=[^ ]*//g; s/hugepages=[^ ]*//g')
+        current=$(echo "$current" | sed -E 's/intel_idle\.max_cstate=[^ ]*//g; s/processor\.max_cstate=[^ ]*//g; s/mitigations=[^ ]*//g; s/idle=poll//g')
         current=$(echo "$current" | tr -s ' ')
         
         # Combine
@@ -997,6 +1009,7 @@ cmd_uninstall() {
         # Remove low-latency params
         local cleaned=$(echo "$current" | sed -E 's/isolcpus=[^ ]*//g; s/nohz_full=[^ ]*//g; s/rcu_nocbs=[^ ]*//g; s/rcu_nocb_poll//g; s/irqaffinity=[^ ]*//g')
         cleaned=$(echo "$cleaned" | sed -E 's/default_hugepagesz=[^ ]*//g; s/hugepagesz=[^ ]*//g; s/hugepages=[^ ]*//g')
+        cleaned=$(echo "$cleaned" | sed -E 's/intel_idle\.max_cstate=[^ ]*//g; s/processor\.max_cstate=[^ ]*//g; s/mitigations=[^ ]*//g; s/idle=poll//g')
         cleaned=$(echo "$cleaned" | tr -s ' ' | sed 's/^ *//; s/ *$//')
 
         # Update GRUB

@@ -14,71 +14,100 @@ METADATA_TOKEN_URL="http://169.254.169.254/latest/api/token"
 
 # Get IMDSv2 token
 get_token() {
-    curl -s -X PUT "$METADATA_TOKEN_URL" \
+    curl -sf -X PUT "$METADATA_TOKEN_URL" \
         -H "X-aws-ec2-metadata-token-ttl-seconds: 300" 2>/dev/null
 }
 
-# Fetch metadata with token
+# Fetch metadata with token (-f: fail silently on HTTP errors like 404)
 fetch_metadata() {
     local path="$1"
     local token=$(get_token)
-    
+
     if [[ -n "$token" ]]; then
-        # IMDSv2
-        curl -s -H "X-aws-ec2-metadata-token: $token" \
+        curl -sf -H "X-aws-ec2-metadata-token: $token" \
             "${METADATA_URL}${path}" 2>/dev/null
     else
-        # Fallback to IMDSv1
-        curl -s "${METADATA_URL}${path}" 2>/dev/null
+        curl -sf "${METADATA_URL}${path}" 2>/dev/null
     fi
 }
 
-# Get PCI address for an interface
+# Get PCI address for a kernel-bound interface
 get_pci_address() {
     local ifname="$1"
     local device_path="/sys/class/net/$ifname/device"
-    
+
     if [[ -L "$device_path" ]]; then
         basename "$(readlink -f "$device_path")"
     fi
 }
 
-# Get dpdk-devbind.py path (with fallback)
-get_dpdk_devbind() {
-    if command -v dpdk-devbind.py &>/dev/null; then
-        echo "dpdk-devbind.py"
-    elif [[ -x "${DPDK_PREFIX:-/usr/local}/bin/dpdk-devbind.py" ]]; then
-        echo "${DPDK_PREFIX:-/usr/local}/bin/dpdk-devbind.py"
-    else
-        echo ""
-    fi
-}
-
-# Get MAC address from interface or from dpdk-devbind
-get_mac_for_pci() {
-    local pci="$1"
-    
-    # First try to get from sysfs (if still bound to kernel)
-    local ifname_path="/sys/bus/pci/devices/$pci/net"
-    if [[ -d "$ifname_path" ]]; then
-        local ifname=$(ls "$ifname_path" | head -1)
-        if [[ -n "$ifname" ]]; then
-            cat "/sys/class/net/$ifname/address" 2>/dev/null
-            return
+# Build a map of MAC → PCI for DPDK-bound devices using elimination:
+#   1. Collect all kernel-bound MACs from sysfs
+#   2. All IMDS MACs not in sysfs must be DPDK-bound
+#   3. Sort unmatched MACs by device-number, DPDK PCI addresses ascending → pair 1:1
+build_dpdk_mac_pci_map() {
+    # Collect kernel-bound MACs
+    local kernel_macs=""
+    for iface in $(ls /sys/class/net/); do
+        if [[ -f "/sys/class/net/$iface/address" ]]; then
+            kernel_macs="$kernel_macs $(cat "/sys/class/net/$iface/address")"
         fi
-    fi
-    
-    # If bound to DPDK, get from dpdk-devbind output
-    # This is a backup - metadata is the primary source
-    local devbind=$(get_dpdk_devbind)
-    [[ -n "$devbind" ]] && $devbind --status 2>/dev/null | grep "$pci" | grep -oP "'[0-9a-fA-F:]+'" | tr -d "'" | head -1
+    done
+
+    # Collect all DPDK-bound PCI addresses (sorted ascending)
+    local dpdk_pcis=$(dpdk-devbind.py --status 2>/dev/null \
+        | grep "drv=vfio-pci" | awk '{print $1}' | sort)
+
+    # Collect IMDS MACs not found in kernel (= DPDK-bound), sorted by device-number
+    local unmatched=""  # "device_number:mac" entries
+    local all_macs=$(fetch_metadata "/network/interfaces/macs/")
+    for mac_slash in $all_macs; do
+        local mac="${mac_slash%/}"
+        local found=false
+        for km in $kernel_macs; do
+            if [[ "$km" == "$mac" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == "false" ]]; then
+            local devnum=$(fetch_metadata "/network/interfaces/macs/$mac/device-number")
+            unmatched="$unmatched ${devnum}:${mac}"
+        fi
+    done
+    # Sort by device-number
+    unmatched=$(echo "$unmatched" | tr ' ' '\n' | sort -t: -k1 -n | tr '\n' ' ')
+
+    # Pair: sorted unmatched MACs ↔ sorted DPDK PCI addresses
+    # Output: "mac=pci" lines (consumed by generate_config)
+    local i=0
+    local pci_arr=($dpdk_pcis)
+    for entry in $unmatched; do
+        local mac="${entry#*:}"
+        if [[ $i -lt ${#pci_arr[@]} ]]; then
+            echo "$mac=${pci_arr[$i]}"
+        fi
+        ((i++))
+    done
 }
 
 # Generate configuration JSON
 generate_config() {
     local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     local instance_type=$(fetch_metadata "/instance-type")
-    
+
+    # Pre-build DPDK MAC→PCI map
+    local dpdk_map=$(build_dpdk_mac_pci_map)
+
+    # Load NIC names once for DPDK device name reconstruction
+    local -a dpdk_nic_names=()
+    local ll_config="/etc/dpdk/low-latency.conf"
+    if [[ -f "$ll_config" ]]; then
+        local _DPDK_NICS=""
+        _DPDK_NICS=$(source "$ll_config" && echo "$DPDK_NICS")
+        dpdk_nic_names=($_DPDK_NICS)
+    fi
+
     echo "{"
     echo "  \"version\": 2,"
     echo "  \"generated_at\": \"$timestamp\","
@@ -86,20 +115,18 @@ generate_config() {
     echo "  \"metadata\": {"
     echo "    \"instance_type\": \"$instance_type\""
     echo "  },"
-    
+
     # Generate dpdk_cores array from low-latency.conf if available
     # Otherwise fallback to all cores except 0
-    local ll_config="/etc/dpdk/low-latency.conf"
     local dpdk_cpus=""
-    
+
     if [[ -f "$ll_config" ]]; then
-        source "$ll_config"
-        dpdk_cpus="$DPDK_CPUS"
+        dpdk_cpus=$(source "$ll_config" && echo "$DPDK_CPUS")
     fi
-    
+
     echo "  \"dpdk_cores\": ["
     local cores_first=true
-    
+
     if [[ -n "$dpdk_cpus" ]]; then
         # Use configured DPDK CPUs from low-latency.conf
         for cpu in $dpdk_cpus; do
@@ -122,18 +149,17 @@ generate_config() {
     fi
     echo ""
     echo "  ],"
-    
+
     # Get all MACs from metadata
     local macs=$(fetch_metadata "/network/interfaces/macs/")
-    
+
     echo "  \"devices\": ["
-    
+
     local first=true
-    local devices_to_bind="${DPDK_DEVICES:-}"
-    
+
     for mac_with_slash in $macs; do
-        local mac="${mac_with_slash%/}"  # Remove trailing slash
-        
+        local mac="${mac_with_slash%/}"
+
         # Get device info from metadata
         local device_number=$(fetch_metadata "/network/interfaces/macs/$mac/device-number")
         local local_ipv4s=$(fetch_metadata "/network/interfaces/macs/$mac/local-ipv4s")
@@ -141,17 +167,16 @@ generate_config() {
         local subnet_cidr=$(fetch_metadata "/network/interfaces/macs/$mac/subnet-ipv4-cidr-block")
         local subnet_cidr_v6=$(fetch_metadata "/network/interfaces/macs/$mac/subnet-ipv6-cidr-blocks" 2>/dev/null || echo "")
         local vpc_cidr=$(fetch_metadata "/network/interfaces/macs/$mac/vpc-ipv4-cidr-blocks")
-        
+
         # Extract prefix length from subnet CIDR
         local prefix="${subnet_cidr#*/}"
         [[ -z "$prefix" ]] && prefix="20"
-        
-        # Get interface name from sysfs
+
+        # Find PCI address and interface name
         local ifname=""
         local pci=""
-        local is_dpdk_bound="false"
-        
-        # First try to find in sysfs (kernel-bound devices)
+
+        # Try sysfs first (kernel-bound devices)
         for iface in $(ls /sys/class/net/); do
             if [[ -f "/sys/class/net/$iface/address" ]]; then
                 local iface_mac=$(cat "/sys/class/net/$iface/address")
@@ -162,47 +187,37 @@ generate_config() {
                 fi
             fi
         done
-        
-        # If not found in sysfs, device might already be bound to DPDK
-        # Use dpdk-devbind to get status and find by checking PCI device properties
+
+        # If not in sysfs, look up from DPDK elimination map
         if [[ -z "$pci" ]]; then
-            # Get all DPDK-bound devices
-            local devbind=$(get_dpdk_devbind)
-            local dpdk_devices=""
-            [[ -n "$devbind" ]] && dpdk_devices=$($devbind --status 2>/dev/null | grep "drv=vfio-pci" | awk '{print $1}')
-            
-            for test_pci in $dpdk_devices; do
-                # For DPDK-bound devices, we can't get MAC from sysfs
-                # But we can use the device-number from metadata to correlate
-                # AWS ENA devices on EC2 have predictable PCI slot assignments
-                
-                # Read the slot from PCI address (e.g., 0000:28:00.0 -> slot 28)
-                local slot=$(echo "$test_pci" | cut -d: -f2)
-                local slot_dec=$((16#$slot))  # Convert hex to decimal
-                
-                # ENA device numbers map roughly to PCI slots
-                # This is EC2-specific heuristic
-                if [[ $((slot_dec - 39)) -eq $device_number ]] || \
-                   [[ $((slot_dec - 40)) -eq $device_number ]]; then
-                    pci="$test_pci"
-                    ifname="enp${slot_dec}s0"  # Reconstruct original name
-                    is_dpdk_bound="true"
-                    break
+            local map_entry=$(echo "$dpdk_map" | grep "^$mac=")
+            if [[ -n "$map_entry" ]]; then
+                pci="${map_entry#*=}"
+                # Reconstruct original interface name from pre-loaded NIC names
+                local dpdk_idx=0
+                for entry in $dpdk_map; do
+                    local entry_mac="${entry%=*}"
+                    if [[ "$entry_mac" == "$mac" ]]; then
+                        break
+                    fi
+                    ((dpdk_idx++))
+                done
+                if [[ $dpdk_idx -lt ${#dpdk_nic_names[@]} ]]; then
+                    ifname="${dpdk_nic_names[$dpdk_idx]}"
                 fi
-            done
+                [[ -z "$ifname" ]] && ifname="dpdk${device_number}"
+            fi
         fi
-        
+
         # Skip if no PCI address found
         [[ -z "$pci" ]] && continue
-        
-        # Determine role: check ACTUAL current binding status
+
+        # Determine role from current binding status
         local role="kernel"
-        local devbind_check=$(get_dpdk_devbind)
-        if [[ -n "$devbind_check" ]] && $devbind_check --status 2>/dev/null | grep "$pci" | grep -q "drv=vfio-pci\|drv=igb_uio"; then
+        if dpdk-devbind.py --status 2>/dev/null | grep "$pci" | grep -q "drv=vfio-pci\|drv=igb_uio"; then
             role="dpdk"
         fi
-        # Note: We only report actual state, not intended state
-        
+
         # Calculate gateway (usually .1 of the subnet)
         local gateway_v4=""
         if [[ -n "$subnet_cidr" ]]; then
@@ -210,12 +225,11 @@ generate_config() {
             local octets=(${subnet_base//./ })
             gateway_v4="${octets[0]}.${octets[1]}.${octets[2]}.1"
         fi
-        
-        # Get IPv6 gateway and prefix
+
+        # Get IPv6 gateway and prefix from kernel routing table
         local gateway_v6=""
         local prefix_v6="128"
         if [[ -n "$subnet_cidr_v6" ]]; then
-            # Extract prefix from IPv6 CIDR (e.g., 2406:da18:e99:5d00::/56 -> 56)
             prefix_v6="${subnet_cidr_v6#*/}"
             [[ -z "$prefix_v6" ]] && prefix_v6="64"
             # AWS VPC uses a link-local address as the IPv6 gateway.
@@ -228,51 +242,44 @@ generate_config() {
                 gateway_v6=$(ip -6 route show default 2>/dev/null | awk '/via/ {print $3; exit}')
             fi
         fi
-        
-        # Note: core_affinity removed in version 2, use dpdk_cores instead
-        
+
         # Output JSON
         if [[ "$first" != "true" ]]; then
             echo ","
         fi
         first=false
-        
+
         echo "    {"
         echo "      \"pci_address\": \"$pci\","
         echo "      \"mac\": \"$mac\","
-        
+
         # Build addresses array (IPv4 + IPv6)
-        # IMPORTANT: Put IPs with EIP associations FIRST so DPDK uses them for external connectivity
+        # Only include IPv4 addresses with EIP associations (external connectivity)
         echo "      \"addresses\": ["
         local addr_first=true
-        
+
         # Get EIP associations for this interface
         local eip_associations=$(fetch_metadata "/network/interfaces/macs/$mac/ipv4-associations/" 2>/dev/null || echo "")
         local ips_with_eip=""
-        local ips_without_eip=""
-        
-        # Categorize IPs by EIP association
+
+        # Find IPs with EIP association
         for ip in $local_ipv4s; do
             local has_eip=false
             for eip_with_slash in $eip_associations; do
                 local eip="${eip_with_slash%/}"
-                # Check if this EIP is associated with this private IP
                 local associated_private=$(fetch_metadata "/network/interfaces/macs/$mac/ipv4-associations/$eip" 2>/dev/null || echo "")
                 if [[ "$associated_private" == "$ip" ]]; then
                     has_eip=true
                     break
                 fi
             done
-            
+
             if [[ "$has_eip" == "true" ]]; then
                 ips_with_eip="$ips_with_eip $ip"
-            else
-                ips_without_eip="$ips_without_eip $ip"
             fi
         done
-        
-        # Output ONLY IPs with public IP associations (EIP or auto-assigned)
-        # Private IPs without public IP mapping cannot be used for external connectivity
+
+        # Output only IPs with public IP associations
         for ip in $ips_with_eip; do
             if [[ -n "$ip" ]]; then
                 if [[ "$addr_first" != "true" ]]; then
@@ -294,7 +301,7 @@ generate_config() {
         done
         echo ""
         echo "      ],"
-        
+
         [[ -n "$gateway_v4" ]] && echo "      \"gateway_v4\": \"$gateway_v4\","
         [[ -n "$gateway_v6" ]] && echo "      \"gateway_v6\": \"$gateway_v6\","
         echo "      \"mtu\": 9001,"
@@ -302,25 +309,25 @@ generate_config() {
         echo "      \"original_name\": \"$ifname\""
         echo -n "    }"
     done
-    
+
     echo ""
     echo "  ],"
-    
+
     # Hugepages config
     local hugepages_total=$(cat /proc/meminfo | grep HugePages_Total | awk '{print $2}')
     [[ -z "$hugepages_total" || "$hugepages_total" -eq 0 ]] && hugepages_total="${DPDK_HUGEPAGES:-512}"
-    
+
     echo "  \"hugepages\": {"
     echo "    \"size_kb\": 2048,"
     echo "    \"count\": $hugepages_total,"
     echo "    \"mount\": \"/mnt/huge\""
     echo "  },"
-    
+
     # EAL args for AWS
     echo "  \"eal_args\": ["
     echo "    \"--iova-mode=pa\""
     echo "  ]"
-    
+
     echo "}"
 }
 
