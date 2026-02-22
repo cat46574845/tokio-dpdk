@@ -26,7 +26,7 @@ impl BlockingSchedule {
                 }
                 #[cfg(feature = "rt-multi-thread")]
                 scheduler::Handle::MultiThread(_) => {}
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 scheduler::Handle::Dpdk(_) => {}
             }
         }
@@ -51,7 +51,7 @@ impl task::Schedule for BlockingSchedule {
                 }
                 #[cfg(feature = "rt-multi-thread")]
                 scheduler::Handle::MultiThread(_) => {}
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 scheduler::Handle::Dpdk(_) => {}
             }
         }

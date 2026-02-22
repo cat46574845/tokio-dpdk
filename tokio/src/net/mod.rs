@@ -51,7 +51,7 @@ cfg_net! {
     }
 }
 
-cfg_rt_multi_thread! {
+cfg_dpdk! {
     pub mod tcp_dpdk;
     pub use tcp_dpdk::TcpDpdkListener;
     pub use tcp_dpdk::TcpDpdkSocket;

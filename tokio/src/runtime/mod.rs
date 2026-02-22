@@ -381,7 +381,7 @@ pub(crate) mod driver;
 
 pub(crate) mod scheduler;
 
-cfg_rt_multi_thread! {
+cfg_dpdk! {
     pub mod dpdk;
 }
 
@@ -594,7 +594,7 @@ cfg_rt! {
     pub use metrics::RuntimeMetrics;
 
     // DPDK scheduler debug APIs
-    cfg_rt_multi_thread! {
+    cfg_dpdk! {
         pub use scheduler::dpdk::{current_tick, current_exec_count, current_scheduler_stats, DpdkSchedulerStats};
 
         // Detailed timing debug APIs (only with dpdk-debug feature)

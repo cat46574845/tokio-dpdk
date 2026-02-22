@@ -84,8 +84,10 @@ signal = [
 sync = []
 test-util = ["rt", "sync", "time"]
 time = []
+# DPDK scheduler - kernel-bypass networking with busy-poll workers
+dpdk = ["rt-multi-thread", "dep:smoltcp", "dep:serde", "dep:serde_json"]
 # DPDK scheduler debugging - enables detailed timing measurements
-dpdk-debug = []
+dpdk-debug = ["dpdk"]
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.
 io-uring = ["dep:io-uring", "libc", "mio/os-poll", "mio/os-ext", "dep:slab"]
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.
@@ -102,11 +104,11 @@ bytes = { version = "1.2.1", optional = true }
 mio = { version = "1.0.1", optional = true, default-features = false }
 parking_lot = { version = "0.12.0", optional = true }
 
-# DPDK scheduler dependencies (always enabled)
+# DPDK scheduler dependencies (optional, enabled by `dpdk` feature)
 # Note: SMOLTCP_IFACE_MAX_ADDR_COUNT=128 is set in .cargo/config.toml
-smoltcp = { git = "https://github.com/cat46574845/smoltcp", branch = "main", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "log", "async"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+smoltcp = { git = "https://github.com/cat46574845/smoltcp", branch = "main", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "log", "async"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 socket2 = { version = "0.6.0", optional = true, features = ["all"] }

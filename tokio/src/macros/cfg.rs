@@ -697,6 +697,15 @@ macro_rules! cfg_metrics_variant {
     }
 }
 
+macro_rules! cfg_dpdk {
+    ($($item:item)*) => {
+        $(
+            #[cfg(feature = "dpdk")]
+            $item
+        )*
+    }
+}
+
 macro_rules! cfg_io_uring {
     ($($item:item)*) => {
         $(

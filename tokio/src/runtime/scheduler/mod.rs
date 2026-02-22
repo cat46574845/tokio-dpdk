@@ -25,8 +25,7 @@ cfg_rt_multi_thread! {
 }
 
 // DPDK scheduler - busy-poll, thread-per-core, no work stealing
-// Gated behind rt-multi-thread to share feature flag infrastructure
-cfg_rt_multi_thread! {
+cfg_dpdk! {
     pub(crate) mod dpdk;
 }
 
@@ -42,7 +41,7 @@ pub(crate) enum Handle {
     #[cfg(feature = "rt-multi-thread")]
     MultiThread(Arc<multi_thread::Handle>),
 
-    #[cfg(feature = "rt-multi-thread")]
+    #[cfg(feature = "dpdk")]
     Dpdk(Arc<dpdk::Handle>),
 
     // TODO: This is to avoid triggering "dead code" warnings many other places
@@ -59,7 +58,7 @@ pub(super) enum Context {
     #[cfg(feature = "rt-multi-thread")]
     MultiThread(multi_thread::Context),
 
-    #[cfg(feature = "rt-multi-thread")]
+    #[cfg(feature = "dpdk")]
     Dpdk(dpdk::Context),
 }
 
@@ -73,7 +72,7 @@ impl Handle {
             #[cfg(feature = "rt-multi-thread")]
             Handle::MultiThread(ref h) => &h.driver,
 
-            #[cfg(feature = "rt-multi-thread")]
+            #[cfg(feature = "dpdk")]
             Handle::Dpdk(ref h) => &h.driver,
 
             #[cfg(not(feature = "rt"))]
@@ -99,7 +98,7 @@ cfg_rt! {
                 #[cfg(feature = "rt-multi-thread")]
                 $ty::MultiThread($h) => $e,
 
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 $ty::Dpdk($h) => $e,
             }
         }
@@ -125,7 +124,7 @@ cfg_rt! {
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(_) => false,
 
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 Handle::Dpdk(_) => false,
             }
         }
@@ -139,7 +138,7 @@ cfg_rt! {
                 Handle::MultiThread(h) => h.timer_flavor,
 
                 // DPDK always uses Traditional timer
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 Handle::Dpdk(_) => crate::runtime::TimerFlavor::Traditional,
             }
         }
@@ -184,7 +183,7 @@ cfg_rt! {
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(_) => false,
 
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 Handle::Dpdk(_) => false,
             }
         }
@@ -200,7 +199,7 @@ cfg_rt! {
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(h) => multi_thread::Handle::spawn(h, future, id, spawned_at),
 
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 Handle::Dpdk(h) => dpdk::Handle::spawn(h, future, id, spawned_at),
             }
         }
@@ -223,7 +222,7 @@ cfg_rt! {
                     // Safety: caller guarantees that this is a `LocalRuntime`.
                     unsafe { current_thread::Handle::spawn_local(h, future, id, spawned_at) }
                 }
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 Handle::Dpdk(h) => {
                     dpdk::Handle::spawn_local_impl(h, future, id, spawned_at)
                         .expect("spawn_local on DPDK requires being on a DPDK worker thread")
@@ -240,7 +239,7 @@ cfg_rt! {
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(ref h) => h.shutdown(),
 
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 Handle::Dpdk(ref h) => h.shutdown(),
             }
         }
@@ -262,7 +261,7 @@ cfg_rt! {
                 Handle::CurrentThread(h) => &h.task_hooks,
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(h) => &h.task_hooks,
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 Handle::Dpdk(h) => &h.task_hooks,
             }
         }
@@ -274,7 +273,7 @@ cfg_rt! {
                 Handle::CurrentThread(_) => 1,
                 #[cfg(feature = "rt-multi-thread")]
                 Handle::MultiThread(handle) => handle.num_workers(),
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 Handle::Dpdk(handle) => handle.num_workers(),
             }
         }

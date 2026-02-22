@@ -139,7 +139,7 @@ pub struct Builder {
     timer_flavor: TimerFlavor,
 
     /// DPDK builder configuration (only used when Kind::Dpdk)
-    #[cfg(feature = "rt-multi-thread")]
+    #[cfg(feature = "dpdk")]
     pub(super) dpdk_builder: Option<crate::runtime::scheduler::dpdk::DpdkBuilder>,
 }
 
@@ -234,7 +234,7 @@ pub(crate) enum Kind {
     CurrentThread,
     #[cfg(feature = "rt-multi-thread")]
     MultiThread,
-    #[cfg(feature = "rt-multi-thread")]
+    #[cfg(feature = "dpdk")]
     Dpdk,
 }
 
@@ -296,8 +296,8 @@ impl Builder {
     ///     .build()
     ///     .unwrap();
     /// ```
-    #[cfg(feature = "rt-multi-thread")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    #[cfg(feature = "dpdk")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dpdk")))]
     pub fn new_dpdk() -> Builder {
         let mut builder = Builder::new(Kind::Dpdk, 61);
         builder.dpdk_builder = Some(crate::runtime::scheduler::dpdk::DpdkBuilder::new());
@@ -369,7 +369,7 @@ impl Builder {
 
             timer_flavor: TimerFlavor::Traditional,
 
-            #[cfg(feature = "rt-multi-thread")]
+            #[cfg(feature = "dpdk")]
             dpdk_builder: None,
         }
     }
@@ -1032,7 +1032,7 @@ impl Builder {
             Kind::CurrentThread => self.build_current_thread_runtime(),
             #[cfg(feature = "rt-multi-thread")]
             Kind::MultiThread => self.build_threaded_runtime(),
-            #[cfg(feature = "rt-multi-thread")]
+            #[cfg(feature = "dpdk")]
             Kind::Dpdk => self.build_dpdk_runtime(),
         }
     }
@@ -1077,7 +1077,7 @@ impl Builder {
                 Kind::CurrentThread => true,
                 #[cfg(feature = "rt-multi-thread")]
                 Kind::MultiThread => false,
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(feature = "dpdk")]
                 Kind::Dpdk => false,
             },
             enable_io: self.enable_io,
@@ -1129,8 +1129,8 @@ impl Builder {
     ///     .build()
     ///     .unwrap();
     /// ```
-    #[cfg(feature = "rt-multi-thread")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    #[cfg(feature = "dpdk")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dpdk")))]
     pub fn dpdk_eal_arg(&mut self, arg: &str) -> &mut Self {
         if let Some(ref mut dpdk_builder) = self.dpdk_builder {
             *dpdk_builder = std::mem::take(dpdk_builder).eal_arg(arg);
@@ -1150,8 +1150,8 @@ impl Builder {
     ///     .build()
     ///     .unwrap();
     /// ```
-    #[cfg(feature = "rt-multi-thread")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    #[cfg(feature = "dpdk")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dpdk")))]
     pub fn dpdk_eal_args(&mut self, args: &[&str]) -> &mut Self {
         if let Some(ref mut dpdk_builder) = self.dpdk_builder {
             *dpdk_builder = std::mem::take(dpdk_builder).eal_args(args);
@@ -1176,8 +1176,8 @@ impl Builder {
     ///     .build()
     ///     .unwrap();
     /// ```
-    #[cfg(feature = "rt-multi-thread")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    #[cfg(feature = "dpdk")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dpdk")))]
     pub fn dpdk_pci_addresses(&mut self, pci_addresses: &[&str]) -> &mut Self {
         if let Some(ref mut dpdk_builder) = self.dpdk_builder {
             *dpdk_builder = std::mem::take(dpdk_builder).dpdk_devices(pci_addresses);
@@ -1197,8 +1197,8 @@ impl Builder {
     ///     .build()
     ///     .unwrap();
     /// ```
-    #[cfg(feature = "rt-multi-thread")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    #[cfg(feature = "dpdk")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dpdk")))]
     pub fn dpdk_mempool_size(&mut self, size: u32) -> &mut Self {
         if let Some(ref mut dpdk_builder) = self.dpdk_builder {
             *dpdk_builder = std::mem::take(dpdk_builder).mempool_size(size);
@@ -1209,8 +1209,8 @@ impl Builder {
     /// Sets the DPDK per-core cache size for the memory pool.
     ///
     /// Default: 256.
-    #[cfg(feature = "rt-multi-thread")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    #[cfg(feature = "dpdk")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dpdk")))]
     pub fn dpdk_cache_size(&mut self, size: u32) -> &mut Self {
         if let Some(ref mut dpdk_builder) = self.dpdk_builder {
             *dpdk_builder = std::mem::take(dpdk_builder).cache_size(size);
@@ -1221,8 +1221,8 @@ impl Builder {
     /// Sets the number of RX/TX queue descriptors per DPDK queue.
     ///
     /// Default: 128.
-    #[cfg(feature = "rt-multi-thread")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+    #[cfg(feature = "dpdk")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dpdk")))]
     pub fn dpdk_queue_descriptors(&mut self, desc: u16) -> &mut Self {
         if let Some(ref mut dpdk_builder) = self.dpdk_builder {
             *dpdk_builder = std::mem::take(dpdk_builder).queue_descriptors(desc);
@@ -1992,6 +1992,11 @@ cfg_rt_multi_thread! {
             Ok(Runtime::from_parts(Scheduler::MultiThread(scheduler), handle, blocking_pool))
         }
 
+    }
+}
+
+cfg_dpdk! {
+    impl Builder {
         /// Builds the DPDK runtime.
         ///
         /// This function initializes the DPDK runtime with busy-poll workers.
@@ -2083,7 +2088,6 @@ cfg_rt_multi_thread! {
 
             Ok(Runtime::from_parts(Scheduler::Dpdk(scheduler), handle, blocking_pool))
         }
-
     }
 }
 

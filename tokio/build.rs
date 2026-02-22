@@ -1,22 +1,25 @@
 //! Build script for tokio with DPDK support.
 //!
 //! This compiles the DPDK C wrapper functions required for FFI calls to
-//! DPDK inline functions.
+//! DPDK inline functions. Only active when the `dpdk` feature is enabled.
 
 fn main() {
-    // Only compile DPDK wrappers on Linux (DPDK primary platform)
-    // Windows support is via pre-built binaries
-    #[cfg(target_os = "linux")]
-    compile_dpdk_wrappers_linux();
+    #[cfg(feature = "dpdk")]
+    {
+        // Only compile DPDK wrappers on Linux (DPDK primary platform)
+        // Windows support is via pre-built binaries
+        #[cfg(target_os = "linux")]
+        compile_dpdk_wrappers_linux();
 
-    #[cfg(target_os = "windows")]
-    compile_dpdk_wrappers_windows();
+        #[cfg(target_os = "windows")]
+        compile_dpdk_wrappers_windows();
 
-    // Tell cargo to rerun if the wrapper source changes
-    println!("cargo:rerun-if-changed=src/runtime/scheduler/dpdk/ffi/dpdk_wrappers.c");
+        // Tell cargo to rerun if the wrapper source changes
+        println!("cargo:rerun-if-changed=src/runtime/scheduler/dpdk/ffi/dpdk_wrappers.c");
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "dpdk", target_os = "linux"))]
 fn compile_dpdk_wrappers_linux() {
     // Check if pkg-config can find DPDK
     let dpdk_cflags = std::process::Command::new("pkg-config")
@@ -75,7 +78,7 @@ fn compile_dpdk_wrappers_linux() {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "dpdk", target_os = "windows"))]
 fn compile_dpdk_wrappers_windows() {
     // Windows DPDK installation path
     // DPDK 23.11 is pre-built at this location
