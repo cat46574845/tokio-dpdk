@@ -601,7 +601,7 @@ cmd_persist() {
     log_info "Updating boot parameters..."
     local new_params="isolcpus=$ISOLCPUS nohz_full=$ISOLCPUS rcu_nocbs=$ISOLCPUS rcu_nocb_poll irqaffinity=$IRQAFFINITY"
     new_params="$new_params default_hugepagesz=2M hugepagesz=2M hugepages=$HUGEPAGES"
-    new_params="$new_params intel_idle.max_cstate=1 processor.max_cstate=1 mitigations=off"
+    new_params="$new_params intel_idle.max_cstate=0 processor.max_cstate=0 mitigations=off"
     os_persist_boot_params "$new_params"
     
     # 2. Create sysctl config
@@ -612,6 +612,7 @@ cmd_persist() {
 
 vm.swappiness = 0
 kernel.numa_balancing = 0
+kernel.sched_rt_runtime_us = -1
 EOF
     log_success "Created $SYSCTL_CONF"
     
