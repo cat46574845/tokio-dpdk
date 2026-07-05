@@ -35,7 +35,7 @@ const TCP_RX_BUFFER_SIZE: usize = 524288;
 const TCP_TX_BUFFER_SIZE: usize = 65536;
 
 /// Default buffer pool size (number of connections)
-const DEFAULT_BUFFER_POOL_SIZE: usize = 256;
+const DEFAULT_BUFFER_POOL_SIZE: usize = 2048;
 
 // =============================================================================
 // TcpBufferPool - Pre-allocated buffer management
