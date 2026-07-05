@@ -168,8 +168,33 @@ impl Handle {
             _phantom: Default::default(),
         });
 
+        let inherited_worker_index = worker::with_current(|maybe_cx| {
+            let Some(cx) = maybe_cx else {
+                return None;
+            };
+            let same_runtime = std::ptr::eq(
+                &cx.worker.handle.shared as *const _,
+                &me.shared as *const _,
+            );
+            if same_runtime {
+                Some(cx.worker.index)
+            } else {
+                None
+            }
+        });
+
+        if let (Some(task), Some(worker_index)) = (notified.as_ref(), inherited_worker_index) {
+            task.dpdk_set_worker_affinity(worker_index);
+        }
+
         #[cfg(feature = "market-trace")]
-        log_task_spawn("spawn", id, None, caller, std::any::type_name::<T>());
+        log_task_spawn(
+            "spawn",
+            id,
+            inherited_worker_index,
+            caller,
+            std::any::type_name::<T>(),
+        );
 
         me.schedule_option_task_without_yield(notified);
 
