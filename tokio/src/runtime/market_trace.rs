@@ -16,6 +16,7 @@ pub(crate) const SPAN_TOKIO_CURRENT_PARK: u16 = 101;
 pub(crate) const SPAN_TOKIO_CURRENT_PARK_YIELD: u16 = 102;
 pub(crate) const SPAN_DPDK_DRIVER_POLL: u16 = 110;
 pub(crate) const SPAN_DPDK_FLUSH_TX: u16 = 111;
+pub(crate) const SPAN_DPDK_DRAIN_RX: u16 = 112;
 pub(crate) const SPAN_DPDK_FLUSH_ACKS: u16 = 113;
 pub(crate) const SPAN_DPDK_YIELD_RAW_TAIL: u16 = 114;
 pub(crate) const SPAN_DPDK_SMOLTCP_POLL: u16 = 115;

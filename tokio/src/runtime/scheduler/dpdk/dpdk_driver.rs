@@ -259,12 +259,22 @@ impl DpdkDriver {
         let smol_now =
             SmolInstant::from_millis(now.duration_since(self.start_time).as_millis() as i64);
         // Flush pending TX packets first.
+        #[cfg(feature = "market-trace")]
+        let flush_tx_before_start_ns = crate::runtime::market_trace::now_ns();
         self.device.flush_tx();
+        #[cfg(feature = "market-trace")]
+        let flush_tx_before_dur_ns =
+            crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_before_start_ns);
 
         // Drain the hardware RX queue at poll entry until rx_burst cannot fill
         // the preallocated batch buffer. The collected mbufs are then processed
         // newest-first inside this same poll.
+        #[cfg(feature = "market-trace")]
+        let drain_rx_start_ns = crate::runtime::market_trace::now_ns();
         let received_rx = self.device.drain_rx(&mut self.raw_tail);
+        #[cfg(feature = "market-trace")]
+        let drain_rx_dur_ns =
+            crate::runtime::market_trace::now_ns().saturating_sub(drain_rx_start_ns);
 
         #[cfg(feature = "market-trace")]
         let trace_poll = received_rx;
@@ -351,6 +361,20 @@ impl DpdkDriver {
                 poll_start_ns,
                 poll_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_DRIVER_POLL,
+                track_id,
+                0,
+            );
+            crate::runtime::market_trace::complete(
+                flush_tx_before_start_ns,
+                flush_tx_before_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_FLUSH_TX,
+                track_id,
+                0,
+            );
+            crate::runtime::market_trace::complete(
+                drain_rx_start_ns,
+                drain_rx_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_DRAIN_RX,
                 track_id,
                 0,
             );
