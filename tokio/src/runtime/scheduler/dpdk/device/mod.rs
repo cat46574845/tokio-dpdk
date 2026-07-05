@@ -15,14 +15,33 @@ use super::raw_tail::{ParsedTcpPacket, RawTailTable};
 // Configuration constants
 // =============================================================================
 
-/// Maximum packets per rx_burst call
-const RX_BURST_SIZE: u16 = 32;
+/// Default packets requested per rx_burst call.
+const RX_BURST_SIZE_DEFAULT: u16 = 256;
 
 /// Maximum packets per tx_burst call
 const TX_BURST_SIZE: u16 = 32;
 
+/// Preallocated mbuf pointers retained for one full driver poll.
+const RX_DRAIN_BATCH_CAP: usize = 8192;
+
 /// Default MTU (Maximum Transmission Unit)
 const DEFAULT_MTU: usize = 1500;
+
+fn configured_rx_burst_size() -> u16 {
+    let Some(value) = std::env::var_os("TOKIO_DPDK_RX_BURST_SIZE") else {
+        return RX_BURST_SIZE_DEFAULT;
+    };
+    let value = value
+        .into_string()
+        .unwrap_or_else(|_| panic!("TOKIO_DPDK_RX_BURST_SIZE is not valid UTF-8"));
+    let parsed = value
+        .parse::<u16>()
+        .unwrap_or_else(|e| panic!("TOKIO_DPDK_RX_BURST_SIZE parse failed value={} error={}", value, e));
+    if parsed == 0 {
+        panic!("TOKIO_DPDK_RX_BURST_SIZE must be greater than zero");
+    }
+    parsed
+}
 
 // =============================================================================
 // DPDK wrapper functions
@@ -122,6 +141,12 @@ pub(crate) struct DpdkDevice {
     rx_pending: Vec<*mut ffi::rte_mbuf>,
     /// Current index into rx_pending
     rx_index: usize,
+    /// Preallocated pointer buffer passed to rte_eth_rx_burst.
+    rx_burst_buf: Vec<*mut ffi::rte_mbuf>,
+    /// Number of mbuf pointers requested from one rx_burst call.
+    rx_burst_size: u16,
+    /// Raw mbufs drained during the current driver poll before reverse dispatch.
+    rx_drain_batch: Vec<*mut ffi::rte_mbuf>,
 }
 
 // DPDK mbufs are thread-safe when used correctly
@@ -135,13 +160,18 @@ impl DpdkDevice {
     /// `mempool` must be a valid DPDK memory pool pointer that outlives
     /// this device.
     pub(crate) unsafe fn new(port_id: u16, queue_id: u16, mempool: *mut ffi::rte_mempool) -> Self {
+        let rx_burst_size = configured_rx_burst_size();
+        let rx_burst_len = rx_burst_size as usize;
         Self {
             port_id,
             queue_id,
             mempool,
             tx_buffer: Vec::with_capacity(TX_BURST_SIZE as usize),
-            rx_pending: Vec::with_capacity(RX_BURST_SIZE as usize),
+            rx_pending: Vec::with_capacity(rx_burst_len),
             rx_index: 0,
+            rx_burst_buf: vec![ptr::null_mut(); rx_burst_len],
+            rx_burst_size,
+            rx_drain_batch: Vec::with_capacity(RX_DRAIN_BATCH_CAP.max(rx_burst_len)),
         }
     }
 
@@ -159,40 +189,45 @@ impl DpdkDevice {
     }
 
     /// Try to receive packets from DPDK.
-    pub(crate) fn drain_rx(&mut self, raw_tail: &mut RawTailTable) {
+    pub(crate) fn drain_rx(&mut self, raw_tail: &mut RawTailTable) -> bool {
         // Only receive if we've consumed all pending packets
         if self.rx_index >= self.rx_pending.len() {
             self.rx_pending.clear();
             self.rx_index = 0;
         }
+        self.rx_drain_batch.clear();
+        let mut received_any = false;
 
         loop {
-            let mut bufs: [*mut ffi::rte_mbuf; RX_BURST_SIZE as usize] =
-                [ptr::null_mut(); RX_BURST_SIZE as usize];
-
             let n = unsafe {
                 dpdk_wrappers::rx_burst(
                     self.port_id,
                     self.queue_id,
-                    bufs.as_mut_ptr(),
-                    RX_BURST_SIZE,
+                    self.rx_burst_buf.as_mut_ptr(),
+                    self.rx_burst_size,
                 )
             };
 
             if n > 0 {
-                for mbuf in &bufs[..n as usize] {
-                    if !raw_tail.is_empty() && raw_tail.capture_mbuf(*mbuf) {
-                        continue;
-                    }
-                    self.rx_pending.push(*mbuf);
+                received_any = true;
+                for mbuf in &self.rx_burst_buf[..n as usize] {
+                    self.rx_drain_batch.push(*mbuf);
                 }
             }
 
-            if n < RX_BURST_SIZE {
+            if n < self.rx_burst_size {
                 break;
             }
         }
+        for mbuf in self.rx_drain_batch.iter().rev() {
+            if !raw_tail.is_empty() && raw_tail.capture_mbuf(*mbuf) {
+                continue;
+            }
+            self.rx_pending.push(*mbuf);
+        }
+        self.rx_drain_batch.clear();
         raw_tail.collect_dirty_from_conns();
+        received_any
     }
 
     /// Flush the transmit buffer.
@@ -245,6 +280,18 @@ impl DpdkDevice {
         }
 
         self.tx_buffer.clear();
+    }
+
+    pub(crate) fn drop_unprocessed_rx_pending(&mut self) {
+        if self.rx_index < self.rx_pending.len() {
+            for mbuf in &self.rx_pending[self.rx_index..] {
+                unsafe {
+                    dpdk_wrappers::pktmbuf_free(*mbuf);
+                }
+            }
+        }
+        self.rx_pending.clear();
+        self.rx_index = 0;
     }
 
     #[inline(always)]
@@ -457,7 +504,7 @@ impl Device for DpdkDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = DEFAULT_MTU;
-        caps.max_burst_size = Some(RX_BURST_SIZE as usize);
+        caps.max_burst_size = Some(self.rx_burst_size as usize);
         caps.medium = Medium::Ethernet;
 
         // Configure smoltcp to calculate checksums for TX packets in software

@@ -19,7 +19,7 @@ use crate::net::{to_socket_addrs, ToSocketAddrs};
 
 // Import worker context from dpdk scheduler
 use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver};
-use crate::runtime::scheduler::dpdk::RawTailHandle;
+use crate::runtime::scheduler::dpdk::{RawTailCallback, RawTailHandle};
 
 use std::marker::PhantomData;
 
@@ -920,12 +920,31 @@ impl TcpDpdkStream {
     /// Divert this connected TCP flow into the DPDK raw-tail market-data path.
     ///
     /// After activation, inbound packets for this flow are captured by RSS hash
-    /// before smoltcp receives them. The caller must poll the raw-tail API and
-    /// should not continue reading this stream as a normal TCP stream.
+    /// before smoltcp receives them. The caller must register a poll-time
+    /// callback and should not continue reading this stream as a normal TCP stream.
     pub fn activate_raw_tail(&self) -> io::Result<RawTailHandle> {
         self.assert_on_correct_worker();
         let handle = self.handle;
         with_current_driver(|driver| driver.activate_raw_tail_for_socket(handle))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))?
+    }
+
+    /// Start capturing packets for a raw-tail flow reserved before connect.
+    pub fn activate_reserved_raw_tail(&self, handle: RawTailHandle) -> io::Result<()> {
+        self.assert_on_correct_worker();
+        with_current_driver(|driver| driver.activate_raw_tail(handle))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))?
+    }
+
+    /// Register the callback invoked inside the DPDK driver poll for this raw-tail flow.
+    pub fn set_raw_tail_callback(
+        &self,
+        handle: RawTailHandle,
+        ctx: *mut (),
+        callback: RawTailCallback,
+    ) -> io::Result<()> {
+        self.assert_on_correct_worker();
+        with_current_driver(|driver| driver.set_raw_tail_callback(handle, ctx, callback))
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))?
     }
 

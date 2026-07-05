@@ -16,6 +16,14 @@ const ETHERTYPE_IPV4: u16 = 0x0800;
 const IPPROTO_TCP: u8 = 6;
 const TCP_FLAG_ACK: u8 = 0x10;
 
+pub(crate) const RAW_TAIL_RSS_KEY: [u8; 40] = [
+    0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
+    0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
+    0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4,
+    0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
+    0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Identifies a TCP flow registered in the DPDK raw-tail receiver.
 pub struct RawTailHandle {
@@ -52,18 +60,23 @@ pub struct RawTailRecord<'a> {
     pub tcp_seq_after_record: u32,
     /// Complete TLS record including the 5-byte TLS header.
     pub bytes: &'a [u8],
+    /// Per-flow generation incremented once for each DPDK poll yield pass.
+    pub poll_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Result of polling one raw-tail flow.
-pub enum RawTailPoll {
-    /// A candidate record was accepted and older mbufs were released.
+/// Result returned by a raw-tail poll-time callback.
+pub enum RawTailCallbackResult {
+    /// A market-data frame was produced for this flow during this driver poll.
     Accepted,
-    /// No complete candidate TLS record was available.
-    NoRecord,
-    /// The handle is not registered on this worker.
-    UnknownHandle,
+    /// The TLS record decrypted, but the websocket frame was incomplete; try older records.
+    NeedPrevious,
+    /// This TLS candidate did not authenticate or did not belong to usable data.
+    Rejected,
 }
+
+/// Function invoked inside one DPDK driver poll for each raw-tail TLS candidate.
+pub type RawTailCallback = unsafe fn(*mut (), RawTailRecord<'_>) -> RawTailCallbackResult;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RawTailTuple {
@@ -89,20 +102,15 @@ impl RawTailTuple {
         })
     }
 
-    #[inline(always)]
-    fn matches(&self, pkt: &ParsedTcpPacket<'_>) -> bool {
-        pkt.local_ip == self.local_ip
-            && pkt.remote_ip == self.remote_ip
-            && pkt.local_port == self.local_port
-            && pkt.remote_port == self.remote_port
+    pub(crate) fn rss_hash(&self) -> u32 {
+        let mut tuple = [0u8; 12];
+        tuple[..4].copy_from_slice(&self.remote_ip.octets());
+        tuple[4..8].copy_from_slice(&self.local_ip.octets());
+        tuple[8..10].copy_from_slice(&self.remote_port.to_be_bytes());
+        tuple[10..12].copy_from_slice(&self.local_port.to_be_bytes());
+        toeplitz_hash(&tuple, &RAW_TAIL_RSS_KEY)
     }
-}
 
-#[derive(Clone, Copy)]
-struct Segment {
-    seq: u32,
-    payload_ptr: *const u8,
-    payload_len: usize,
 }
 
 struct TailRing {
@@ -122,10 +130,7 @@ impl TailRing {
 
     fn push(&mut self, mbuf: *mut ffi::rte_mbuf) -> Option<*mut ffi::rte_mbuf> {
         if self.len == RAW_TAIL_RING_CAP {
-            let old = self.slots[self.head];
-            self.slots[self.head] = mbuf;
-            self.head = (self.head + 1) % RAW_TAIL_RING_CAP;
-            Some(old)
+            Some(mbuf)
         } else {
             let idx = (self.head + self.len) % RAW_TAIL_RING_CAP;
             self.slots[idx] = mbuf;
@@ -138,30 +143,6 @@ impl TailRing {
         TailRingRevIter {
             ring: self,
             remaining: self.len,
-        }
-    }
-
-    fn release_before_tcp_seq(&mut self, seq: u32) {
-        let mut kept = [ptr::null_mut(); RAW_TAIL_RING_CAP];
-        let mut kept_len = 0usize;
-        for mbuf in self.newest_to_oldest() {
-            let keep = match parse_tcp_packet(mbuf) {
-                Some(pkt) => tcp_seq_after_payload(pkt.tcp_seq, pkt.payload.len()) > seq,
-                None => false,
-            };
-            if keep {
-                kept[kept_len] = mbuf;
-                kept_len += 1;
-            } else {
-                unsafe { DpdkDevice::free_mbuf(mbuf) };
-            }
-        }
-
-        self.slots = [ptr::null_mut(); RAW_TAIL_RING_CAP];
-        self.head = 0;
-        self.len = 0;
-        for idx in (0..kept_len).rev() {
-            let _ = self.push(kept[idx]);
         }
     }
 
@@ -187,18 +168,24 @@ impl Iterator for TailRingRevIter<'_> {
         if self.remaining == 0 {
             return None;
         }
+        let emitted = self.ring.len - self.remaining;
         self.remaining -= 1;
-        let idx = (self.ring.head + self.remaining) % RAW_TAIL_RING_CAP;
+        let idx = (self.ring.head + emitted) % RAW_TAIL_RING_CAP;
         Some(self.ring.slots[idx])
     }
 }
 
 struct TailConn {
     handle: RawTailHandle,
-    tuple: RawTailTuple,
     rss_hash: Option<u32>,
     ring: TailRing,
+    record_bytes: Vec<u8>,
+    segments: Vec<TailSegment>,
+    callback: Option<RawTailCallback>,
+    callback_ctx: *mut (),
     dirty: bool,
+    poll_generation: u64,
+    active: bool,
 }
 
 impl Drop for TailConn {
@@ -228,21 +215,65 @@ impl RawTailTable {
         }
     }
 
-    pub(crate) fn register(&mut self, tuple: RawTailTuple) -> RawTailHandle {
+    pub(crate) fn register(&mut self, tuple: RawTailTuple) -> io::Result<RawTailHandle> {
+        let rss_hash = tuple.rss_hash();
+        if let Some(existing_id) = self.rss_to_id.get(&rss_hash) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "raw-tail RSS hash collision rss={} existing_id={}",
+                    rss_hash, existing_id
+                ),
+            ));
+        }
         let id = self.next_id;
         self.next_id = self
             .next_id
             .checked_add(1)
             .expect("raw-tail handle id overflow");
         let handle = RawTailHandle::new(id, self.worker_index);
+        self.rss_to_id.insert(rss_hash, handle.id);
         self.conns.push(Some(TailConn {
             handle,
-            tuple,
-            rss_hash: None,
+            rss_hash: Some(rss_hash),
             ring: TailRing::new(),
+            record_bytes: Vec::with_capacity(RAW_TAIL_MAX_TLS_RECORD),
+            segments: Vec::with_capacity(RAW_TAIL_RING_CAP),
+            callback: None,
+            callback_ctx: ptr::null_mut(),
             dirty: false,
+            poll_generation: 0,
+            active: false,
         }));
-        handle
+        Ok(handle)
+    }
+
+    pub(crate) fn activate(&mut self, handle: RawTailHandle) -> io::Result<()> {
+        let Some((_idx, conn)) = self.find_conn_mut(handle.id) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "raw-tail handle not registered on this worker",
+            ));
+        };
+        conn.active = true;
+        Ok(())
+    }
+
+    pub(crate) fn set_callback(
+        &mut self,
+        handle: RawTailHandle,
+        ctx: *mut (),
+        callback: RawTailCallback,
+    ) -> io::Result<()> {
+        let Some((_idx, conn)) = self.find_conn_mut(handle.id) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "raw-tail handle not registered on this worker",
+            ));
+        };
+        conn.callback = Some(callback);
+        conn.callback_ctx = ctx;
+        Ok(())
     }
 
     pub(crate) fn unregister(&mut self, handle: RawTailHandle) {
@@ -263,18 +294,9 @@ impl RawTailTable {
         let rss = unsafe { mbuf_rss_hash(mbuf) };
         if let Some(id) = self.rss_to_id.get(&rss).copied() {
             if let Some((_idx, conn)) = self.find_conn_mut(id) {
-                Self::push_conn_mbuf(conn, mbuf);
-                return true;
-            }
-        }
-
-        let Some(pkt) = parse_tcp_packet(mbuf) else {
-            return false;
-        };
-        for conn in self.conns.iter_mut().flatten() {
-            if conn.rss_hash.is_none() && conn.tuple.matches(&pkt) {
-                conn.rss_hash = Some(rss);
-                self.rss_to_id.insert(rss, conn.handle.id);
+                if !conn.active {
+                    return false;
+                }
                 Self::push_conn_mbuf(conn, mbuf);
                 return true;
             }
@@ -283,12 +305,11 @@ impl RawTailTable {
     }
 
     pub(crate) fn flush_acks(&mut self, device: &mut DpdkDevice) {
-        let dirty_ids: Vec<u64> = self.dirty_ids.drain(..).collect();
+        let dirty_ids = self.dirty_ids.clone();
         for id in dirty_ids {
             let Some((_idx, conn)) = self.find_conn_mut(id) else {
                 continue;
             };
-            conn.dirty = false;
             let Some(mbuf) = conn.ring.newest_to_oldest().next() else {
                 continue;
             };
@@ -304,82 +325,16 @@ impl RawTailTable {
         device.flush_tx();
     }
 
-    pub(crate) fn poll_tls_records<F>(
-        &mut self,
-        handle: RawTailHandle,
-        scratch: &mut [u8],
-        mut f: F,
-    ) -> io::Result<RawTailPoll>
-    where
-        F: FnMut(RawTailRecord<'_>) -> bool,
-    {
-        if scratch.len() < RAW_TAIL_MAX_TLS_RECORD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "raw-tail scratch buffer is smaller than one TLS record",
-            ));
-        }
-        let Some((_idx, conn)) = self.find_conn_mut(handle.id) else {
-            return Ok(RawTailPoll::UnknownHandle);
-        };
-
-        let mut segments = [Segment {
-            seq: 0,
-            payload_ptr: ptr::null(),
-            payload_len: 0,
-        }; RAW_TAIL_RING_CAP];
-        let mut segment_len = 0usize;
-        for mbuf in conn.ring.newest_to_oldest() {
-            let Some(pkt) = parse_tcp_packet(mbuf) else {
+    pub(crate) fn yield_dirty_records(&mut self) {
+        let dirty_ids: Vec<u64> = self.dirty_ids.drain(..).collect();
+        for id in dirty_ids {
+            let Some((_idx, conn)) = self.find_conn_mut(id) else {
                 continue;
             };
-            if pkt.payload.is_empty() {
-                continue;
-            }
-            segments[segment_len] = Segment {
-                seq: pkt.tcp_seq,
-                payload_ptr: pkt.payload.as_ptr(),
-                payload_len: pkt.payload.len(),
-            };
-            segment_len += 1;
-            if segment_len == RAW_TAIL_RING_CAP {
-                break;
-            }
+            conn.dirty = false;
+            Self::yield_latest_tls_records(conn);
+            conn.ring.drain_free();
         }
-
-        let Some(rss_hash) = conn.rss_hash else {
-            return Ok(RawTailPoll::NoRecord);
-        };
-        for seg_idx in 0..segment_len {
-            let seg = segments[seg_idx];
-            let payload = unsafe { std::slice::from_raw_parts(seg.payload_ptr, seg.payload_len) };
-            let mut offset = payload.len().saturating_sub(5);
-            loop {
-                if looks_like_tls_header(&payload[offset..]) {
-                    let record_len = 5 + u16::from_be_bytes([payload[offset + 3], payload[offset + 4]]) as usize;
-                    let start_seq = seg.seq.wrapping_add(offset as u32);
-                    if copy_tcp_range(&segments[..segment_len], start_seq, record_len, scratch) {
-                        let record = RawTailRecord {
-                            handle,
-                            rss_hash,
-                            tcp_seq: start_seq,
-                            tcp_seq_after_record: start_seq.wrapping_add(record_len as u32),
-                            bytes: &scratch[..record_len],
-                        };
-                        if f(record) {
-                            conn.ring.release_before_tcp_seq(record.tcp_seq_after_record);
-                            return Ok(RawTailPoll::Accepted);
-                        }
-                    }
-                }
-                if offset == 0 {
-                    break;
-                }
-                offset -= 1;
-            }
-        }
-
-        Ok(RawTailPoll::NoRecord)
     }
 
     fn push_conn_mbuf(conn: &mut TailConn, mbuf: *mut ffi::rte_mbuf) {
@@ -397,6 +352,63 @@ impl RawTailTable {
             if conn.dirty {
                 self.dirty_ids.push(conn.handle.id);
             }
+        }
+    }
+
+    fn yield_latest_tls_records(conn: &mut TailConn) {
+        let (Some(callback), Some(rss_hash)) = (conn.callback, conn.rss_hash) else {
+            return;
+        };
+        conn.poll_generation = conn.poll_generation.wrapping_add(1);
+        let poll_generation = conn.poll_generation;
+        conn.segments.clear();
+        let mut inferred_payload_offset = None;
+        let mut inferred_next_seq = None;
+        for mbuf in conn.ring.newest_to_oldest() {
+            let Some(segment) = build_tail_segment(mbuf, inferred_payload_offset, inferred_next_seq) else {
+                continue;
+            };
+            inferred_payload_offset = Some(segment.payload_offset);
+            inferred_next_seq = Some(segment.tcp_seq);
+            if segment.payload.len() < 5 {
+                conn.segments.push(segment);
+                continue;
+            }
+            let mut offset = segment.payload.len() - 5;
+            loop {
+                if looks_like_tls_header(&segment.payload[offset..]) {
+                    let record_len =
+                        5 + u16::from_be_bytes([segment.payload[offset + 3], segment.payload[offset + 4]]) as usize;
+                    let start_seq = segment.tcp_seq.wrapping_add(offset as u32);
+                    conn.record_bytes.resize(record_len, 0);
+                    conn.segments.push(segment);
+                    if copy_tcp_range_from_segments(
+                        &conn.segments,
+                        start_seq,
+                        record_len,
+                        &mut conn.record_bytes,
+                    ) {
+                        let record = RawTailRecord {
+                            handle: conn.handle,
+                            rss_hash,
+                            tcp_seq: start_seq,
+                            tcp_seq_after_record: start_seq.wrapping_add(record_len as u32),
+                            bytes: &conn.record_bytes[..record_len],
+                            poll_generation,
+                        };
+                        match unsafe { callback(conn.callback_ctx, record) } {
+                            RawTailCallbackResult::Accepted => return,
+                            RawTailCallbackResult::NeedPrevious | RawTailCallbackResult::Rejected => {}
+                        }
+                    }
+                    conn.segments.pop();
+                }
+                if offset == 0 {
+                    break;
+                }
+                offset -= 1;
+            }
+            conn.segments.push(segment);
         }
     }
 
@@ -420,6 +432,7 @@ pub(crate) struct ParsedTcpPacket<'a> {
     pub tcp_seq: u32,
     pub tcp_ack: u32,
     pub payload: &'a [u8],
+    pub payload_offset: usize,
 }
 
 pub(crate) fn parse_tcp_packet(mbuf: *mut ffi::rte_mbuf) -> Option<ParsedTcpPacket<'static>> {
@@ -473,7 +486,72 @@ pub(crate) fn parse_tcp_packet(mbuf: *mut ffi::rte_mbuf) -> Option<ParsedTcpPack
         tcp_seq,
         tcp_ack,
         payload: &tcp[data_offset..],
+        payload_offset: ETHERNET_HEADER_LEN + ihl + data_offset,
     })
+}
+
+#[derive(Clone, Copy)]
+struct TailSegment {
+    tcp_seq: u32,
+    payload_offset: usize,
+    payload: &'static [u8],
+}
+
+fn build_tail_segment(
+    mbuf: *mut ffi::rte_mbuf,
+    known_payload_offset: Option<usize>,
+    next_seq: Option<u32>,
+) -> Option<TailSegment> {
+    if let (Some(payload_offset), Some(next_seq)) = (known_payload_offset, next_seq) {
+        let data = unsafe { mbuf_data(mbuf) }?;
+        if data.len() < payload_offset {
+            return None;
+        }
+        let payload = &data[payload_offset..];
+        let tcp_seq = next_seq.wrapping_sub(payload.len() as u32);
+        return Some(TailSegment {
+            tcp_seq,
+            payload_offset,
+            payload,
+        });
+    }
+
+    let pkt = parse_tcp_packet(mbuf)?;
+    Some(TailSegment {
+        tcp_seq: pkt.tcp_seq,
+        payload_offset: pkt.payload_offset,
+        payload: pkt.payload,
+    })
+}
+
+fn toeplitz_hash(input: &[u8], key: &[u8]) -> u32 {
+    let required_key_bits = input.len() * 8 + 32;
+    if key.len() * 8 < required_key_bits {
+        panic!(
+            "RSS key too short: key_bits={} required_bits={}",
+            key.len() * 8,
+            required_key_bits
+        );
+    }
+    let mut hash = 0u32;
+    for bit_idx in 0..input.len() * 8 {
+        let input_byte = input[bit_idx / 8];
+        let input_mask = 0x80u8 >> (bit_idx % 8);
+        if input_byte & input_mask == 0 {
+            continue;
+        }
+        let mut key_window = 0u32;
+        for key_bit in 0..32 {
+            let idx = bit_idx + key_bit;
+            let key_byte = key[idx / 8];
+            let key_mask = 0x80u8 >> (idx % 8);
+            if key_byte & key_mask != 0 {
+                key_window |= 1u32 << (31 - key_bit);
+            }
+        }
+        hash ^= key_window;
+    }
+    hash
 }
 
 #[inline(always)]
@@ -493,7 +571,12 @@ fn looks_like_tls_header(buf: &[u8]) -> bool {
     len > 0 && len <= 16_640
 }
 
-fn copy_tcp_range(segments: &[Segment], start_seq: u32, len: usize, out: &mut [u8]) -> bool {
+fn copy_tcp_range_from_segments(
+    segments_newest_to_oldest: &[TailSegment],
+    start_seq: u32,
+    len: usize,
+    out: &mut [u8],
+) -> bool {
     if len > out.len() {
         return false;
     }
@@ -501,13 +584,12 @@ fn copy_tcp_range(segments: &[Segment], start_seq: u32, len: usize, out: &mut [u
     while copied < len {
         let want_seq = start_seq.wrapping_add(copied as u32);
         let mut found = false;
-        for seg in segments {
-            let seg_end = seg.seq.wrapping_add(seg.payload_len as u32);
-            if seq_in_range(want_seq, seg.seq, seg_end) {
-                let off = want_seq.wrapping_sub(seg.seq) as usize;
-                let take = (seg.payload_len - off).min(len - copied);
-                let src = unsafe { std::slice::from_raw_parts(seg.payload_ptr.add(off), take) };
-                out[copied..copied + take].copy_from_slice(src);
+        for segment in segments_newest_to_oldest {
+            let seg_end = segment.tcp_seq.wrapping_add(segment.payload.len() as u32);
+            if seq_in_range(want_seq, segment.tcp_seq, seg_end) {
+                let off = want_seq.wrapping_sub(segment.tcp_seq) as usize;
+                let take = (segment.payload.len() - off).min(len - copied);
+                out[copied..copied + take].copy_from_slice(&segment.payload[off..off + take]);
                 copied += take;
                 found = true;
                 break;

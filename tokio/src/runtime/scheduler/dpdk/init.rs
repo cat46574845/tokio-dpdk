@@ -11,6 +11,9 @@ use std::io;
 
 use super::device::DpdkDevice;
 use super::ffi;
+use super::raw_tail::RAW_TAIL_RSS_KEY;
+
+const RTE_ETH_RSS_NONFRAG_IPV4_TCP: u64 = 1u64 << 4;
 
 /// A fully initialized DPDK worker for multi-queue mode.
 ///
@@ -155,8 +158,25 @@ pub(crate) fn init_port(
         ));
     }
 
-    // Configure the port
-    let port_conf: ffi::rte_eth_conf = unsafe { std::mem::zeroed() };
+    // Configure the port with an explicit RSS key so raw-tail can compute and
+    // validate per-flow hashes before diverting packets away from smoltcp.
+    let mut port_conf: ffi::rte_eth_conf = unsafe { std::mem::zeroed() };
+    if dev_info.hash_key_size as usize > RAW_TAIL_RSS_KEY.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "DPDK device RSS key size {} exceeds raw-tail key size {}",
+                dev_info.hash_key_size,
+                RAW_TAIL_RSS_KEY.len()
+            ),
+        ));
+    }
+    port_conf.rxmode.mq_mode = ffi::rte_eth_rx_mq_mode_RTE_ETH_MQ_RX_RSS;
+    port_conf.rx_adv_conf.rss_conf.rss_key = RAW_TAIL_RSS_KEY.as_ptr() as *mut u8;
+    port_conf.rx_adv_conf.rss_conf.rss_key_len = dev_info.hash_key_size;
+    port_conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP;
+    port_conf.rx_adv_conf.rss_conf.algorithm =
+        ffi::rte_eth_hash_function_RTE_ETH_HASH_FUNCTION_TOEPLITZ;
     let ret =
         unsafe { ffi::rte_eth_dev_configure(port_id, nb_rx_queues, nb_tx_queues, &port_conf) };
     if ret != 0 {

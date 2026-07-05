@@ -19,7 +19,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
 use super::device::DpdkDevice;
-use super::raw_tail::{RawTailHandle, RawTailPoll, RawTailRecord, RawTailTable, RawTailTuple};
+use super::raw_tail::{RawTailCallback, RawTailHandle, RawTailTable, RawTailTuple};
 
 // =============================================================================
 // Constants
@@ -254,15 +254,15 @@ impl DpdkDriver {
     pub(crate) fn poll(&mut self, now: Instant) -> bool {
         let smol_now =
             SmolInstant::from_millis(now.duration_since(self.start_time).as_millis() as i64);
-
-        // Flush pending TX packets first
+        // Flush pending TX packets first.
         self.device.flush_tx();
 
-        // Drain the hardware RX queue to the bottom once per driver tick. Raw-tail
-        // market-data flows are diverted by RSS hash; all other packets are kept
-        // pending for smoltcp below.
-        self.device.drain_rx(&mut self.raw_tail);
+        // Drain the hardware RX queue at poll entry until rx_burst cannot fill
+        // the preallocated batch buffer. The collected mbufs are then processed
+        // newest-first inside this same poll.
+        let received_rx = self.device.drain_rx(&mut self.raw_tail);
         self.raw_tail.flush_acks(&mut self.device);
+        self.raw_tail.yield_dirty_records();
 
         // Poll smoltcp (processes RX, generates TX)
         // smoltcp will automatically call wake() on registered wakers when:
@@ -272,6 +272,7 @@ impl DpdkDriver {
         let result = self
             .iface
             .poll(smol_now, &mut self.device, &mut self.sockets);
+        self.device.drop_unprocessed_rx_pending();
 
         // Flush any new TX packets (e.g., ACKs, SYN-ACK)
         self.device.flush_tx();
@@ -279,8 +280,7 @@ impl DpdkDriver {
         // Note: dispatch_wakers() is no longer needed!
         // smoltcp's native waker mechanism handles wakeups internally.
 
-        // Return true if there was socket state change (activity)
-        matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
+        received_rx || matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
     }
 
     pub(crate) fn activate_raw_tail_for_socket(
@@ -297,23 +297,35 @@ impl DpdkDriver {
         let local_addr = endpoint_to_socket_addr(local)?;
         let remote_addr = endpoint_to_socket_addr(remote)?;
         let tuple = RawTailTuple::from_addrs(local_addr, remote_addr)?;
-        Ok(self.raw_tail.register(tuple))
+        let raw_tail = self.raw_tail.register(tuple)?;
+        self.raw_tail.activate(raw_tail)?;
+        Ok(raw_tail)
+    }
+
+    pub(crate) fn reserve_raw_tail(
+        &mut self,
+        local_addr: std::net::SocketAddr,
+        remote_addr: std::net::SocketAddr,
+    ) -> std::io::Result<RawTailHandle> {
+        let tuple = RawTailTuple::from_addrs(local_addr, remote_addr)?;
+        self.raw_tail.register(tuple)
+    }
+
+    pub(crate) fn activate_raw_tail(&mut self, handle: RawTailHandle) -> std::io::Result<()> {
+        self.raw_tail.activate(handle)
     }
 
     pub(crate) fn unregister_raw_tail(&mut self, handle: RawTailHandle) {
         self.raw_tail.unregister(handle);
     }
 
-    pub(crate) fn poll_raw_tail_tls<F>(
+    pub(crate) fn set_raw_tail_callback(
         &mut self,
         handle: RawTailHandle,
-        scratch: &mut [u8],
-        f: F,
-    ) -> std::io::Result<RawTailPoll>
-    where
-        F: FnMut(RawTailRecord<'_>) -> bool,
-    {
-        self.raw_tail.poll_tls_records(handle, scratch, f)
+        ctx: *mut (),
+        callback: RawTailCallback,
+    ) -> std::io::Result<()> {
+        self.raw_tail.set_callback(handle, ctx, callback)
     }
 
     /// Create a new TCP socket using pre-allocated buffers from the pool.
