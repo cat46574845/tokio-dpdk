@@ -1629,6 +1629,11 @@ impl Context {
         #[cfg(feature = "market-trace")]
         let task_queue_source = task.market_trace_queue_source();
         #[cfg(feature = "market-trace")]
+        let _task_queue_guard = crate::runtime::market_trace::enter_task_queue(
+            task_queue_source,
+            task_queue_wait_ns,
+        );
+        #[cfg(feature = "market-trace")]
         let _trace_scope = crate::runtime::market_trace::scope(
             crate::runtime::market_trace::SPAN_DPDK_RUN_TASK,
             crate::runtime::market_trace::dpdk_track(self.worker.index),

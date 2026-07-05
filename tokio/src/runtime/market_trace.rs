@@ -5,6 +5,8 @@ pub(crate) type EndHook = fn(start_ns: u64, span_id: u16, track_id: u32, aux: u6
 pub(crate) type CompleteHook =
     fn(start_ns: u64, dur_ns: u64, span_id: u16, track_id: u32, aux: u64);
 pub(crate) type CounterHook = fn(counter_id: u16, track_id: u32, value: u64);
+pub(crate) type TaskQueueEnterHook = fn(queue_source: u8, queue_wait_ns: u64);
+pub(crate) type TaskQueueExitHook = fn();
 
 pub(crate) const TRACK_TOKIO_CURRENT: u32 = 40_000;
 pub(crate) const TRACK_DPDK_BASE: u32 = 41_000;
@@ -38,7 +40,13 @@ struct Hooks {
     counter: CounterHook,
 }
 
+struct TaskQueueHooks {
+    enter: TaskQueueEnterHook,
+    exit: TaskQueueExitHook,
+}
+
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
+static TASK_QUEUE_HOOKS: OnceLock<TaskQueueHooks> = OnceLock::new();
 static SCHED_DETAIL: OnceLock<bool> = OnceLock::new();
 
 pub(crate) const QUEUE_SOURCE_UNKNOWN: u8 = 0;
@@ -83,6 +91,42 @@ pub fn set_hooks(
             counter,
         })
         .map_err(|_| ())
+}
+
+/// Registers hooks that expose the currently polled task queue source to the host trace recorder.
+pub fn set_task_queue_hooks(
+    enter: fn(queue_source: u8, queue_wait_ns: u64),
+    exit: fn(),
+) -> Result<(), ()> {
+    TASK_QUEUE_HOOKS
+        .set(TaskQueueHooks { enter, exit })
+        .map_err(|_| ())
+}
+
+pub(crate) struct TaskQueueGuard {
+    active: bool,
+}
+
+impl Drop for TaskQueueGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.active {
+            if let Some(hooks) = TASK_QUEUE_HOOKS.get() {
+                (hooks.exit)();
+            }
+        }
+    }
+}
+
+#[inline(always)]
+pub(crate) fn enter_task_queue(queue_source: u8, queue_wait_ns: u64) -> TaskQueueGuard {
+    let active = if let Some(hooks) = TASK_QUEUE_HOOKS.get() {
+        (hooks.enter)(queue_source, queue_wait_ns);
+        true
+    } else {
+        false
+    };
+    TaskQueueGuard { active }
 }
 
 #[inline(always)]
