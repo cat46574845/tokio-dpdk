@@ -1327,11 +1327,15 @@ impl Context {
                         // Wrap in coop budget so the block_on future yields
                         // fairly with spawned tasks.
                         #[cfg(feature = "market-trace")]
-                        let _trace_scope = crate::runtime::market_trace::scope(
-                            crate::runtime::market_trace::SPAN_DPDK_BLOCK_ON_POLL,
-                            crate::runtime::market_trace::dpdk_track(self.worker.index),
-                            0,
-                        );
+                        let _trace_scope = if crate::runtime::market_trace::sched_detail_enabled() {
+                            Some(crate::runtime::market_trace::scope(
+                                crate::runtime::market_trace::SPAN_DPDK_BLOCK_ON_POLL,
+                                crate::runtime::market_trace::dpdk_track(self.worker.index),
+                                0,
+                            ))
+                        } else {
+                            None
+                        };
                         let poll_result = crate::task::coop::budget(|| {
                             (state.poll_fn)(&mut cx)
                         });
