@@ -469,6 +469,26 @@ impl<S: 'static> Notified<S> {
         self.0.header()
     }
 
+    #[cfg(feature = "dpdk")]
+    pub(crate) fn dpdk_set_worker_affinity(&self, worker_index: usize) {
+        self.header().dpdk_worker_affinity.store(
+            worker_index,
+            crate::loom::sync::atomic::Ordering::Release,
+        );
+    }
+
+    #[cfg(feature = "dpdk")]
+    pub(crate) fn dpdk_worker_affinity(&self) -> Option<usize> {
+        let worker_index = self.header().dpdk_worker_affinity.load(
+            crate::loom::sync::atomic::Ordering::Acquire,
+        );
+        if worker_index == usize::MAX {
+            None
+        } else {
+            Some(worker_index)
+        }
+    }
+
     #[cfg(feature = "sched-probe")]
     pub(crate) fn sched_probe_mark_queued(&self) {
         let queued_ns = crate::runtime::sched_probe::now_ns().max(1);

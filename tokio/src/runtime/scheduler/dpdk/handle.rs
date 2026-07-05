@@ -153,6 +153,27 @@ impl Handle {
 
     /// Schedules a task
     pub(crate) fn schedule_task(&self, task: WorkerNotified, is_yield: bool) {
+        if let Some(worker_index) = task.dpdk_worker_affinity() {
+            worker::with_current(|maybe_cx| {
+                if let Some(cx) = maybe_cx {
+                    let same_runtime = std::ptr::eq(
+                        &cx.worker.handle.shared as *const _,
+                        &self.shared as *const _,
+                    );
+
+                    if same_runtime && worker::current_worker_index() == Some(worker_index) {
+                        if let Some(core) = cx.core.borrow_mut().as_mut() {
+                            self.schedule_local(core, task, is_yield);
+                            return;
+                        }
+                    }
+                }
+
+                self.push_worker_task(worker_index, task);
+            });
+            return;
+        }
+
         // Try to schedule locally if we're on a worker thread
         worker::with_current(|maybe_cx| {
             if let Some(cx) = maybe_cx {
@@ -351,6 +372,7 @@ impl Handle {
         });
 
         if let Some(task) = notified {
+            task.dpdk_set_worker_affinity(worker_index);
             // If already on the target worker, schedule locally for lower latency
             if worker::current_worker_index() == Some(worker_index) {
                 worker::with_current(|ctx| {
@@ -416,6 +438,7 @@ impl Handle {
 
             // Schedule to local queue
             if let Some(task) = notified {
+                task.dpdk_set_worker_affinity(cx.worker.index);
                 if let Some(core) = cx.core.borrow_mut().as_mut() {
                     me.schedule_local(core, task, false);
                 }

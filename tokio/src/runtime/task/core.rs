@@ -178,6 +178,9 @@ pub(crate) struct Header {
     #[cfg(feature = "market-trace")]
     pub(super) market_trace_queue_source: crate::loom::sync::atomic::AtomicU8,
 
+    #[cfg(feature = "dpdk")]
+    pub(super) dpdk_worker_affinity: crate::loom::sync::atomic::AtomicUsize,
+
     /// Table of function pointers for executing actions on the task.
     pub(super) vtable: &'static Vtable,
 
@@ -255,6 +258,8 @@ impl<T: Future, S: Schedule> Cell<T, S> {
                 market_trace_queue_source: crate::loom::sync::atomic::AtomicU8::new(
                     crate::runtime::market_trace::QUEUE_SOURCE_UNKNOWN,
                 ),
+                #[cfg(feature = "dpdk")]
+                dpdk_worker_affinity: crate::loom::sync::atomic::AtomicUsize::new(usize::MAX),
                 vtable,
                 owner_id: UnsafeCell::new(None),
                 #[cfg(all(tokio_unstable, feature = "tracing"))]
