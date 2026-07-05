@@ -22,6 +22,37 @@ use super::worker::{self, Notified as WorkerNotified, Shared};
 #[cfg(feature = "market-trace")]
 static OUTSIDE_WORKER_SCHEDULE_BACKTRACES: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(feature = "market-trace")]
+fn log_task_spawn(
+    kind: &str,
+    id: task::Id,
+    worker_index: Option<usize>,
+    caller: &'static std::panic::Location<'static>,
+) {
+    if std::env::var_os("TOKIO_DPDK_LOG_TASK_SPAWN").is_none() {
+        return;
+    }
+    match worker_index {
+        Some(worker_index) => eprintln!(
+            "[tokio-dpdk] task_spawn id={} kind={} worker={} file={} line={} column={}",
+            id.as_u64(),
+            kind,
+            worker_index,
+            caller.file(),
+            caller.line(),
+            caller.column()
+        ),
+        None => eprintln!(
+            "[tokio-dpdk] task_spawn id={} kind={} worker=none file={} line={} column={}",
+            id.as_u64(),
+            kind,
+            caller.file(),
+            caller.line(),
+            caller.column()
+        ),
+    }
+}
+
 /// Handle to the DPDK scheduler
 pub(crate) struct Handle {
     /// Task spawner (shared state)
@@ -124,6 +155,8 @@ impl Handle {
         T: Future + Send + 'static,
         T::Output: Send + 'static,
     {
+        #[cfg(feature = "market-trace")]
+        let caller = std::panic::Location::caller();
         let (handle, notified) = me.shared.owned.bind(future, me.clone(), id, spawned_at);
 
         me.task_hooks.spawn(&TaskMeta {
@@ -131,6 +164,9 @@ impl Handle {
             spawned_at,
             _phantom: Default::default(),
         });
+
+        #[cfg(feature = "market-trace")]
+        log_task_spawn("spawn", id, None, caller);
 
         me.schedule_option_task_without_yield(notified);
 
@@ -356,6 +392,8 @@ impl Handle {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        #[cfg(feature = "market-trace")]
+        let caller = std::panic::Location::caller();
         assert!(
             worker_index < me.shared.remotes.len(),
             "spawn_on_worker: worker_index {} is out of range (num_workers: {})",
@@ -370,6 +408,9 @@ impl Handle {
             spawned_at,
             _phantom: Default::default(),
         });
+
+        #[cfg(feature = "market-trace")]
+        log_task_spawn("spawn_on_worker", id, Some(worker_index), caller);
 
         if let Some(task) = notified {
             task.dpdk_set_worker_affinity(worker_index);
@@ -416,6 +457,8 @@ impl Handle {
         F: Future + 'static,
         F::Output: 'static,
     {
+        #[cfg(feature = "market-trace")]
+        let caller = std::panic::Location::caller();
         worker::with_current(|maybe_cx| {
             let cx = maybe_cx?;
 
@@ -435,6 +478,9 @@ impl Handle {
                 spawned_at,
                 _phantom: Default::default(),
             });
+
+            #[cfg(feature = "market-trace")]
+            log_task_spawn("spawn_local", id, Some(cx.worker.index), caller);
 
             // Schedule to local queue
             if let Some(task) = notified {

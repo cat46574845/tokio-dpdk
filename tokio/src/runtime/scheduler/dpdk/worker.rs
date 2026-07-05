@@ -25,6 +25,8 @@ use super::queue::{self, Local};
 use super::stats::Stats;
 
 use std::sync::atomic::Ordering;
+#[cfg(feature = "market-trace")]
+use std::sync::OnceLock;
 use std::task::Poll;
 use std::time::Instant;
 
@@ -531,6 +533,23 @@ pub(crate) type RunResult = Result<Box<Core>, ()>;
 
 /// A notified task handle
 pub(crate) type Notified = task::Notified<Arc<Handle>>;
+
+#[cfg(feature = "market-trace")]
+fn long_task_threshold_ns() -> u64 {
+    static THRESHOLD_NS: OnceLock<u64> = OnceLock::new();
+    *THRESHOLD_NS.get_or_init(|| match std::env::var("TOKIO_DPDK_LOG_LONG_TASK_US") {
+        Ok(value) => {
+            let threshold_us = value
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("invalid TOKIO_DPDK_LOG_LONG_TASK_US={value}: {e}"));
+            threshold_us
+                .checked_mul(1_000)
+                .unwrap_or_else(|| panic!("TOKIO_DPDK_LOG_LONG_TASK_US overflow: {value}"))
+        }
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(e) => panic!("read TOKIO_DPDK_LOG_LONG_TASK_US failed: {e}"),
+    })
+}
 
 /// Value picked out of thin-air for LIFO polls.
 const MAX_LIFO_POLLS_PER_TICK: usize = 3;
@@ -1629,6 +1648,8 @@ impl Context {
         #[cfg(feature = "market-trace")]
         let task_queue_source = task.market_trace_queue_source();
         #[cfg(feature = "market-trace")]
+        let task_id = task.market_trace_task_id();
+        #[cfg(feature = "market-trace")]
         let _task_queue_guard = crate::runtime::market_trace::enter_task_queue(
             task_queue_source,
             task_queue_wait_ns,
@@ -1639,9 +1660,26 @@ impl Context {
             crate::runtime::market_trace::dpdk_track(self.worker.index),
             crate::runtime::market_trace::pack_task_aux(task_queue_source, task_queue_wait_ns),
         );
+        #[cfg(feature = "market-trace")]
+        let run_start_ns = crate::runtime::market_trace::now_ns();
         crate::task::coop::budget(|| {
             task.run();
         });
+        #[cfg(feature = "market-trace")]
+        {
+            let run_dur_ns = crate::runtime::market_trace::now_ns().saturating_sub(run_start_ns);
+            let threshold_ns = long_task_threshold_ns();
+            if threshold_ns != 0 && run_dur_ns >= threshold_ns {
+                eprintln!(
+                    "[tokio-dpdk] long_task id={} worker={} dur_ns={} queue_source={} queue_wait_ns={}",
+                    task_id,
+                    self.worker.index,
+                    run_dur_ns,
+                    task_queue_source,
+                    task_queue_wait_ns
+                );
+            }
+        }
 
         // End poll tracking (LIFO stays disabled in DPDK scheduler)
         if let Some(core) = self.core.borrow_mut().as_mut() {

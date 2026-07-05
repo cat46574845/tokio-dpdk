@@ -579,6 +579,13 @@ impl<S: Schedule> LocalNotified<S> {
         )
     }
 
+    #[cfg(feature = "market-trace")]
+    pub(crate) fn market_trace_task_id(&self) -> u64 {
+        // Safety: the LocalNotified owns a valid task header for the scheduler
+        // that is about to poll this task.
+        unsafe { Header::get_id(self.task.raw.header_ptr()).as_u64() }
+    }
+
     /// Runs the task.
     pub(crate) fn run(self) {
         let raw = self.task.raw;
