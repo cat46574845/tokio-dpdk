@@ -770,7 +770,37 @@ impl LocalSet {
                 // task initially. Because `LocalSet` itself is `!Send`, and
                 // `spawn_local` spawns into the `LocalSet` on the current
                 // thread, the invariant is maintained.
-                Some(task) => crate::task::coop::budget(|| task.run()),
+                Some(task) => {
+                    #[cfg(feature = "sched-probe")]
+                    {
+                        let sched_probe_now_ns = crate::runtime::sched_probe::now_ns();
+                        let sched_probe_wait_ns =
+                            task.sched_probe_queue_wait_ns(sched_probe_now_ns);
+                        crate::runtime::sched_probe::record_localset_task_start(
+                            sched_probe_wait_ns,
+                            unsafe { self.context.shared.local_state.task_queue_len() },
+                            self.context
+                                .shared
+                                .queue
+                                .lock()
+                                .as_ref()
+                                .map_or(0, VecDeque::len),
+                        );
+                    }
+
+                    crate::task::coop::budget(|| {
+                        #[cfg(feature = "sched-probe")]
+                        let sched_probe_poll_start_ns = crate::runtime::sched_probe::now_ns();
+
+                        task.run();
+
+                        #[cfg(feature = "sched-probe")]
+                        crate::runtime::sched_probe::record_localset_task_poll_ns(
+                            crate::runtime::sched_probe::now_ns()
+                                .saturating_sub(sched_probe_poll_start_ns),
+                        );
+                    })
+                }
                 // We have fully drained the queue of notified tasks, so the
                 // local future doesn't need to be notified again — it can wait
                 // until something else wakes a task in the local set.
@@ -1124,7 +1154,14 @@ impl Shared {
                     let mut lock = self.queue.lock();
 
                     if let Some(queue) = lock.as_mut() {
+                        #[cfg(feature = "sched-probe")]
+                        task.sched_probe_mark_queued();
+
                         queue.push_back(task);
+
+                        #[cfg(feature = "sched-probe")]
+                        crate::runtime::sched_probe::record_localset_remote_schedule(queue.len());
+
                         drop(lock);
                         self.waker.wake();
                     }
@@ -1208,8 +1245,22 @@ impl LocalState {
         // the LocalSet.
         self.assert_called_from_owner_thread();
 
-        self.local_queue
-            .with_mut(|ptr| unsafe { (*ptr).push_back(task) });
+        self.local_queue.with_mut(|ptr| unsafe {
+            #[cfg(feature = "sched-probe")]
+            task.sched_probe_mark_queued();
+
+            (*ptr).push_back(task);
+
+            #[cfg(feature = "sched-probe")]
+            crate::runtime::sched_probe::record_localset_local_schedule((*ptr).len());
+        });
+    }
+
+    #[cfg(feature = "sched-probe")]
+    unsafe fn task_queue_len(&self) -> usize {
+        self.assert_called_from_owner_thread();
+
+        self.local_queue.with(|ptr| unsafe { (*ptr).len() })
     }
 
     /// # Safety

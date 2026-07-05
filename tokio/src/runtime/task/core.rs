@@ -172,6 +172,9 @@ pub(crate) struct Header {
     /// Pointer to next task, used with the injection queue.
     pub(super) queue_next: UnsafeCell<Option<NonNull<Header>>>,
 
+    #[cfg(feature = "sched-probe")]
+    pub(super) sched_probe_queued_ns: crate::loom::sync::atomic::AtomicU64,
+
     /// Table of function pointers for executing actions on the task.
     pub(super) vtable: &'static Vtable,
 
@@ -243,6 +246,8 @@ impl<T: Future, S: Schedule> Cell<T, S> {
             Header {
                 state,
                 queue_next: UnsafeCell::new(None),
+                #[cfg(feature = "sched-probe")]
+                sched_probe_queued_ns: crate::loom::sync::atomic::AtomicU64::new(0),
                 vtable,
                 owner_id: UnsafeCell::new(None),
                 #[cfg(all(tokio_unstable, feature = "tracing"))]

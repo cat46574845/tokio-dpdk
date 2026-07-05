@@ -181,6 +181,14 @@ impl Driver {
 
         handle.release_pending_registrations();
 
+        #[cfg(feature = "sched-probe")]
+        let sched_probe_start_ns = crate::runtime::sched_probe::now_ns();
+        #[cfg(feature = "sched-probe")]
+        let sched_probe_max_wait_ns = match max_wait {
+            Some(duration) => Some(duration.as_nanos().min(u128::from(u64::MAX)) as u64),
+            None => None,
+        };
+
         let events = &mut self.events;
 
         // Block waiting for an event to happen, peeling out how many events
@@ -198,7 +206,14 @@ impl Driver {
 
         // Process all the events that came in, dispatching appropriately
         let mut ready_count = 0;
+        #[cfg(feature = "sched-probe")]
+        let mut event_count = 0;
         for event in events.iter() {
+            #[cfg(feature = "sched-probe")]
+            {
+                event_count += 1;
+            }
+
             let token = event.token();
 
             if token == TOKEN_WAKEUP {
@@ -236,6 +251,14 @@ impl Driver {
         }
 
         handle.metrics.incr_ready_count_by(ready_count);
+
+        #[cfg(feature = "sched-probe")]
+        crate::runtime::sched_probe::record_io_turn(
+            crate::runtime::sched_probe::now_ns().saturating_sub(sched_probe_start_ns),
+            ready_count,
+            event_count,
+            sched_probe_max_wait_ns,
+        );
     }
 }
 

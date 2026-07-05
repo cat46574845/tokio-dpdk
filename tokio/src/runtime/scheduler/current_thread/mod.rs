@@ -337,12 +337,18 @@ impl Core {
     }
 
     fn push_task(&mut self, handle: &Handle, task: Notified) {
+        #[cfg(feature = "sched-probe")]
+        task.sched_probe_mark_queued();
+
         self.tasks.push_back(task);
         self.metrics.inc_local_schedule_count();
         handle
             .shared
             .worker_metrics
             .set_queue_depth(self.tasks.len());
+
+        #[cfg(feature = "sched-probe")]
+        crate::runtime::sched_probe::record_current_local_schedule(self.tasks.len());
     }
 
     fn submit_metrics(&mut self, handle: &Handle) {
@@ -387,7 +393,15 @@ impl Context {
             core.metrics.about_to_park();
             core.submit_metrics(handle);
 
+            #[cfg(feature = "sched-probe")]
+            let sched_probe_start_ns = crate::runtime::sched_probe::now_ns();
+
             core = self.park_internal(core, handle, &mut driver, None);
+
+            #[cfg(feature = "sched-probe")]
+            crate::runtime::sched_probe::record_current_park_ns(
+                crate::runtime::sched_probe::now_ns().saturating_sub(sched_probe_start_ns),
+            );
 
             core.metrics.unparked();
             core.submit_metrics(handle);
@@ -408,7 +422,15 @@ impl Context {
 
         core.submit_metrics(handle);
 
+        #[cfg(feature = "sched-probe")]
+        let sched_probe_start_ns = crate::runtime::sched_probe::now_ns();
+
         core = self.park_internal(core, handle, &mut driver, Some(Duration::from_millis(0)));
+
+        #[cfg(feature = "sched-probe")]
+        crate::runtime::sched_probe::record_current_park_yield_ns(
+            crate::runtime::sched_probe::now_ns().saturating_sub(sched_probe_start_ns),
+        );
 
         core.driver = Some(driver);
         core
@@ -672,7 +694,16 @@ impl Schedule for Arc<Handle> {
                 self.shared.scheduler_metrics.inc_remote_schedule_count();
 
                 // Schedule the task
+                #[cfg(feature = "sched-probe")]
+                task.sched_probe_mark_queued();
+
                 self.shared.inject.push(task);
+
+                #[cfg(feature = "sched-probe")]
+                crate::runtime::sched_probe::record_current_remote_schedule(
+                    self.shared.inject.len(),
+                );
+
                 self.driver.unpark();
             }
         });
@@ -809,11 +840,32 @@ impl CoreGuard<'_> {
                     #[cfg(tokio_unstable)]
                     let task_meta = task.task_meta();
 
+                    #[cfg(feature = "sched-probe")]
+                    {
+                        let sched_probe_now_ns = crate::runtime::sched_probe::now_ns();
+                        let sched_probe_wait_ns =
+                            task.sched_probe_queue_wait_ns(sched_probe_now_ns);
+                        crate::runtime::sched_probe::record_current_task_start(
+                            sched_probe_wait_ns,
+                            core.tasks.len(),
+                            handle.shared.inject.len(),
+                        );
+                    }
+
                     let (c, ()) = context.run_task(core, || {
                         #[cfg(tokio_unstable)]
                         context.handle.task_hooks.poll_start_callback(&task_meta);
 
+                        #[cfg(feature = "sched-probe")]
+                        let sched_probe_poll_start_ns = crate::runtime::sched_probe::now_ns();
+
                         task.run();
+
+                        #[cfg(feature = "sched-probe")]
+                        crate::runtime::sched_probe::record_current_task_poll_ns(
+                            crate::runtime::sched_probe::now_ns()
+                                .saturating_sub(sched_probe_poll_start_ns),
+                        );
 
                         #[cfg(tokio_unstable)]
                         context.handle.task_hooks.poll_stop_callback(&task_meta);

@@ -88,6 +88,8 @@ time = []
 dpdk = ["rt-multi-thread", "dep:smoltcp", "dep:serde", "dep:serde_json"]
 # DPDK scheduler debugging - enables detailed timing measurements
 dpdk-debug = ["dpdk"]
+# Current-thread scheduler load probe for production latency experiments.
+sched-probe = []
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.
 io-uring = ["dep:io-uring", "libc", "mio/os-poll", "mio/os-ext", "dep:slab"]
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.

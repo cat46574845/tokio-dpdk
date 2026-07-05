@@ -575,6 +575,9 @@ cfg_rt! {
     mod runtime;
     pub use runtime::{Runtime, RuntimeFlavor, is_rt_shutdown_err};
 
+    #[cfg(feature = "sched-probe")]
+    pub mod sched_probe;
+
     mod id;
     pub use id::Id;
 
