@@ -164,11 +164,16 @@ impl Handle {
                         self.schedule_local(core, task, is_yield);
                         return;
                     }
+                    self.push_remote_task_no_core(task);
+                    return;
                 }
+
+                self.push_remote_task_different_runtime(task);
+                return;
             }
 
             // Fall back to global queue
-            self.push_remote_task(task);
+            self.push_remote_task_outside_worker(task);
         });
     }
 
@@ -234,13 +239,66 @@ impl Handle {
     /// Pushes a task to the global queue
     pub(crate) fn push_remote_task(&self, task: WorkerNotified) {
         #[cfg(feature = "market-trace")]
-        task.market_trace_mark_queued(crate::runtime::market_trace::QUEUE_SOURCE_SHARED_INJECT);
+        self.push_remote_task_with_source(
+            task,
+            crate::runtime::market_trace::QUEUE_SOURCE_SHARED_INJECT,
+        );
+        #[cfg(not(feature = "market-trace"))]
+        self.push_remote_task_raw(task);
+    }
+
+    #[cfg(feature = "market-trace")]
+    fn push_remote_task_with_source(&self, task: WorkerNotified, queue_source: u8) {
+        task.market_trace_mark_queued(queue_source);
+        self.push_remote_task_raw(task);
+    }
+
+    fn push_remote_task_raw(&self, task: WorkerNotified) {
         // Safety: we hold the synced lock
         unsafe {
             self.shared
                 .inject
                 .push(&mut self.shared.synced.lock().inject, task);
         }
+    }
+
+    #[cfg(feature = "market-trace")]
+    fn push_remote_task_outside_worker(&self, task: WorkerNotified) {
+        self.push_remote_task_with_source(
+            task,
+            crate::runtime::market_trace::QUEUE_SOURCE_SHARED_INJECT_OUTSIDE_WORKER,
+        );
+    }
+
+    #[cfg(not(feature = "market-trace"))]
+    fn push_remote_task_outside_worker(&self, task: WorkerNotified) {
+        self.push_remote_task(task);
+    }
+
+    #[cfg(feature = "market-trace")]
+    fn push_remote_task_different_runtime(&self, task: WorkerNotified) {
+        self.push_remote_task_with_source(
+            task,
+            crate::runtime::market_trace::QUEUE_SOURCE_SHARED_INJECT_DIFFERENT_RUNTIME,
+        );
+    }
+
+    #[cfg(not(feature = "market-trace"))]
+    fn push_remote_task_different_runtime(&self, task: WorkerNotified) {
+        self.push_remote_task(task);
+    }
+
+    #[cfg(feature = "market-trace")]
+    fn push_remote_task_no_core(&self, task: WorkerNotified) {
+        self.push_remote_task_with_source(
+            task,
+            crate::runtime::market_trace::QUEUE_SOURCE_SHARED_INJECT_NO_CORE,
+        );
+    }
+
+    #[cfg(not(feature = "market-trace"))]
+    fn push_remote_task_no_core(&self, task: WorkerNotified) {
+        self.push_remote_task(task);
     }
 
     /// Spawns a `Send` task targeted to a specific worker's queue.

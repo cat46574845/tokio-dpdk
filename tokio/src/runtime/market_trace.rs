@@ -47,6 +47,9 @@ pub(crate) const QUEUE_SOURCE_LOCAL_OVERFLOW: u8 = 2;
 pub(crate) const QUEUE_SOURCE_LIFO: u8 = 3;
 pub(crate) const QUEUE_SOURCE_PER_WORKER_INJECT: u8 = 4;
 pub(crate) const QUEUE_SOURCE_SHARED_INJECT: u8 = 5;
+pub(crate) const QUEUE_SOURCE_SHARED_INJECT_OUTSIDE_WORKER: u8 = 6;
+pub(crate) const QUEUE_SOURCE_SHARED_INJECT_DIFFERENT_RUNTIME: u8 = 7;
+pub(crate) const QUEUE_SOURCE_SHARED_INJECT_NO_CORE: u8 = 8;
 
 const QUEUE_SOURCE_SHIFT: u64 = 56;
 const QUEUE_WAIT_MASK: u64 = (1u64 << QUEUE_SOURCE_SHIFT) - 1;
