@@ -479,10 +479,14 @@ impl<S: 'static> Notified<S> {
     }
 
     #[cfg(feature = "market-trace")]
-    pub(crate) fn market_trace_mark_queued(&self) {
+    pub(crate) fn market_trace_mark_queued(&self, queue_source: u8) {
         let queued_ns = crate::runtime::market_trace::now_ns().max(1);
         self.header().sched_probe_queued_ns.store(
             queued_ns,
+            crate::loom::sync::atomic::Ordering::Release,
+        );
+        self.header().market_trace_queue_source.store(
+            queue_source,
             crate::loom::sync::atomic::Ordering::Release,
         );
     }
@@ -545,6 +549,14 @@ impl<S: Schedule> LocalNotified<S> {
         } else {
             crate::runtime::market_trace::now_ns().saturating_sub(queued_ns)
         }
+    }
+
+    #[cfg(feature = "market-trace")]
+    pub(crate) fn market_trace_queue_source(&self) -> u8 {
+        self.task.header().market_trace_queue_source.swap(
+            crate::runtime::market_trace::QUEUE_SOURCE_UNKNOWN,
+            crate::loom::sync::atomic::Ordering::AcqRel,
+        )
     }
 
     /// Runs the task.

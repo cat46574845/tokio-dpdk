@@ -20,6 +20,10 @@ pub(crate) const SPAN_DPDK_SMOLTCP_POLL: u16 = 115;
 pub(crate) const SPAN_DPDK_RUN_TASK: u16 = 116;
 pub(crate) const SPAN_DPDK_POLL_DRIVER_LOCK: u16 = 117;
 pub(crate) const SPAN_DPDK_BLOCK_ON_POLL: u16 = 118;
+pub(crate) const SPAN_DPDK_NEXT_TASK: u16 = 119;
+pub(crate) const SPAN_DPDK_POLL_DRIVER_IDLE: u16 = 120;
+pub(crate) const SPAN_DPDK_PROCESS_LOCAL_SPAWN: u16 = 121;
+pub(crate) const SPAN_DPDK_MAINTENANCE: u16 = 122;
 pub(crate) const COUNTER_DPDK_QUEUE_TOTAL_DEPTH: u16 = 130;
 pub(crate) const COUNTER_DPDK_RUN_QUEUE_DEPTH: u16 = 131;
 pub(crate) const COUNTER_DPDK_OVERFLOW_DEPTH: u16 = 132;
@@ -35,6 +39,31 @@ struct Hooks {
 }
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
+static SCHED_DETAIL: OnceLock<bool> = OnceLock::new();
+
+pub(crate) const QUEUE_SOURCE_UNKNOWN: u8 = 0;
+pub(crate) const QUEUE_SOURCE_LOCAL_RUN: u8 = 1;
+pub(crate) const QUEUE_SOURCE_LOCAL_OVERFLOW: u8 = 2;
+pub(crate) const QUEUE_SOURCE_LIFO: u8 = 3;
+pub(crate) const QUEUE_SOURCE_PER_WORKER_INJECT: u8 = 4;
+pub(crate) const QUEUE_SOURCE_SHARED_INJECT: u8 = 5;
+
+const QUEUE_SOURCE_SHIFT: u64 = 56;
+const QUEUE_WAIT_MASK: u64 = (1u64 << QUEUE_SOURCE_SHIFT) - 1;
+
+#[inline(always)]
+pub(crate) fn pack_task_aux(queue_source: u8, queue_wait_ns: u64) -> u64 {
+    ((queue_source as u64) << QUEUE_SOURCE_SHIFT) | queue_wait_ns.min(QUEUE_WAIT_MASK)
+}
+
+#[inline(always)]
+pub(crate) fn sched_detail_enabled() -> bool {
+    *SCHED_DETAIL.get_or_init(|| {
+        std::env::var_os("TOKIO_DPDK_MARKET_TRACE_SCHED_DETAIL")
+            .map(|value| value != "0" && value != "false" && value != "FALSE")
+            .unwrap_or(false)
+    })
+}
 
 /// Registers the host application's trace recorder callbacks.
 pub fn set_hooks(

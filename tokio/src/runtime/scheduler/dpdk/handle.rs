@@ -179,12 +179,12 @@ impl Handle {
         task: WorkerNotified,
         is_yield: bool,
     ) {
-        #[cfg(feature = "market-trace")]
-        task.market_trace_mark_queued();
         core.stats.inc_local_schedule_count();
 
         // If LIFO is enabled and not yielding, use LIFO slot
         if core.lifo_enabled && !is_yield {
+            #[cfg(feature = "market-trace")]
+            task.market_trace_mark_queued(crate::runtime::market_trace::QUEUE_SOURCE_LIFO);
             if let Some(prev) = core.lifo_slot.replace(task) {
                 // Push previous to run queue, overflow to local_overflow if full
                 self.push_to_local_queue_or_overflow(core, prev);
@@ -201,9 +201,13 @@ impl Handle {
     fn push_to_local_queue_or_overflow(&self, core: &mut worker::Core, task: WorkerNotified) {
         // Check if run_queue has space
         if core.run_queue.remaining_slots() > 0 {
+            #[cfg(feature = "market-trace")]
+            task.market_trace_mark_queued(crate::runtime::market_trace::QUEUE_SOURCE_LOCAL_RUN);
             // Safe to push directly (won't trigger Overflow trait)
             core.run_queue.push_back(std::iter::once(task));
         } else {
+            #[cfg(feature = "market-trace")]
+            task.market_trace_mark_queued(crate::runtime::market_trace::QUEUE_SOURCE_LOCAL_OVERFLOW);
             // Queue full - use local overflow (lock-free, same worker)
             core.local_overflow.push_back(task);
             core.stats.incr_overflow_count();
@@ -230,7 +234,7 @@ impl Handle {
     /// Pushes a task to the global queue
     pub(crate) fn push_remote_task(&self, task: WorkerNotified) {
         #[cfg(feature = "market-trace")]
-        task.market_trace_mark_queued();
+        task.market_trace_mark_queued(crate::runtime::market_trace::QUEUE_SOURCE_SHARED_INJECT);
         // Safety: we hold the synced lock
         unsafe {
             self.shared
@@ -349,7 +353,7 @@ impl Handle {
     /// Pushes a task to a specific worker's per-worker inject queue.
     pub(crate) fn push_worker_task(&self, worker_index: usize, task: WorkerNotified) {
         #[cfg(feature = "market-trace")]
-        task.market_trace_mark_queued();
+        task.market_trace_mark_queued(crate::runtime::market_trace::QUEUE_SOURCE_PER_WORKER_INJECT);
         self.shared.remotes[worker_index].per_inject.push(task);
     }
 

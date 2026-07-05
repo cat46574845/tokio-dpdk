@@ -1215,7 +1215,19 @@ impl Context {
             debug::record_poll_driver_end();
 
             // Process any pending factory closures from spawn_local_on
+            #[cfg(feature = "market-trace")]
+            let _local_spawn_trace = if crate::runtime::market_trace::sched_detail_enabled() {
+                Some(crate::runtime::market_trace::scope(
+                    crate::runtime::market_trace::SPAN_DPDK_PROCESS_LOCAL_SPAWN,
+                    crate::runtime::market_trace::dpdk_track(self.worker.index),
+                    0,
+                ))
+            } else {
+                None
+            };
             self.process_local_spawn_queue();
+            #[cfg(feature = "market-trace")]
+            drop(_local_spawn_trace);
 
             // Start tracking scheduled task processing
             if let Some(core) = self.core.borrow_mut().as_mut() {
@@ -1235,7 +1247,24 @@ impl Context {
             let mut tasks_in_batch = 0;
 
             while tasks_in_batch < MAX_TASKS_PER_TICK {
-                if let Some(task) = self.next_task_with_fairness(&mut lifo_polls) {
+                #[cfg(feature = "market-trace")]
+                let next_task_start_ns = if crate::runtime::market_trace::sched_detail_enabled() {
+                    crate::runtime::market_trace::now_ns()
+                } else {
+                    0
+                };
+                let next_task = self.next_task_with_fairness(&mut lifo_polls);
+                #[cfg(feature = "market-trace")]
+                if next_task_start_ns != 0 {
+                    crate::runtime::market_trace::complete(
+                        next_task_start_ns,
+                        crate::runtime::market_trace::now_ns().saturating_sub(next_task_start_ns),
+                        crate::runtime::market_trace::SPAN_DPDK_NEXT_TASK,
+                        crate::runtime::market_trace::dpdk_track(self.worker.index),
+                        u64::from(next_task.is_some()),
+                    );
+                }
+                if let Some(task) = next_task {
                     // Debug: record for first task only
                     #[cfg(feature = "dpdk-debug")]
                     if tasks_in_batch == 0 {
@@ -1300,7 +1329,19 @@ impl Context {
             }
 
             // Maintenance every event_interval ticks (includes defer.wake())
+            #[cfg(feature = "market-trace")]
+            let _maintenance_trace = if crate::runtime::market_trace::sched_detail_enabled() {
+                Some(crate::runtime::market_trace::scope(
+                    crate::runtime::market_trace::SPAN_DPDK_MAINTENANCE,
+                    crate::runtime::market_trace::dpdk_track(self.worker.index),
+                    0,
+                ))
+            } else {
+                None
+            };
             self.maybe_maintenance();
+            #[cfg(feature = "market-trace")]
+            drop(_maintenance_trace);
 
             // Debug: record tick end
             #[cfg(feature = "dpdk-debug")]
@@ -1340,6 +1381,16 @@ impl Context {
                         poll_driver_lock_start_ns,
                         poll_driver_lock_dur_ns,
                         crate::runtime::market_trace::SPAN_DPDK_POLL_DRIVER_LOCK,
+                        track_id,
+                        0,
+                    );
+                } else if crate::runtime::market_trace::sched_detail_enabled() {
+                    let poll_driver_idle_dur_ns = crate::runtime::market_trace::now_ns()
+                        .saturating_sub(poll_driver_lock_start_ns);
+                    crate::runtime::market_trace::complete(
+                        poll_driver_lock_start_ns,
+                        poll_driver_idle_dur_ns,
+                        crate::runtime::market_trace::SPAN_DPDK_POLL_DRIVER_IDLE,
                         track_id,
                         0,
                     );
@@ -1576,10 +1627,12 @@ impl Context {
         #[cfg(feature = "market-trace")]
         let task_queue_wait_ns = task.market_trace_queue_wait_ns();
         #[cfg(feature = "market-trace")]
+        let task_queue_source = task.market_trace_queue_source();
+        #[cfg(feature = "market-trace")]
         let _trace_scope = crate::runtime::market_trace::scope(
             crate::runtime::market_trace::SPAN_DPDK_RUN_TASK,
             crate::runtime::market_trace::dpdk_track(self.worker.index),
-            task_queue_wait_ns,
+            crate::runtime::market_trace::pack_task_aux(task_queue_source, task_queue_wait_ns),
         );
         crate::task::coop::budget(|| {
             task.run();
