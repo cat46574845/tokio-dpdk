@@ -28,27 +28,30 @@ fn log_task_spawn(
     id: task::Id,
     worker_index: Option<usize>,
     caller: &'static std::panic::Location<'static>,
+    future_type: &'static str,
 ) {
     if std::env::var_os("TOKIO_DPDK_LOG_TASK_SPAWN").is_none() {
         return;
     }
     match worker_index {
         Some(worker_index) => eprintln!(
-            "[tokio-dpdk] task_spawn id={} kind={} worker={} file={} line={} column={}",
+            "[tokio-dpdk] task_spawn id={} kind={} worker={} file={} line={} column={} future_type={}",
             id.as_u64(),
             kind,
             worker_index,
             caller.file(),
             caller.line(),
-            caller.column()
+            caller.column(),
+            future_type
         ),
         None => eprintln!(
-            "[tokio-dpdk] task_spawn id={} kind={} worker=none file={} line={} column={}",
+            "[tokio-dpdk] task_spawn id={} kind={} worker=none file={} line={} column={} future_type={}",
             id.as_u64(),
             kind,
             caller.file(),
             caller.line(),
-            caller.column()
+            caller.column(),
+            future_type
         ),
     }
 }
@@ -166,7 +169,7 @@ impl Handle {
         });
 
         #[cfg(feature = "market-trace")]
-        log_task_spawn("spawn", id, None, caller);
+        log_task_spawn("spawn", id, None, caller, std::any::type_name::<T>());
 
         me.schedule_option_task_without_yield(notified);
 
@@ -410,7 +413,13 @@ impl Handle {
         });
 
         #[cfg(feature = "market-trace")]
-        log_task_spawn("spawn_on_worker", id, Some(worker_index), caller);
+        log_task_spawn(
+            "spawn_on_worker",
+            id,
+            Some(worker_index),
+            caller,
+            std::any::type_name::<F>(),
+        );
 
         if let Some(task) = notified {
             task.dpdk_set_worker_affinity(worker_index);
@@ -480,7 +489,13 @@ impl Handle {
             });
 
             #[cfg(feature = "market-trace")]
-            log_task_spawn("spawn_local", id, Some(cx.worker.index), caller);
+            log_task_spawn(
+                "spawn_local",
+                id,
+                Some(cx.worker.index),
+                caller,
+                std::any::type_name::<F>(),
+            );
 
             // Schedule to local queue
             if let Some(task) = notified {
