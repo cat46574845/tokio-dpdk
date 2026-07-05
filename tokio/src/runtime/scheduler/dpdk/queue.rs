@@ -49,7 +49,7 @@ unsafe impl<T> Send for Inner<T> {}
 unsafe impl<T> Sync for Inner<T> {}
 
 #[cfg(not(loom))]
-const LOCAL_QUEUE_CAPACITY: usize = 256;
+const LOCAL_QUEUE_CAPACITY: usize = 8192;
 
 #[cfg(loom)]
 const LOCAL_QUEUE_CAPACITY: usize = 4;
@@ -225,6 +225,7 @@ mod tests {
 
     #[test]
     fn test_local_queue_capacity() {
-        assert!(LOCAL_QUEUE_CAPACITY - 1 <= u8::MAX as usize);
+        assert!(LOCAL_QUEUE_CAPACITY.is_power_of_two());
+        assert!(LOCAL_QUEUE_CAPACITY <= (UnsignedShort::MAX as usize + 1) / 2);
     }
 }
