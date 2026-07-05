@@ -12,7 +12,9 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{
+    Config as IfaceConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
+};
 use smoltcp::socket::tcp::Socket as TcpSocket;
 use smoltcp::storage::LinearBuffer;
 use smoltcp::time::Instant as SmolInstant;
@@ -324,9 +326,52 @@ impl DpdkDriver {
         } else {
             0
         };
-        let result = self
-            .iface
-            .poll(smol_now, &mut self.device, &mut self.sockets);
+        let mut result = PollResult::None;
+
+        #[cfg(feature = "market-trace")]
+        let smoltcp_ingress_start_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns()
+        } else {
+            0
+        };
+        loop {
+            match self
+                .iface
+                .poll_ingress_single(smol_now, &mut self.device, &mut self.sockets)
+            {
+                PollIngressSingleResult::None => break,
+                PollIngressSingleResult::PacketProcessed => {}
+                PollIngressSingleResult::SocketStateChanged => result = PollResult::SocketStateChanged,
+            }
+        }
+        #[cfg(feature = "market-trace")]
+        let smoltcp_ingress_dur_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns().saturating_sub(smoltcp_ingress_start_ns)
+        } else {
+            0
+        };
+
+        #[cfg(feature = "market-trace")]
+        let smoltcp_egress_start_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns()
+        } else {
+            0
+        };
+        loop {
+            match self
+                .iface
+                .poll_egress(smol_now, &mut self.device, &mut self.sockets)
+            {
+                PollResult::None => break,
+                PollResult::SocketStateChanged => result = PollResult::SocketStateChanged,
+            }
+        }
+        #[cfg(feature = "market-trace")]
+        let smoltcp_egress_dur_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns().saturating_sub(smoltcp_egress_start_ns)
+        } else {
+            0
+        };
         #[cfg(feature = "market-trace")]
         let smoltcp_poll_dur_ns = if trace_poll {
             crate::runtime::market_trace::now_ns().saturating_sub(smoltcp_poll_start_ns)
@@ -396,6 +441,20 @@ impl DpdkDriver {
                 smoltcp_poll_start_ns,
                 smoltcp_poll_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_POLL,
+                track_id,
+                0,
+            );
+            crate::runtime::market_trace::complete(
+                smoltcp_ingress_start_ns,
+                smoltcp_ingress_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_INGRESS,
+                track_id,
+                0,
+            );
+            crate::runtime::market_trace::complete(
+                smoltcp_egress_start_ns,
+                smoltcp_egress_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_EGRESS,
                 track_id,
                 0,
             );
