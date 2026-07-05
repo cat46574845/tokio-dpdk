@@ -14,8 +14,13 @@ use crate::util::RngSeedGenerator;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU64;
+#[cfg(feature = "market-trace")]
+use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
 
 use super::worker::{self, Notified as WorkerNotified, Shared};
+
+#[cfg(feature = "market-trace")]
+static OUTSIDE_WORKER_SCHEDULE_BACKTRACES: AtomicUsize = AtomicUsize::new(0);
 
 /// Handle to the DPDK scheduler
 pub(crate) struct Handle {
@@ -264,6 +269,18 @@ impl Handle {
 
     #[cfg(feature = "market-trace")]
     fn push_remote_task_outside_worker(&self, task: WorkerNotified) {
+        if std::env::var_os("TOKIO_DPDK_LOG_OUTSIDE_WORKER_SCHEDULE").is_some() {
+            let idx = OUTSIDE_WORKER_SCHEDULE_BACKTRACES.fetch_add(1, StdOrdering::Relaxed);
+            if idx < 16 {
+                let thread = std::thread::current();
+                eprintln!(
+                    "[tokio-dpdk] shared_inject_outside_worker idx={} thread={:?} backtrace={:?}",
+                    idx,
+                    thread.name(),
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
         self.push_remote_task_with_source(
             task,
             crate::runtime::market_trace::QUEUE_SOURCE_SHARED_INJECT_OUTSIDE_WORKER,
