@@ -176,7 +176,7 @@ pub(crate) fn init_port(
     port_conf.rx_adv_conf.rss_conf.rss_key_len = dev_info.hash_key_size;
     port_conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP;
     port_conf.rx_adv_conf.rss_conf.algorithm =
-        ffi::rte_eth_hash_function_RTE_ETH_HASH_FUNCTION_TOEPLITZ;
+        ffi::rte_eth_hash_function_RTE_ETH_HASH_FUNCTION_DEFAULT;
     let ret =
         unsafe { ffi::rte_eth_dev_configure(port_id, nb_rx_queues, nb_tx_queues, &port_conf) };
     if ret != 0 {
