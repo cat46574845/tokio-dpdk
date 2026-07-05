@@ -478,6 +478,15 @@ impl<S: 'static> Notified<S> {
         );
     }
 
+    #[cfg(feature = "market-trace")]
+    pub(crate) fn market_trace_mark_queued(&self) {
+        let queued_ns = crate::runtime::market_trace::now_ns().max(1);
+        self.header().sched_probe_queued_ns.store(
+            queued_ns,
+            crate::loom::sync::atomic::Ordering::Release,
+        );
+    }
+
     #[cfg(tokio_unstable)]
     #[allow(dead_code)]
     pub(crate) fn task_id(&self) -> crate::task::Id {
@@ -522,6 +531,19 @@ impl<S: Schedule> LocalNotified<S> {
             0
         } else {
             now_ns.saturating_sub(queued_ns)
+        }
+    }
+
+    #[cfg(feature = "market-trace")]
+    pub(crate) fn market_trace_queue_wait_ns(&self) -> u64 {
+        let queued_ns = self.task.header().sched_probe_queued_ns.swap(
+            0,
+            crate::loom::sync::atomic::Ordering::AcqRel,
+        );
+        if queued_ns == 0 {
+            0
+        } else {
+            crate::runtime::market_trace::now_ns().saturating_sub(queued_ns)
         }
     }
 

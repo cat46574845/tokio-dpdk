@@ -578,6 +578,10 @@ cfg_rt! {
     #[cfg(feature = "sched-probe")]
     pub mod sched_probe;
 
+    /// Runtime trace hooks used by the DPDK scheduler instrumentation.
+    #[cfg(feature = "market-trace")]
+    pub mod market_trace;
+
     mod id;
     pub use id::Id;
 

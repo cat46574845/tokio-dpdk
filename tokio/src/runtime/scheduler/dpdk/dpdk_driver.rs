@@ -149,6 +149,7 @@ impl TcpBufferPool {
 /// Waker management is handled by smoltcp's native `register_recv_waker`/`register_send_waker`.
 /// The driver is polled in the worker event loop to process packets.
 pub(crate) struct DpdkDriver {
+    worker_index: usize,
     /// DPDK device for packet I/O
     device: DpdkDevice,
     /// smoltcp network interface
@@ -232,6 +233,7 @@ impl DpdkDriver {
         let sockets = SocketSet::new(vec![]);
 
         Self {
+            worker_index,
             device,
             iface,
             sockets,
@@ -252,6 +254,8 @@ impl DpdkDriver {
     ///
     /// Returns `true` if there was network activity.
     pub(crate) fn poll(&mut self, now: Instant) -> bool {
+        #[cfg(feature = "market-trace")]
+        let track_id = crate::runtime::market_trace::dpdk_track(self.worker_index);
         let smol_now =
             SmolInstant::from_millis(now.duration_since(self.start_time).as_millis() as i64);
         // Flush pending TX packets first.
@@ -261,26 +265,125 @@ impl DpdkDriver {
         // the preallocated batch buffer. The collected mbufs are then processed
         // newest-first inside this same poll.
         let received_rx = self.device.drain_rx(&mut self.raw_tail);
+
+        #[cfg(feature = "market-trace")]
+        let trace_poll = received_rx;
+        #[cfg(feature = "market-trace")]
+        let poll_start_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns()
+        } else {
+            0
+        };
+
+        #[cfg(feature = "market-trace")]
+        let flush_acks_start_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns()
+        } else {
+            0
+        };
         self.raw_tail.flush_acks(&mut self.device);
+        #[cfg(feature = "market-trace")]
+        let flush_acks_dur_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns().saturating_sub(flush_acks_start_ns)
+        } else {
+            0
+        };
+
+        #[cfg(feature = "market-trace")]
+        let yield_raw_tail_start_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns()
+        } else {
+            0
+        };
         self.raw_tail.yield_dirty_records();
+        #[cfg(feature = "market-trace")]
+        let yield_raw_tail_dur_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns().saturating_sub(yield_raw_tail_start_ns)
+        } else {
+            0
+        };
 
         // Poll smoltcp (processes RX, generates TX)
         // smoltcp will automatically call wake() on registered wakers when:
         // - rx_buffer has new data (register_recv_waker)
         // - tx_buffer has new space (register_send_waker)
         // - connection state changes (both wakers)
+        #[cfg(feature = "market-trace")]
+        let smoltcp_poll_start_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns()
+        } else {
+            0
+        };
         let result = self
             .iface
             .poll(smol_now, &mut self.device, &mut self.sockets);
+        #[cfg(feature = "market-trace")]
+        let smoltcp_poll_dur_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns().saturating_sub(smoltcp_poll_start_ns)
+        } else {
+            0
+        };
         self.device.drop_unprocessed_rx_pending();
 
         // Flush any new TX packets (e.g., ACKs, SYN-ACK)
+        #[cfg(feature = "market-trace")]
+        let flush_tx_after_start_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns()
+        } else {
+            0
+        };
         self.device.flush_tx();
+        #[cfg(feature = "market-trace")]
+        let flush_tx_after_dur_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_after_start_ns)
+        } else {
+            0
+        };
 
         // Note: dispatch_wakers() is no longer needed!
         // smoltcp's native waker mechanism handles wakeups internally.
 
-        received_rx || matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
+        let active = received_rx || matches!(result, smoltcp::iface::PollResult::SocketStateChanged);
+        #[cfg(feature = "market-trace")]
+        if trace_poll {
+            let poll_dur_ns = crate::runtime::market_trace::now_ns().saturating_sub(poll_start_ns);
+            crate::runtime::market_trace::complete(
+                poll_start_ns,
+                poll_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_DRIVER_POLL,
+                track_id,
+                0,
+            );
+            crate::runtime::market_trace::complete(
+                flush_acks_start_ns,
+                flush_acks_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_FLUSH_ACKS,
+                track_id,
+                0,
+            );
+            crate::runtime::market_trace::complete(
+                yield_raw_tail_start_ns,
+                yield_raw_tail_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_YIELD_RAW_TAIL,
+                track_id,
+                0,
+            );
+            crate::runtime::market_trace::complete(
+                smoltcp_poll_start_ns,
+                smoltcp_poll_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_POLL,
+                track_id,
+                0,
+            );
+            crate::runtime::market_trace::complete(
+                flush_tx_after_start_ns,
+                flush_tx_after_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_FLUSH_TX,
+                track_id,
+                1,
+            );
+        }
+        active
     }
 
     pub(crate) fn activate_raw_tail_for_socket(

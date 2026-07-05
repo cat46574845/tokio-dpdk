@@ -179,6 +179,8 @@ impl Handle {
         task: WorkerNotified,
         is_yield: bool,
     ) {
+        #[cfg(feature = "market-trace")]
+        task.market_trace_mark_queued();
         core.stats.inc_local_schedule_count();
 
         // If LIFO is enabled and not yielding, use LIFO slot
@@ -227,6 +229,8 @@ impl Handle {
 
     /// Pushes a task to the global queue
     pub(crate) fn push_remote_task(&self, task: WorkerNotified) {
+        #[cfg(feature = "market-trace")]
+        task.market_trace_mark_queued();
         // Safety: we hold the synced lock
         unsafe {
             self.shared
@@ -344,6 +348,8 @@ impl Handle {
 
     /// Pushes a task to a specific worker's per-worker inject queue.
     pub(crate) fn push_worker_task(&self, worker_index: usize, task: WorkerNotified) {
+        #[cfg(feature = "market-trace")]
+        task.market_trace_mark_queued();
         self.shared.remotes[worker_index].per_inject.push(task);
     }
 

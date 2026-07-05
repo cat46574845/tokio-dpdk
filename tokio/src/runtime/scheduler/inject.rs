@@ -67,4 +67,5 @@ impl<T: 'static> Inject<T> {
         // safety: passing correct `Synced`
         unsafe { self.shared.pop(&mut synced) }
     }
+
 }

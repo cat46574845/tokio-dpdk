@@ -378,6 +378,34 @@ pub(crate) struct Core {
     /// Local overflow queue for tasks when run_queue is full.
     /// Lock-free since only the owning worker accesses it.
     pub(crate) local_overflow: VecDeque<Notified>,
+
+    #[cfg(feature = "market-trace")]
+    trace_queue_depths: TraceQueueDepths,
+}
+
+#[cfg(feature = "market-trace")]
+#[derive(Clone, Copy)]
+struct TraceQueueDepths {
+    run_queue: usize,
+    overflow: usize,
+    per_worker_inject: usize,
+    global_inject: usize,
+    lifo: usize,
+    total: usize,
+}
+
+#[cfg(feature = "market-trace")]
+impl TraceQueueDepths {
+    const fn unknown() -> Self {
+        Self {
+            run_queue: usize::MAX,
+            overflow: usize::MAX,
+            per_worker_inject: usize::MAX,
+            global_inject: usize::MAX,
+            lifo: usize::MAX,
+            total: usize::MAX,
+        }
+    }
 }
 
 /// State shared across all workers
@@ -572,6 +600,8 @@ pub(super) fn create(
             stats,
             rand: FastRand::from_seed(config.seed_generator.next_seed()),
             local_overflow: VecDeque::new(),
+            #[cfg(feature = "market-trace")]
+            trace_queue_depths: TraceQueueDepths::unknown(),
         }));
 
         remotes.push(Remote {
@@ -1177,6 +1207,8 @@ impl Context {
 
             // Poll DPDK network stack (receive packets, process TCP/IP, wake socket tasks)
             self.poll_dpdk_driver();
+            #[cfg(feature = "market-trace")]
+            self.trace_queue_depths();
 
             // Debug: record poll_dpdk_driver end
             #[cfg(feature = "dpdk-debug")]
@@ -1231,6 +1263,8 @@ impl Context {
             if let Some(core) = self.core.borrow_mut().as_mut() {
                 core.stats.end_processing_scheduled_tasks();
             }
+            #[cfg(feature = "market-trace")]
+            self.trace_queue_depths();
 
             // Poll block_on future if present (unified event loop design)
             // This allows the block_on future to be polled alongside spawned tasks
@@ -1244,6 +1278,12 @@ impl Context {
                         let mut cx = std::task::Context::from_waker(&waker);
                         // Wrap in coop budget so the block_on future yields
                         // fairly with spawned tasks.
+                        #[cfg(feature = "market-trace")]
+                        let _trace_scope = crate::runtime::market_trace::scope(
+                            crate::runtime::market_trace::SPAN_DPDK_BLOCK_ON_POLL,
+                            crate::runtime::market_trace::dpdk_track(self.worker.index),
+                            0,
+                        );
                         let poll_result = crate::task::coop::budget(|| {
                             (state.poll_fn)(&mut cx)
                         });
@@ -1277,6 +1317,8 @@ impl Context {
     fn poll_dpdk_driver(&self) {
         // Get worker index to access correct driver
         let index = self.worker.index;
+        #[cfg(feature = "market-trace")]
+        let track_id = crate::runtime::market_trace::dpdk_track(index);
 
         // Access the driver for this worker (each worker has dedicated driver)
         if let Some(driver_mutex) = self.worker.handle.shared.drivers.get(index) {
@@ -1287,9 +1329,94 @@ impl Context {
                 }
                 // Poll with current time
                 let now = Instant::now();
-                driver.poll(now);
+                #[cfg(feature = "market-trace")]
+                let poll_driver_lock_start_ns = crate::runtime::market_trace::now_ns();
+                let active = driver.poll(now);
+                #[cfg(feature = "market-trace")]
+                if active {
+                    let poll_driver_lock_dur_ns = crate::runtime::market_trace::now_ns()
+                        .saturating_sub(poll_driver_lock_start_ns);
+                    crate::runtime::market_trace::complete(
+                        poll_driver_lock_start_ns,
+                        poll_driver_lock_dur_ns,
+                        crate::runtime::market_trace::SPAN_DPDK_POLL_DRIVER_LOCK,
+                        track_id,
+                        0,
+                    );
+                }
             }
             // If lock fails, another thread is using it - skip this tick
+        }
+    }
+
+    #[cfg(feature = "market-trace")]
+    fn trace_queue_depths(&self) {
+        let index = self.worker.index;
+        let track_id = crate::runtime::market_trace::dpdk_track(index);
+        let per_worker_inject = self.worker.handle.shared.remotes[index].per_inject.len();
+        let global_inject = self.worker.handle.shared.inject.len();
+
+        let mut core = self.core.borrow_mut();
+        let Some(core) = core.as_mut() else {
+            return;
+        };
+
+        let run_queue = core.run_queue.len();
+        let overflow = core.local_overflow.len();
+        let lifo = usize::from(core.lifo_slot.is_some());
+        let total = run_queue
+            .saturating_add(overflow)
+            .saturating_add(per_worker_inject)
+            .saturating_add(global_inject)
+            .saturating_add(lifo);
+
+        if core.trace_queue_depths.total != total {
+            crate::runtime::market_trace::counter(
+                crate::runtime::market_trace::COUNTER_DPDK_QUEUE_TOTAL_DEPTH,
+                track_id,
+                total as u64,
+            );
+            core.trace_queue_depths.total = total;
+        }
+        if core.trace_queue_depths.run_queue != run_queue {
+            crate::runtime::market_trace::counter(
+                crate::runtime::market_trace::COUNTER_DPDK_RUN_QUEUE_DEPTH,
+                track_id,
+                run_queue as u64,
+            );
+            core.trace_queue_depths.run_queue = run_queue;
+        }
+        if core.trace_queue_depths.overflow != overflow {
+            crate::runtime::market_trace::counter(
+                crate::runtime::market_trace::COUNTER_DPDK_OVERFLOW_DEPTH,
+                track_id,
+                overflow as u64,
+            );
+            core.trace_queue_depths.overflow = overflow;
+        }
+        if core.trace_queue_depths.per_worker_inject != per_worker_inject {
+            crate::runtime::market_trace::counter(
+                crate::runtime::market_trace::COUNTER_DPDK_PER_WORKER_INJECT_DEPTH,
+                track_id,
+                per_worker_inject as u64,
+            );
+            core.trace_queue_depths.per_worker_inject = per_worker_inject;
+        }
+        if core.trace_queue_depths.global_inject != global_inject {
+            crate::runtime::market_trace::counter(
+                crate::runtime::market_trace::COUNTER_DPDK_GLOBAL_INJECT_DEPTH,
+                track_id,
+                global_inject as u64,
+            );
+            core.trace_queue_depths.global_inject = global_inject;
+        }
+        if core.trace_queue_depths.lifo != lifo {
+            crate::runtime::market_trace::counter(
+                crate::runtime::market_trace::COUNTER_DPDK_LIFO_DEPTH,
+                track_id,
+                lifo as u64,
+            );
+            core.trace_queue_depths.lifo = lifo;
         }
     }
 
@@ -1446,6 +1573,14 @@ impl Context {
         // monopolize the worker. IO operations and sync primitives call
         // poll_proceed() internally, which decrements this budget.
         let task = self.worker.handle.shared.owned.assert_owner(task);
+        #[cfg(feature = "market-trace")]
+        let task_queue_wait_ns = task.market_trace_queue_wait_ns();
+        #[cfg(feature = "market-trace")]
+        let _trace_scope = crate::runtime::market_trace::scope(
+            crate::runtime::market_trace::SPAN_DPDK_RUN_TASK,
+            crate::runtime::market_trace::dpdk_track(self.worker.index),
+            task_queue_wait_ns,
+        );
         crate::task::coop::budget(|| {
             task.run();
         });

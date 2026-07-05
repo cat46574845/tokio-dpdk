@@ -370,6 +370,12 @@ impl Context {
     /// Execute the closure with the given scheduler core stored in the
     /// thread-local context.
     fn run_task<R>(&self, mut core: Box<Core>, f: impl FnOnce() -> R) -> (Box<Core>, R) {
+        #[cfg(feature = "market-trace")]
+        let _trace_scope = crate::runtime::market_trace::scope(
+            crate::runtime::market_trace::SPAN_TOKIO_CURRENT_RUN_TASK,
+            crate::runtime::market_trace::TRACK_TOKIO_CURRENT,
+            0,
+        );
         core.metrics.start_poll();
         let mut ret = self.enter(core, || crate::task::coop::budget(f));
         ret.0.metrics.end_poll();
@@ -396,6 +402,12 @@ impl Context {
             #[cfg(feature = "sched-probe")]
             let sched_probe_start_ns = crate::runtime::sched_probe::now_ns();
 
+            #[cfg(feature = "market-trace")]
+            let _trace_scope = crate::runtime::market_trace::scope(
+                crate::runtime::market_trace::SPAN_TOKIO_CURRENT_PARK,
+                crate::runtime::market_trace::TRACK_TOKIO_CURRENT,
+                0,
+            );
             core = self.park_internal(core, handle, &mut driver, None);
 
             #[cfg(feature = "sched-probe")]
@@ -425,6 +437,12 @@ impl Context {
         #[cfg(feature = "sched-probe")]
         let sched_probe_start_ns = crate::runtime::sched_probe::now_ns();
 
+        #[cfg(feature = "market-trace")]
+        let _trace_scope = crate::runtime::market_trace::scope(
+            crate::runtime::market_trace::SPAN_TOKIO_CURRENT_PARK_YIELD,
+            crate::runtime::market_trace::TRACK_TOKIO_CURRENT,
+            0,
+        );
         core = self.park_internal(core, handle, &mut driver, Some(Duration::from_millis(0)));
 
         #[cfg(feature = "sched-probe")]
