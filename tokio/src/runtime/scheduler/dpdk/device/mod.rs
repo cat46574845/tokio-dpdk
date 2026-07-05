@@ -9,6 +9,7 @@ use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, M
 use smoltcp::time::Instant as SmolInstant;
 
 use super::ffi;
+use super::raw_tail::{ParsedTcpPacket, RawTailTable};
 
 // =============================================================================
 // Configuration constants
@@ -158,12 +159,14 @@ impl DpdkDevice {
     }
 
     /// Try to receive packets from DPDK.
-    fn try_receive(&mut self) {
+    pub(crate) fn drain_rx(&mut self, raw_tail: &mut RawTailTable) {
         // Only receive if we've consumed all pending packets
         if self.rx_index >= self.rx_pending.len() {
             self.rx_pending.clear();
             self.rx_index = 0;
+        }
 
+        loop {
             let mut bufs: [*mut ffi::rte_mbuf; RX_BURST_SIZE as usize] =
                 [ptr::null_mut(); RX_BURST_SIZE as usize];
 
@@ -177,9 +180,19 @@ impl DpdkDevice {
             };
 
             if n > 0 {
-                self.rx_pending.extend_from_slice(&bufs[0..n as usize]);
+                for mbuf in &bufs[..n as usize] {
+                    if !raw_tail.is_empty() && raw_tail.capture_mbuf(*mbuf) {
+                        continue;
+                    }
+                    self.rx_pending.push(*mbuf);
+                }
+            }
+
+            if n < RX_BURST_SIZE {
+                break;
             }
         }
+        raw_tail.collect_dirty_from_conns();
     }
 
     /// Flush the transmit buffer.
@@ -233,6 +246,92 @@ impl DpdkDevice {
 
         self.tx_buffer.clear();
     }
+
+    #[inline(always)]
+    pub(crate) unsafe fn free_mbuf(mbuf: *mut ffi::rte_mbuf) {
+        unsafe { dpdk_wrappers::pktmbuf_free(mbuf) }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn mbuf_data_ptr(mbuf: *mut ffi::rte_mbuf) -> *mut u8 {
+        unsafe { dpdk_wrappers::pktmbuf_mtod(mbuf) }
+    }
+
+    pub(crate) fn send_raw_tcp_ack(&mut self, pkt: &ParsedTcpPacket<'_>, seq: u32, ack: u32) {
+        const ACK_PACKET_LEN: usize = 14 + 20 + 20;
+        let mbuf = unsafe { dpdk_wrappers::pktmbuf_alloc(self.mempool) };
+        if mbuf.is_null() {
+            panic!("Failed to allocate mbuf for raw-tail ACK");
+        }
+
+        let data = unsafe {
+            let ptr = dpdk_wrappers::pktmbuf_append(mbuf, ACK_PACKET_LEN as u16);
+            if ptr.is_null() {
+                dpdk_wrappers::pktmbuf_free(mbuf);
+                panic!("Failed to append raw-tail ACK bytes to mbuf");
+            }
+            std::slice::from_raw_parts_mut(ptr as *mut u8, ACK_PACKET_LEN)
+        };
+
+        data[..6].copy_from_slice(&pkt.eth_src);
+        data[6..12].copy_from_slice(&pkt.eth_dst);
+        data[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+
+        let ip = &mut data[14..34];
+        ip[0] = 0x45;
+        ip[1] = 0;
+        ip[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        ip[4..6].copy_from_slice(&0u16.to_be_bytes());
+        ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = 6;
+        ip[10..12].copy_from_slice(&0u16.to_be_bytes());
+        ip[12..16].copy_from_slice(&pkt.local_ip.octets());
+        ip[16..20].copy_from_slice(&pkt.remote_ip.octets());
+        let ip_sum = internet_checksum(ip);
+        ip[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+
+        let tcp = &mut data[34..54];
+        tcp[0..2].copy_from_slice(&pkt.local_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&pkt.remote_port.to_be_bytes());
+        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+        tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+        tcp[12] = 5u8 << 4;
+        tcp[13] = 0x10;
+        tcp[14..16].copy_from_slice(&65535u16.to_be_bytes());
+        tcp[16..18].copy_from_slice(&0u16.to_be_bytes());
+        tcp[18..20].copy_from_slice(&0u16.to_be_bytes());
+        let tcp_sum = tcp_checksum(pkt.local_ip.octets(), pkt.remote_ip.octets(), tcp);
+        tcp[16..18].copy_from_slice(&tcp_sum.to_be_bytes());
+
+        self.tx_buffer.push(mbuf);
+    }
+}
+
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = data.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+    }
+    if let Some(&byte) = chunks.remainder().first() {
+        sum = sum.wrapping_add((byte as u32) << 8);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp: &[u8]) -> u16 {
+    let mut pseudo = [0u8; 12 + 20];
+    pseudo[..4].copy_from_slice(&src_ip);
+    pseudo[4..8].copy_from_slice(&dst_ip);
+    pseudo[8] = 0;
+    pseudo[9] = 6;
+    pseudo[10..12].copy_from_slice(&(tcp.len() as u16).to_be_bytes());
+    pseudo[12..].copy_from_slice(tcp);
+    internet_checksum(&pseudo)
 }
 
 impl Drop for DpdkDevice {
@@ -341,8 +440,6 @@ impl Device for DpdkDevice {
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.try_receive();
-
         if self.rx_index < self.rx_pending.len() {
             let mbuf = self.rx_pending[self.rx_index];
             self.rx_index += 1;

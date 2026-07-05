@@ -19,6 +19,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
 use super::device::DpdkDevice;
+use super::raw_tail::{RawTailHandle, RawTailPoll, RawTailRecord, RawTailTable, RawTailTuple};
 
 // =============================================================================
 // Constants
@@ -162,6 +163,8 @@ pub(crate) struct DpdkDriver {
     buffer_pool: TcpBufferPool,
     /// Set of bound ports to track address-in-use (since smoltcp doesn't expose this)
     bound_ports: HashSet<u16>,
+    /// RSS-hash based lossy tail receiver for market-data flows.
+    raw_tail: RawTailTable,
 }
 
 impl DpdkDriver {
@@ -175,6 +178,7 @@ impl DpdkDriver {
     /// * `gateway_v6` - Optional IPv6 default gateway
     pub(crate) fn new(
         mut device: DpdkDevice,
+        worker_index: usize,
         mac: [u8; 6],
         addresses: Vec<IpCidr>,
         gateway_v4: Option<Ipv4Address>,
@@ -235,6 +239,7 @@ impl DpdkDriver {
             registered_sockets: HashSet::new(),
             buffer_pool: TcpBufferPool::with_defaults(),
             bound_ports: HashSet::new(),
+            raw_tail: RawTailTable::new(worker_index),
         }
     }
 
@@ -253,6 +258,12 @@ impl DpdkDriver {
         // Flush pending TX packets first
         self.device.flush_tx();
 
+        // Drain the hardware RX queue to the bottom once per driver tick. Raw-tail
+        // market-data flows are diverted by RSS hash; all other packets are kept
+        // pending for smoltcp below.
+        self.device.drain_rx(&mut self.raw_tail);
+        self.raw_tail.flush_acks(&mut self.device);
+
         // Poll smoltcp (processes RX, generates TX)
         // smoltcp will automatically call wake() on registered wakers when:
         // - rx_buffer has new data (register_recv_waker)
@@ -270,6 +281,39 @@ impl DpdkDriver {
 
         // Return true if there was socket state change (activity)
         matches!(result, smoltcp::iface::PollResult::SocketStateChanged)
+    }
+
+    pub(crate) fn activate_raw_tail_for_socket(
+        &mut self,
+        handle: SocketHandle,
+    ) -> std::io::Result<RawTailHandle> {
+        let socket = self.get_tcp_socket_mut(handle);
+        let local = socket.local_endpoint().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "socket has no local endpoint")
+        })?;
+        let remote = socket.remote_endpoint().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "socket has no remote endpoint")
+        })?;
+        let local_addr = endpoint_to_socket_addr(local)?;
+        let remote_addr = endpoint_to_socket_addr(remote)?;
+        let tuple = RawTailTuple::from_addrs(local_addr, remote_addr)?;
+        Ok(self.raw_tail.register(tuple))
+    }
+
+    pub(crate) fn unregister_raw_tail(&mut self, handle: RawTailHandle) {
+        self.raw_tail.unregister(handle);
+    }
+
+    pub(crate) fn poll_raw_tail_tls<F>(
+        &mut self,
+        handle: RawTailHandle,
+        scratch: &mut [u8],
+        f: F,
+    ) -> std::io::Result<RawTailPoll>
+    where
+        F: FnMut(RawTailRecord<'_>) -> bool,
+    {
+        self.raw_tail.poll_tls_records(handle, scratch, f)
     }
 
     /// Create a new TCP socket using pre-allocated buffers from the pool.
@@ -503,4 +547,20 @@ impl DpdkDriver {
 
         None
     }
+}
+
+fn endpoint_to_socket_addr(endpoint: smoltcp::wire::IpEndpoint) -> std::io::Result<std::net::SocketAddr> {
+    let ip = match endpoint.addr {
+        smoltcp::wire::IpAddress::Ipv4(addr) => {
+            let octets = addr.octets();
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                octets[0], octets[1], octets[2], octets[3],
+            ))
+        }
+        smoltcp::wire::IpAddress::Ipv6(addr) => {
+            let octets = addr.octets();
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        }
+    };
+    Ok(std::net::SocketAddr::new(ip, endpoint.port))
 }

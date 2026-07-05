@@ -13,6 +13,7 @@ pub(crate) mod dpdk_driver;
 pub(crate) mod env_config;
 mod ffi;
 mod flow_rules;
+pub(crate) mod raw_tail;
 pub(crate) mod init;
 pub(crate) mod io_thread;
 mod resource_lock;
@@ -32,6 +33,8 @@ pub(crate) use worker::Context;
 
 // Re-export worker context API for TcpDpdkStream
 pub(crate) use worker::{current_worker_index, with_current_driver};
+
+pub use raw_tail::{RawTailHandle, RawTailPoll, RawTailRecord};
 
 // Re-export debug APIs
 pub use worker::{current_tick, current_exec_count, current_scheduler_stats, DpdkSchedulerStats};

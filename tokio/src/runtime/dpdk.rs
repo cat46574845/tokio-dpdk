@@ -38,6 +38,9 @@ use crate::runtime::task::{self, SpawnLocation};
 use crate::task::JoinHandle;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::io;
+
+pub use crate::runtime::scheduler::dpdk::{RawTailHandle, RawTailPoll, RawTailRecord};
 
 /// Identifies a specific DPDK worker thread.
 ///
@@ -83,6 +86,35 @@ pub fn current_worker() -> WorkerId {
 /// if not on a DPDK worker thread.
 pub fn try_current_worker() -> Option<WorkerId> {
     crate::runtime::scheduler::dpdk::worker::current_worker_index().map(WorkerId::new)
+}
+
+/// Poll the DPDK raw-tail TLS record receiver for one registered flow.
+///
+/// The callback is invoked with candidate TLS records in newest-first order.
+/// Return `true` only after the record has authenticated and the caller wants
+/// the runtime to commit the corresponding TCP tail and release older mbufs.
+#[track_caller]
+pub fn poll_raw_tail_tls<F>(
+    handle: RawTailHandle,
+    scratch: &mut [u8],
+    f: F,
+) -> io::Result<RawTailPoll>
+where
+    F: FnMut(RawTailRecord<'_>) -> bool,
+{
+    crate::runtime::scheduler::dpdk::worker::with_current_driver(|driver| {
+        driver.poll_raw_tail_tls(handle, scratch, f)
+    })
+    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DPDK driver unavailable"))?
+}
+
+/// Stop diverting a raw-tail flow and free any retained mbufs.
+#[track_caller]
+pub fn unregister_raw_tail(handle: RawTailHandle) -> io::Result<()> {
+    crate::runtime::scheduler::dpdk::worker::with_current_driver(|driver| {
+        driver.unregister_raw_tail(handle);
+    })
+    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DPDK driver unavailable"))
 }
 
 /// Returns a list of all worker IDs in the current DPDK runtime.

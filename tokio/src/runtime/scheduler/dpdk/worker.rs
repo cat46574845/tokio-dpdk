@@ -540,9 +540,10 @@ pub(super) fn create(
     let mut core_ids = Vec::with_capacity(size);
 
     // Create DpdkDrivers from initialized workers
-    for worker in workers {
+    for (worker_index, worker) in workers.into_iter().enumerate() {
         let driver = DpdkDriver::new(
             worker.device,
+            worker_index,
             worker.mac,
             worker.addresses,
             worker.gateway_v4,

@@ -19,6 +19,7 @@ use crate::net::{to_socket_addrs, ToSocketAddrs};
 
 // Import worker context from dpdk scheduler
 use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver};
+use crate::runtime::scheduler::dpdk::RawTailHandle;
 
 use std::marker::PhantomData;
 
@@ -914,6 +915,18 @@ impl TcpDpdkStream {
             Some(Err(kind)) => Err(io::Error::new(kind, "consume error")),
             None => Err(io::Error::new(io::ErrorKind::Other, "driver unavailable")),
         }
+    }
+
+    /// Divert this connected TCP flow into the DPDK raw-tail market-data path.
+    ///
+    /// After activation, inbound packets for this flow are captured by RSS hash
+    /// before smoltcp receives them. The caller must poll the raw-tail API and
+    /// should not continue reading this stream as a normal TCP stream.
+    pub fn activate_raw_tail(&self) -> io::Result<RawTailHandle> {
+        self.assert_on_correct_worker();
+        let handle = self.handle;
+        with_current_driver(|driver| driver.activate_raw_tail_for_socket(handle))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))?
     }
 
     /// Tries to read data from the stream into the provided buffer.
