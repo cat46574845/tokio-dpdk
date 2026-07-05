@@ -917,6 +917,15 @@ impl TcpDpdkStream {
         }
     }
 
+    /// Returns the number of bytes currently queued in the TCP receive buffer.
+    pub fn recv_queue_len(&self) -> io::Result<usize> {
+        self.assert_on_correct_worker();
+
+        let handle = self.handle;
+        with_current_driver(|driver| driver.get_tcp_socket_mut(handle).recv_queue())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))
+    }
+
     /// Divert this connected TCP flow into the DPDK raw-tail market-data path.
     ///
     /// After activation, inbound packets for this flow are captured by RSS hash
