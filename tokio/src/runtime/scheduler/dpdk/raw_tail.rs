@@ -131,7 +131,10 @@ impl TailRing {
 
     fn push(&mut self, mbuf: *mut ffi::rte_mbuf) -> Option<*mut ffi::rte_mbuf> {
         if self.len == RAW_TAIL_RING_CAP {
-            Some(mbuf)
+            let old = self.slots[self.head];
+            self.slots[self.head] = mbuf;
+            self.head = (self.head + 1) % RAW_TAIL_RING_CAP;
+            Some(old)
         } else {
             let idx = (self.head + self.len) % RAW_TAIL_RING_CAP;
             self.slots[idx] = mbuf;
@@ -169,9 +172,8 @@ impl Iterator for TailRingRevIter<'_> {
         if self.remaining == 0 {
             return None;
         }
-        let emitted = self.ring.len - self.remaining;
+        let idx = (self.ring.head + self.remaining - 1) % RAW_TAIL_RING_CAP;
         self.remaining -= 1;
-        let idx = (self.ring.head + emitted) % RAW_TAIL_RING_CAP;
         Some(self.ring.slots[idx])
     }
 }
@@ -830,4 +832,60 @@ unsafe fn mbuf_data(mbuf: *mut ffi::rte_mbuf) -> Option<&'static [u8]> {
 
 unsafe fn mbuf_rss_hash(mbuf: *mut ffi::rte_mbuf) -> u32 {
     unsafe { (*mbuf).__bindgen_anon_2.hash.rss }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_mbuf(id: usize) -> *mut ffi::rte_mbuf {
+        id as *mut ffi::rte_mbuf
+    }
+
+    fn mbuf_id(mbuf: *mut ffi::rte_mbuf) -> usize {
+        mbuf as usize
+    }
+
+    #[test]
+    fn tail_ring_iterates_newest_to_oldest_before_wrap() {
+        let mut ring = TailRing::new();
+        assert_eq!(ring.push(fake_mbuf(1)).map(mbuf_id), None);
+        assert_eq!(ring.push(fake_mbuf(2)).map(mbuf_id), None);
+        assert_eq!(ring.push(fake_mbuf(3)).map(mbuf_id), None);
+
+        let ids = ring
+            .newest_to_oldest()
+            .map(mbuf_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn tail_ring_overwrites_oldest_and_keeps_latest_first_when_full() {
+        let mut ring = TailRing::new();
+        for id in 1..=RAW_TAIL_RING_CAP {
+            assert_eq!(ring.push(fake_mbuf(id)).map(mbuf_id), None);
+        }
+
+        assert_eq!(
+            ring.push(fake_mbuf(RAW_TAIL_RING_CAP + 1)).map(mbuf_id),
+            Some(1)
+        );
+        assert_eq!(
+            ring.push(fake_mbuf(RAW_TAIL_RING_CAP + 2)).map(mbuf_id),
+            Some(2)
+        );
+
+        let ids = ring
+            .newest_to_oldest()
+            .map(mbuf_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), RAW_TAIL_RING_CAP);
+        assert_eq!(ids[0], RAW_TAIL_RING_CAP + 2);
+        assert_eq!(ids[1], RAW_TAIL_RING_CAP + 1);
+        assert_eq!(ids[2], RAW_TAIL_RING_CAP);
+        assert_eq!(ids[RAW_TAIL_RING_CAP - 1], 3);
+        assert!(!ids.contains(&1));
+        assert!(!ids.contains(&2));
+    }
 }
