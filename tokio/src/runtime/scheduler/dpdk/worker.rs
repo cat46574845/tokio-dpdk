@@ -381,6 +381,9 @@ pub(crate) struct Core {
     /// Lock-free since only the owning worker accesses it.
     pub(crate) local_overflow: VecDeque<Notified>,
 
+    /// Reused scratch space for draining shared inject without allocating.
+    pub(crate) inject_scratch: Vec<Notified>,
+
     #[cfg(feature = "market-trace")]
     trace_queue_depths: TraceQueueDepths,
 }
@@ -619,6 +622,7 @@ pub(super) fn create(
             stats,
             rand: FastRand::from_seed(config.seed_generator.next_seed()),
             local_overflow: VecDeque::new(),
+            inject_scratch: Vec::with_capacity(256),
             #[cfg(feature = "market-trace")]
             trace_queue_depths: TraceQueueDepths::unknown(),
         }));
@@ -1599,12 +1603,14 @@ impl Context {
         let n = usize::min(inject_len / num_workers + 1, cap);
         let n = usize::max(1, n);
 
-        // Pop tasks from inject queue and push to local queue
-        let tasks: Vec<_> = {
+        core.inject_scratch.clear();
+        {
             let mut synced = self.worker.handle.shared.synced.lock();
             // Safety: passing in the correct inject::Synced
-            unsafe { inject.pop_n(&mut synced.inject, n) }.collect()
-        };
+            for task in unsafe { inject.pop_n(&mut synced.inject, n) } {
+                core.inject_scratch.push(task);
+            }
+        }
         // synced is dropped here, lock released
 
         // Push tasks to local queue, with overflow handling.
@@ -1612,20 +1618,16 @@ impl Context {
         // pushed tasks to us (via inject queue scheduling), so we must
         // handle the case where run_queue is now full.
         let actual_remaining = core.run_queue.remaining_slots();
-        if actual_remaining >= tasks.len() {
+        if actual_remaining >= core.inject_scratch.len() {
             // Safe to push all directly
-            core.run_queue.push_back(tasks.into_iter());
+            core.run_queue.push_back(core.inject_scratch.drain(..));
         } else {
             // Split: push what fits to run_queue, rest to local_overflow
-            let (fit, overflow) = {
-                let mut v = tasks;
-                let overflow = v.split_off(actual_remaining);
-                (v, overflow)
-            };
-            if !fit.is_empty() {
-                core.run_queue.push_back(fit.into_iter());
+            if actual_remaining > 0 {
+                core.run_queue
+                    .push_back(core.inject_scratch.drain(..actual_remaining));
             }
-            for task in overflow {
+            for task in core.inject_scratch.drain(..) {
                 core.local_overflow.push_back(task);
                 core.stats.incr_overflow_count();
             }
