@@ -8,6 +8,7 @@ use super::ffi;
 
 const RAW_TAIL_RING_CAP: usize = 256;
 const RAW_TAIL_DIRTY_CAP: usize = 8192;
+const RAW_TAIL_RSS_MAP_CAP: usize = RAW_TAIL_DIRTY_CAP * 4;
 const RAW_TAIL_MAX_TLS_RECORD: usize = 16_640 + 5;
 const ETHERNET_HEADER_LEN: usize = 14;
 const IPV4_MIN_HEADER_LEN: usize = 20;
@@ -175,6 +176,125 @@ impl Iterator for TailRingRevIter<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RssSlotEntry {
+    rss: u32,
+    slot: usize,
+    state: u8,
+}
+
+impl RssSlotEntry {
+    const EMPTY: Self = Self {
+        rss: 0,
+        slot: 0,
+        state: 0,
+    };
+    const TOMBSTONE_STATE: u8 = 1;
+    const FULL_STATE: u8 = 2;
+}
+
+struct RssSlotMap {
+    entries: Vec<RssSlotEntry>,
+    len: usize,
+}
+
+impl RssSlotMap {
+    fn new() -> Self {
+        if !RAW_TAIL_RSS_MAP_CAP.is_power_of_two() {
+            panic!(
+                "raw-tail RSS map cap must be power of two cap={}",
+                RAW_TAIL_RSS_MAP_CAP
+            );
+        }
+        Self {
+            entries: vec![RssSlotEntry::EMPTY; RAW_TAIL_RSS_MAP_CAP],
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, rss: u32) -> Option<usize> {
+        let mut idx = (rss as usize) & (RAW_TAIL_RSS_MAP_CAP - 1);
+        for _ in 0..RAW_TAIL_RSS_MAP_CAP {
+            let entry = self.entries[idx];
+            match entry.state {
+                RssSlotEntry::FULL_STATE if entry.rss == rss => return Some(entry.slot),
+                0 => return None,
+                _ => {
+                    idx = (idx + 1) & (RAW_TAIL_RSS_MAP_CAP - 1);
+                }
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, rss: u32, slot: usize) -> Result<Option<usize>, ()> {
+        if self.len >= RAW_TAIL_DIRTY_CAP {
+            return Err(());
+        }
+        let mut idx = (rss as usize) & (RAW_TAIL_RSS_MAP_CAP - 1);
+        let mut first_tombstone = None;
+        for _ in 0..RAW_TAIL_RSS_MAP_CAP {
+            let entry = self.entries[idx];
+            match entry.state {
+                RssSlotEntry::FULL_STATE if entry.rss == rss => return Ok(Some(entry.slot)),
+                RssSlotEntry::TOMBSTONE_STATE => {
+                    if first_tombstone.is_none() {
+                        first_tombstone = Some(idx);
+                    }
+                }
+                0 => {
+                    let insert_idx = match first_tombstone {
+                        Some(tombstone_idx) => tombstone_idx,
+                        None => idx,
+                    };
+                    self.entries[insert_idx] = RssSlotEntry {
+                        rss,
+                        slot,
+                        state: RssSlotEntry::FULL_STATE,
+                    };
+                    self.len += 1;
+                    return Ok(None);
+                }
+                _ => {}
+            }
+            idx = (idx + 1) & (RAW_TAIL_RSS_MAP_CAP - 1);
+        }
+        let Some(insert_idx) = first_tombstone else {
+            return Err(());
+        };
+        self.entries[insert_idx] = RssSlotEntry {
+            rss,
+            slot,
+            state: RssSlotEntry::FULL_STATE,
+        };
+        self.len += 1;
+        Ok(None)
+    }
+
+    fn remove(&mut self, rss: u32) -> Option<usize> {
+        let mut idx = (rss as usize) & (RAW_TAIL_RSS_MAP_CAP - 1);
+        for _ in 0..RAW_TAIL_RSS_MAP_CAP {
+            let entry = self.entries[idx];
+            match entry.state {
+                RssSlotEntry::FULL_STATE if entry.rss == rss => {
+                    self.entries[idx].state = RssSlotEntry::TOMBSTONE_STATE;
+                    self.len = self
+                        .len
+                        .checked_sub(1)
+                        .expect("raw-tail RSS map len underflow");
+                    return Some(entry.slot);
+                }
+                0 => return None,
+                _ => {
+                    idx = (idx + 1) & (RAW_TAIL_RSS_MAP_CAP - 1);
+                }
+            }
+        }
+        None
+    }
+}
+
 struct TailConn {
     handle: RawTailHandle,
     rss_hash: Option<u32>,
@@ -198,7 +318,7 @@ pub(crate) struct RawTailTable {
     next_id: u64,
     worker_index: usize,
     conns: Vec<Option<TailConn>>,
-    rss_to_slot: HashMap<u32, usize>,
+    rss_to_slot: RssSlotMap,
     id_to_slot: HashMap<u64, usize>,
     dirty_slots: Vec<usize>,
     active_count: usize,
@@ -212,7 +332,7 @@ impl RawTailTable {
             next_id: 1,
             worker_index,
             conns: Vec::new(),
-            rss_to_slot: HashMap::new(),
+            rss_to_slot: RssSlotMap::new(),
             id_to_slot: HashMap::new(),
             dirty_slots: Vec::with_capacity(RAW_TAIL_DIRTY_CAP),
             active_count: 0,
@@ -221,7 +341,7 @@ impl RawTailTable {
 
     pub(crate) fn register(&mut self, tuple: RawTailTuple) -> io::Result<RawTailHandle> {
         let rss_hash = tuple.rss_hash();
-        if let Some(existing_slot) = self.rss_to_slot.get(&rss_hash).copied() {
+        if let Some(existing_slot) = self.rss_to_slot.get(rss_hash) {
             let Some(existing_id) = self
                 .conns
                 .get(existing_slot)
@@ -257,7 +377,24 @@ impl RawTailTable {
             .expect("raw-tail handle id overflow");
         let handle = RawTailHandle::new(id, self.worker_index);
         let slot = self.conns.len();
-        self.rss_to_slot.insert(rss_hash, slot);
+        match self.rss_to_slot.insert(rss_hash, slot) {
+            Ok(None) => {}
+            Ok(Some(existing_slot)) => {
+                panic!(
+                    "raw-tail RSS inserted after duplicate check rss={} existing_slot={}",
+                    rss_hash, existing_slot
+                );
+            }
+            Err(()) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!(
+                        "raw-tail RSS map capacity exceeded cap={}",
+                        RAW_TAIL_RSS_MAP_CAP
+                    ),
+                ));
+            }
+        }
         self.id_to_slot.insert(handle.id, slot);
         self.conns.push(Some(TailConn {
             handle,
@@ -321,7 +458,13 @@ impl RawTailTable {
                 return;
             };
             if let Some(rss) = conn.rss_hash {
-                self.rss_to_slot.remove(&rss);
+                let removed_slot = self.rss_to_slot.remove(rss);
+                if removed_slot != Some(idx) {
+                    panic!(
+                        "raw-tail RSS map remove mismatch rss={} expected_slot={} removed_slot={:?}",
+                        rss, idx, removed_slot
+                    );
+                }
             }
             if conn.active {
                 self.active_count = self
@@ -344,7 +487,7 @@ impl RawTailTable {
             return false;
         }
         let rss = unsafe { mbuf_rss_hash(mbuf) };
-        if let Some(slot) = self.rss_to_slot.get(&rss).copied() {
+        if let Some(slot) = self.rss_to_slot.get(rss) {
             let newly_dirty = {
                 let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
                     return false;
