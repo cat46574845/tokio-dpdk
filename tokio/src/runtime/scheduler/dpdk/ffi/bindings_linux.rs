@@ -3594,6 +3594,12 @@ unsafe extern "C" {
     pub fn dpdk_wrap_rte_pktmbuf_tailroom(m: *const rte_mbuf) -> u16;
 }
 unsafe extern "C" {
+    pub fn dpdk_wrap_rte_eth_dev_rss_hash_conf_get(
+        port_id: u16,
+        rss_conf: *mut rte_eth_rss_conf,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn dpdk_wrap_rte_flow_create_queue_rule(
         port_id: u16,
         priority: u32,

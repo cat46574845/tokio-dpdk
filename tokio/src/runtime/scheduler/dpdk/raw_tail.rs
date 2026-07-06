@@ -17,6 +17,7 @@ const TCP_MIN_HEADER_LEN: usize = 20;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const IPPROTO_TCP: u8 = 6;
 const TCP_FLAG_ACK: u8 = 0x10;
+pub(crate) const RAW_TAIL_REQUIRED_RSS_HF: u64 = 1u64 << 4;
 
 #[cfg(feature = "market-trace")]
 const DPDK_TRACE_AUX_FIELD_BITS: u64 = 21;
@@ -141,15 +142,22 @@ impl RawTailTuple {
         })
     }
 
-    pub(crate) fn rss_hash(&self) -> u32 {
+    pub(crate) fn rss_hash(&self, rss_key: &[u8]) -> u32 {
         let mut tuple = [0u8; 12];
         tuple[..4].copy_from_slice(&self.remote_ip.octets());
         tuple[4..8].copy_from_slice(&self.local_ip.octets());
         tuple[8..10].copy_from_slice(&self.remote_port.to_be_bytes());
         tuple[10..12].copy_from_slice(&self.local_port.to_be_bytes());
-        toeplitz_hash(&tuple, &RAW_TAIL_RSS_KEY)
+        toeplitz_hash(&tuple, rss_key)
     }
 
+    #[cfg(feature = "dpdk-debug")]
+    fn matches_packet(&self, pkt: &ParsedTcpPacket<'_>) -> bool {
+        self.local_ip == pkt.local_ip
+            && self.remote_ip == pkt.remote_ip
+            && self.local_port == pkt.local_port
+            && self.remote_port == pkt.remote_port
+    }
 }
 
 struct TailRing {
@@ -337,6 +345,8 @@ impl RssSlotMap {
 
 struct TailConn {
     handle: RawTailHandle,
+    #[cfg(feature = "dpdk-debug")]
+    tuple: RawTailTuple,
     rss_hash: Option<u32>,
     ring: TailRing,
     segments: Vec<TailSegment>,
@@ -391,6 +401,7 @@ impl Drop for TailConn {
 pub(crate) struct RawTailTable {
     next_id: u64,
     worker_index: usize,
+    rss_key: Box<[u8]>,
     conns: Vec<Option<TailConn>>,
     rss_to_slot: RssSlotMap,
     id_to_slot: HashMap<u64, usize>,
@@ -401,10 +412,14 @@ pub(crate) struct RawTailTable {
 unsafe impl Send for RawTailTable {}
 
 impl RawTailTable {
-    pub(crate) fn new(worker_index: usize) -> Self {
+    pub(crate) fn new(worker_index: usize, rss_key: &[u8]) -> Self {
+        if rss_key.is_empty() {
+            panic!("raw-tail RSS key must not be empty");
+        }
         Self {
             next_id: 1,
             worker_index,
+            rss_key: rss_key.into(),
             conns: Vec::new(),
             rss_to_slot: RssSlotMap::new(),
             id_to_slot: HashMap::new(),
@@ -414,7 +429,7 @@ impl RawTailTable {
     }
 
     pub(crate) fn register(&mut self, tuple: RawTailTuple) -> io::Result<RawTailHandle> {
-        let rss_hash = tuple.rss_hash();
+        let rss_hash = tuple.rss_hash(&self.rss_key);
         if let Some(existing_slot) = self.rss_to_slot.get(rss_hash) {
             let Some(existing_id) = self
                 .conns
@@ -472,6 +487,8 @@ impl RawTailTable {
         self.id_to_slot.insert(handle.id, slot);
         self.conns.push(Some(TailConn {
             handle,
+            #[cfg(feature = "dpdk-debug")]
+            tuple,
             rss_hash: Some(rss_hash),
             ring: TailRing::new(),
             segments: Vec::with_capacity(RAW_TAIL_RING_CAP),
@@ -572,7 +589,40 @@ impl RawTailTable {
             }
             return true;
         }
+        #[cfg(feature = "dpdk-debug")]
+        self.assert_no_active_tuple_rss_miss(mbuf, rss);
         false
+    }
+
+    #[cfg(feature = "dpdk-debug")]
+    fn assert_no_active_tuple_rss_miss(&self, mbuf: *mut ffi::rte_mbuf, mbuf_rss: u32) {
+        let Some(pkt) = parse_tcp_packet(mbuf) else {
+            return;
+        };
+        for (slot, conn) in self.conns.iter().enumerate() {
+            let Some(conn) = conn.as_ref() else {
+                continue;
+            };
+            if !conn.active || !conn.tuple.matches_packet(&pkt) {
+                continue;
+            }
+            let expected_rss = conn.tuple.rss_hash(&self.rss_key);
+            let mapped_slot = self.rss_to_slot.get(expected_rss);
+            panic!(
+                "active raw-tail packet missed RSS lookup worker={} slot={} handle_id={} mbuf_rss={} expected_rss={} mapped_slot={:?} payload_len={} local={}:{} remote={}:{}",
+                self.worker_index,
+                slot,
+                conn.handle.id,
+                mbuf_rss,
+                expected_rss,
+                mapped_slot,
+                pkt.payload.len(),
+                pkt.local_ip,
+                pkt.local_port,
+                pkt.remote_ip,
+                pkt.remote_port
+            );
+        }
     }
 
     pub(crate) fn flush_acks(&mut self, device: &mut DpdkDevice) {

@@ -3,13 +3,13 @@
 //! This module provides `DpdkDevice` which implements `smoltcp::phy::Device`,
 //! allowing DPDK to be used as the network backend for smoltcp's TCP/IP stack.
 
-use std::ptr;
+use std::{io, ptr};
 
 use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
 
 use super::ffi;
-use super::raw_tail::{ParsedTcpPacket, RawTailTable};
+use super::raw_tail::{ParsedTcpPacket, RawTailTable, RAW_TAIL_REQUIRED_RSS_HF};
 
 // =============================================================================
 // Configuration constants
@@ -159,6 +159,55 @@ mod dpdk_wrappers {
         // SAFETY: Caller guarantees valid mbuf pointer
         unsafe { ffi::dpdk_wrap_rte_pktmbuf_append(mbuf, len) as *mut u8 }
     }
+
+    pub(crate) unsafe fn rss_hash_conf_get(
+        port_id: u16,
+        rss_conf: *mut ffi::rte_eth_rss_conf,
+    ) -> i32 {
+        unsafe { ffi::dpdk_wrap_rte_eth_dev_rss_hash_conf_get(port_id, rss_conf) }
+    }
+}
+
+fn load_actual_rss_key(port_id: u16) -> io::Result<Box<[u8]>> {
+    let mut dev_info: ffi::rte_eth_dev_info = unsafe { std::mem::zeroed() };
+    let ret = unsafe { ffi::rte_eth_dev_info_get(port_id, &mut dev_info) };
+    if ret != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("rte_eth_dev_info_get({}) failed: {}", port_id, ret),
+        ));
+    }
+    let key_len = dev_info.hash_key_size as usize;
+    if key_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("DPDK port {} reports zero RSS key length", port_id),
+        ));
+    }
+    let mut key = vec![0u8; key_len];
+    let mut rss_conf = ffi::rte_eth_rss_conf {
+        rss_key: key.as_mut_ptr(),
+        rss_key_len: dev_info.hash_key_size,
+        rss_hf: 0,
+        algorithm: ffi::rte_eth_hash_function_RTE_ETH_HASH_FUNCTION_DEFAULT,
+    };
+    let ret = unsafe { dpdk_wrappers::rss_hash_conf_get(port_id, &mut rss_conf) };
+    if ret != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("rte_eth_dev_rss_hash_conf_get({}) failed: {}", port_id, ret),
+        ));
+    }
+    if (rss_conf.rss_hf & RAW_TAIL_REQUIRED_RSS_HF) == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "DPDK port {} RSS hf {:#x} does not include raw-tail required IPv4 TCP hf {:#x}",
+                port_id, rss_conf.rss_hf, RAW_TAIL_REQUIRED_RSS_HF
+            ),
+        ));
+    }
+    Ok(key.into_boxed_slice())
 }
 
 // =============================================================================
@@ -176,6 +225,7 @@ pub(crate) struct DpdkDevice {
     queue_id: u16,
     /// mbuf memory pool pointer
     mempool: *mut ffi::rte_mempool,
+    raw_tail_rss_key: Box<[u8]>,
     /// Pending transmit mbufs (buffered for batching)
     tx_buffer: Vec<*mut ffi::rte_mbuf>,
     /// Received mbufs pending processing
@@ -200,21 +250,27 @@ impl DpdkDevice {
     ///
     /// `mempool` must be a valid DPDK memory pool pointer that outlives
     /// this device.
-    pub(crate) unsafe fn new(port_id: u16, queue_id: u16, mempool: *mut ffi::rte_mempool) -> Self {
+    pub(crate) unsafe fn new(
+        port_id: u16,
+        queue_id: u16,
+        mempool: *mut ffi::rte_mempool,
+    ) -> io::Result<Self> {
+        let raw_tail_rss_key = load_actual_rss_key(port_id)?;
         let rx_burst_size = configured_rx_burst_size();
         let rx_burst_len = rx_burst_size as usize;
         let rx_drain_batch_cap = configured_rx_drain_batch_cap();
-        Self {
+        Ok(Self {
             port_id,
             queue_id,
             mempool,
+            raw_tail_rss_key,
             tx_buffer: Vec::with_capacity(TX_BURST_SIZE as usize),
             rx_pending: Vec::with_capacity(rx_burst_len),
             rx_index: 0,
             rx_burst_buf: vec![ptr::null_mut(); rx_burst_len],
             rx_burst_size,
             rx_drain_batch: Vec::with_capacity(rx_drain_batch_cap.max(rx_burst_len)),
-        }
+        })
     }
 
     /// Get the port ID.
@@ -228,6 +284,10 @@ impl DpdkDevice {
     #[allow(dead_code)]
     pub(crate) fn queue_id(&self) -> u16 {
         self.queue_id
+    }
+
+    pub(crate) fn raw_tail_rss_key(&self) -> &[u8] {
+        &self.raw_tail_rss_key
     }
 
     /// Try to receive packets from DPDK.

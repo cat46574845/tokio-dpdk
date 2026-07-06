@@ -2706,4 +2706,9 @@ unsafe extern "C" {
     pub fn dpdk_wrap_rte_pktmbuf_headroom(m: *const rte_mbuf) -> u16;
 
     pub fn dpdk_wrap_rte_pktmbuf_tailroom(m: *const rte_mbuf) -> u16;
+
+    pub fn dpdk_wrap_rte_eth_dev_rss_hash_conf_get(
+        port_id: u16,
+        rss_conf: *mut rte_eth_rss_conf,
+    ) -> ::core::ffi::c_int;
 }

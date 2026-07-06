@@ -11,9 +11,7 @@ use std::io;
 
 use super::device::DpdkDevice;
 use super::ffi;
-use super::raw_tail::RAW_TAIL_RSS_KEY;
-
-const RTE_ETH_RSS_NONFRAG_IPV4_TCP: u64 = 1u64 << 4;
+use super::raw_tail::{RAW_TAIL_REQUIRED_RSS_HF, RAW_TAIL_RSS_KEY};
 
 /// A fully initialized DPDK worker for multi-queue mode.
 ///
@@ -174,7 +172,7 @@ pub(crate) fn init_port(
     port_conf.rxmode.mq_mode = ffi::rte_eth_rx_mq_mode_RTE_ETH_MQ_RX_RSS;
     port_conf.rx_adv_conf.rss_conf.rss_key = RAW_TAIL_RSS_KEY.as_ptr() as *mut u8;
     port_conf.rx_adv_conf.rss_conf.rss_key_len = dev_info.hash_key_size;
-    port_conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP;
+    port_conf.rx_adv_conf.rss_conf.rss_hf = RAW_TAIL_REQUIRED_RSS_HF;
     port_conf.rx_adv_conf.rss_conf.algorithm =
         ffi::rte_eth_hash_function_RTE_ETH_HASH_FUNCTION_DEFAULT;
     let ret =
@@ -402,7 +400,7 @@ pub(crate) fn initialize_dpdk_from_plan(
         })?;
 
         // Create DpdkDevice with specific queue_id
-        let dpdk_device = unsafe { DpdkDevice::new(port_id, allocation.queue_id, mempool) };
+        let dpdk_device = unsafe { DpdkDevice::new(port_id, allocation.queue_id, mempool) }?;
 
         workers.push(InitializedWorker {
             device: dpdk_device,

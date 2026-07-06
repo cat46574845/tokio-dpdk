@@ -84,6 +84,13 @@ uint16_t dpdk_wrap_rte_pktmbuf_tailroom(const struct rte_mbuf *m)
     return rte_pktmbuf_tailroom(m);
 }
 
+int dpdk_wrap_rte_eth_dev_rss_hash_conf_get(
+    uint16_t port_id,
+    struct rte_eth_rss_conf *rss_conf)
+{
+    return rte_eth_dev_rss_hash_conf_get(port_id, rss_conf);
+}
+
 /* ============================================================
  * rte_flow wrappers for multi-queue traffic routing
  * ============================================================ */

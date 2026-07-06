@@ -258,6 +258,7 @@ impl DpdkDriver {
 
         // Create socket set
         let sockets = SocketSet::new(vec![]);
+        let raw_tail_rss_key = device.raw_tail_rss_key().to_vec();
 
         Self {
             worker_index,
@@ -268,7 +269,7 @@ impl DpdkDriver {
             registered_sockets: HashSet::new(),
             buffer_pool: TcpBufferPool::with_defaults(),
             bound_ports: HashSet::new(),
-            raw_tail: RawTailTable::new(worker_index),
+            raw_tail: RawTailTable::new(worker_index, &raw_tail_rss_key),
             pending_egress_heap: Vec::new(),
             pending_egress_pos: Vec::new(),
             ingress_touched: Vec::new(),
