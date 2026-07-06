@@ -5,8 +5,15 @@ pub(crate) type EndHook = fn(start_ns: u64, span_id: u16, track_id: u32, aux: u6
 pub(crate) type CompleteHook =
     fn(start_ns: u64, dur_ns: u64, span_id: u16, track_id: u32, aux: u64);
 pub(crate) type CounterHook = fn(counter_id: u16, track_id: u32, value: u64);
-pub(crate) type TaskQueueEnterHook = fn(queue_source: u8, queue_wait_ns: u64);
+pub(crate) type TaskQueueEnterHook = fn(
+    queue_source: u8,
+    queue_wait_ns: u64,
+    task_id: u64,
+    task_kind_id: u32,
+    queue_depth: u32,
+);
 pub(crate) type TaskQueueExitHook = fn();
+pub(crate) type TaskNameHook = fn(name: &'static str) -> u32;
 
 pub(crate) const TRACK_TOKIO_CURRENT: u32 = 40_000;
 pub(crate) const TRACK_DPDK_BASE: u32 = 41_000;
@@ -28,12 +35,17 @@ pub(crate) const SPAN_DPDK_PROCESS_LOCAL_SPAWN: u16 = 121;
 pub(crate) const SPAN_DPDK_MAINTENANCE: u16 = 122;
 pub(crate) const SPAN_DPDK_SMOLTCP_INGRESS: u16 = 123;
 pub(crate) const SPAN_DPDK_SMOLTCP_EGRESS: u16 = 124;
+pub(crate) const SPAN_DPDK_SMOLTCP_POLL_AT_HANDLE: u16 = 125;
+pub(crate) const SPAN_DPDK_SMOLTCP_TCP_LOOKUP: u16 = 126;
+pub(crate) const SPAN_DPDK_RAW_TAIL_RECORD_DETAIL: u16 = 127;
 pub(crate) const COUNTER_DPDK_QUEUE_TOTAL_DEPTH: u16 = 130;
 pub(crate) const COUNTER_DPDK_RUN_QUEUE_DEPTH: u16 = 131;
 pub(crate) const COUNTER_DPDK_OVERFLOW_DEPTH: u16 = 132;
 pub(crate) const COUNTER_DPDK_PER_WORKER_INJECT_DEPTH: u16 = 133;
 pub(crate) const COUNTER_DPDK_GLOBAL_INJECT_DEPTH: u16 = 134;
 pub(crate) const COUNTER_DPDK_LIFO_DEPTH: u16 = 135;
+pub(crate) const COUNTER_DPDK_LOCAL_SPAWN_DEPTH: u16 = 136;
+pub(crate) const COUNTER_DPDK_DEFER_DEPTH: u16 = 137;
 
 struct Hooks {
     begin: BeginHook,
@@ -49,6 +61,7 @@ struct TaskQueueHooks {
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
 static TASK_QUEUE_HOOKS: OnceLock<TaskQueueHooks> = OnceLock::new();
+static TASK_NAME_HOOK: OnceLock<TaskNameHook> = OnceLock::new();
 static SCHED_DETAIL: OnceLock<bool> = OnceLock::new();
 
 pub(crate) const QUEUE_SOURCE_UNKNOWN: u8 = 0;
@@ -96,12 +109,21 @@ pub fn set_hooks(
 
 /// Registers hooks that expose the currently polled task queue source to the host trace recorder.
 pub fn set_task_queue_hooks(
-    enter: fn(queue_source: u8, queue_wait_ns: u64),
+    enter: fn(queue_source: u8, queue_wait_ns: u64, task_id: u64, task_kind_id: u32, queue_depth: u32),
     exit: fn(),
 ) -> Result<(), ()> {
     TASK_QUEUE_HOOKS
         .set(TaskQueueHooks { enter, exit })
         .map_err(|_| ())
+}
+
+pub fn set_task_name_hook(register: fn(name: &'static str) -> u32) -> Result<(), ()> {
+    TASK_NAME_HOOK.set(register).map_err(|_| ())
+}
+
+#[inline(always)]
+pub(crate) fn task_name_id(name: &'static str) -> u32 {
+    TASK_NAME_HOOK.get().map(|register| register(name)).unwrap_or(0)
 }
 
 pub(crate) struct TaskQueueGuard {
@@ -120,9 +142,21 @@ impl Drop for TaskQueueGuard {
 }
 
 #[inline(always)]
-pub(crate) fn enter_task_queue(queue_source: u8, queue_wait_ns: u64) -> TaskQueueGuard {
+pub(crate) fn enter_task_queue(
+    queue_source: u8,
+    queue_wait_ns: u64,
+    task_id: u64,
+    task_kind_id: u32,
+    queue_depth: u32,
+) -> TaskQueueGuard {
     let active = if let Some(hooks) = TASK_QUEUE_HOOKS.get() {
-        (hooks.enter)(queue_source, queue_wait_ns);
+        (hooks.enter)(
+            queue_source,
+            queue_wait_ns,
+            task_id,
+            task_kind_id,
+            queue_depth,
+        );
         true
     } else {
         false

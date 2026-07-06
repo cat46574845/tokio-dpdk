@@ -586,6 +586,13 @@ impl<S: Schedule> LocalNotified<S> {
         unsafe { Header::get_id(self.task.raw.header_ptr()).as_u64() }
     }
 
+    #[cfg(feature = "market-trace")]
+    pub(crate) fn market_trace_task_kind_id(&self) -> u32 {
+        self.task.header().market_trace_task_kind_id.load(
+            crate::loom::sync::atomic::Ordering::Acquire,
+        )
+    }
+
     /// Runs the task.
     pub(crate) fn run(self) {
         let raw = self.task.raw;

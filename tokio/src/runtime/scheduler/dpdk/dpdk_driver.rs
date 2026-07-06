@@ -297,6 +297,20 @@ impl DpdkDriver {
         } else {
             0
         };
+        #[cfg(feature = "market-trace")]
+        let flush_tx_before_stats = if trace_flush_tx_before {
+            match self.device.flush_tx_with_stats() {
+                Ok(stats) => stats,
+                Err(error) => {
+                    eprintln!("[tokio-dpdk] flush_tx_before failed during trace: {error}");
+                    Default::default()
+                }
+            }
+        } else {
+            let _ = self.device.flush_tx();
+            Default::default()
+        };
+        #[cfg(not(feature = "market-trace"))]
         let _ = self.device.flush_tx();
         #[cfg(feature = "market-trace")]
         let flush_tx_before_dur_ns = if trace_flush_tx_before {
@@ -356,6 +370,16 @@ impl DpdkDriver {
         let mut smoltcp_ingress_state_changes = 0usize;
         #[cfg(feature = "market-trace")]
         let mut smoltcp_ingress_touched = 0usize;
+        #[cfg(feature = "market-trace")]
+        let mut smoltcp_poll_at_handle_count = 0usize;
+        #[cfg(feature = "market-trace")]
+        let mut smoltcp_poll_at_handle_queued = 0usize;
+        #[cfg(feature = "market-trace")]
+        let mut smoltcp_tcp_cache_hits = 0usize;
+        #[cfg(feature = "market-trace")]
+        let mut smoltcp_tcp_cache_misses = 0usize;
+        #[cfg(feature = "market-trace")]
+        let mut smoltcp_tcp_linear_scanned = 0usize;
 
         #[cfg(feature = "market-trace")]
         let smoltcp_ingress_start_ns = if trace_poll {
@@ -363,6 +387,12 @@ impl DpdkDriver {
         } else {
             0
         };
+        #[cfg(feature = "market-trace")]
+        let mut smoltcp_ingress_done_ns = smoltcp_ingress_start_ns;
+        #[cfg(feature = "market-trace")]
+        let mut smoltcp_poll_at_handle_start_ns = 0u64;
+        #[cfg(feature = "market-trace")]
+        let mut smoltcp_poll_at_handle_dur_ns = 0u64;
         if has_smoltcp_rx {
             let mut ingress_touched = std::mem::take(&mut self.ingress_touched);
             let mut ingress_touched_bits = std::mem::take(&mut self.ingress_touched_bits);
@@ -405,10 +435,46 @@ impl DpdkDriver {
             {
                 smoltcp_ingress_touched = ingress_touched.len();
             }
+            #[cfg(feature = "market-trace")]
+            let tcp_probe_stats = self.iface.take_tcp_probe_stats();
+            #[cfg(feature = "market-trace")]
+            {
+                smoltcp_tcp_cache_hits = tcp_probe_stats.cache_hits;
+                smoltcp_tcp_cache_misses = tcp_probe_stats.cache_misses;
+                smoltcp_tcp_linear_scanned = tcp_probe_stats.linear_scanned;
+            }
+            #[cfg(feature = "market-trace")]
+            {
+                smoltcp_ingress_done_ns = crate::runtime::market_trace::now_ns();
+            }
+            #[cfg(feature = "market-trace")]
+            {
+                smoltcp_poll_at_handle_start_ns = if trace_poll {
+                    crate::runtime::market_trace::now_ns()
+                } else {
+                    0
+                };
+            }
             for handle in ingress_touched.iter().copied() {
+                #[cfg(feature = "market-trace")]
+                {
+                    smoltcp_poll_at_handle_count += 1;
+                }
                 if let Some(next_due) = self.iface.poll_at_handle(smol_now, &self.sockets, handle) {
+                    #[cfg(feature = "market-trace")]
+                    {
+                        smoltcp_poll_at_handle_queued += 1;
+                    }
                     self.queue_egress_at(handle, next_due);
                 }
+            }
+            #[cfg(feature = "market-trace")]
+            {
+                smoltcp_poll_at_handle_dur_ns = if trace_poll {
+                    crate::runtime::market_trace::now_ns().saturating_sub(smoltcp_poll_at_handle_start_ns)
+                } else {
+                    0
+                };
             }
             ingress_touched.clear();
             self.ingress_touched = ingress_touched;
@@ -416,7 +482,7 @@ impl DpdkDriver {
         }
         #[cfg(feature = "market-trace")]
         let smoltcp_ingress_dur_ns = if trace_poll {
-            crate::runtime::market_trace::now_ns().saturating_sub(smoltcp_ingress_start_ns)
+            smoltcp_ingress_done_ns.saturating_sub(smoltcp_ingress_start_ns)
         } else {
             0
         };
@@ -460,6 +526,20 @@ impl DpdkDriver {
         } else {
             0
         };
+        #[cfg(feature = "market-trace")]
+        let flush_tx_after_stats = if trace_flush_tx_after {
+            match self.device.flush_tx_with_stats() {
+                Ok(stats) => stats,
+                Err(error) => {
+                    eprintln!("[tokio-dpdk] flush_tx_after failed during trace: {error}");
+                    Default::default()
+                }
+            }
+        } else {
+            let _ = self.device.flush_tx();
+            Default::default()
+        };
+        #[cfg(not(feature = "market-trace"))]
         let _ = self.device.flush_tx();
         #[cfg(feature = "market-trace")]
         let flush_tx_after_dur_ns = if trace_flush_tx_after {
@@ -487,7 +567,11 @@ impl DpdkDriver {
                 flush_tx_before_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_FLUSH_TX,
                 track_id,
-                0,
+                pack_trace_aux3(
+                    0,
+                    flush_tx_before_stats.total_packets,
+                    flush_tx_before_stats.zero_retries,
+                ),
             );
             if drain_rx_stats.trace_start_ns != 0 {
                 crate::runtime::market_trace::complete(
@@ -532,6 +616,28 @@ impl DpdkDriver {
                 ),
             );
             crate::runtime::market_trace::complete(
+                smoltcp_ingress_start_ns,
+                smoltcp_ingress_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_TCP_LOOKUP,
+                track_id,
+                pack_trace_aux3(
+                    smoltcp_tcp_cache_hits,
+                    smoltcp_tcp_cache_misses,
+                    smoltcp_tcp_linear_scanned,
+                ),
+            );
+            crate::runtime::market_trace::complete(
+                smoltcp_poll_at_handle_start_ns,
+                smoltcp_poll_at_handle_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_POLL_AT_HANDLE,
+                track_id,
+                pack_trace_aux3(
+                    smoltcp_poll_at_handle_count,
+                    smoltcp_poll_at_handle_queued,
+                    smoltcp_ingress_touched,
+                ),
+            );
+            crate::runtime::market_trace::complete(
                 smoltcp_egress_start_ns,
                 smoltcp_egress_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_EGRESS,
@@ -547,7 +653,11 @@ impl DpdkDriver {
                 flush_tx_after_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_FLUSH_TX,
                 track_id,
-                1,
+                pack_trace_aux3(
+                    1,
+                    flush_tx_after_stats.total_packets,
+                    flush_tx_after_stats.zero_retries,
+                ),
             );
         }
         active

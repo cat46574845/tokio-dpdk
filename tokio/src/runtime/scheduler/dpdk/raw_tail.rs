@@ -18,6 +18,11 @@ const ETHERTYPE_IPV4: u16 = 0x0800;
 const IPPROTO_TCP: u8 = 6;
 const TCP_FLAG_ACK: u8 = 0x10;
 
+#[cfg(feature = "market-trace")]
+const DPDK_TRACE_AUX_FIELD_BITS: u64 = 21;
+#[cfg(feature = "market-trace")]
+const DPDK_TRACE_AUX_FIELD_MASK: u64 = (1u64 << DPDK_TRACE_AUX_FIELD_BITS) - 1;
+
 pub(crate) const RAW_TAIL_RSS_KEY: [u8; 40] = [
     0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
     0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
@@ -25,6 +30,32 @@ pub(crate) const RAW_TAIL_RSS_KEY: [u8; 40] = [
     0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
     0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
 ];
+
+#[cfg(feature = "market-trace")]
+#[inline(always)]
+fn pack_trace_aux3(a: usize, b: usize, c: usize) -> u64 {
+    ((a as u64) & DPDK_TRACE_AUX_FIELD_MASK)
+        | (((b as u64) & DPDK_TRACE_AUX_FIELD_MASK) << DPDK_TRACE_AUX_FIELD_BITS)
+        | (((c as u64) & DPDK_TRACE_AUX_FIELD_MASK) << (DPDK_TRACE_AUX_FIELD_BITS * 2))
+}
+
+#[cfg(feature = "market-trace")]
+#[inline(always)]
+fn complete_raw_tail_record_detail(
+    start_ns: u64,
+    handle: RawTailHandle,
+    header_checks: usize,
+    copy_attempts: usize,
+    mbufs_popped: usize,
+) {
+    crate::runtime::market_trace::complete(
+        start_ns,
+        crate::runtime::market_trace::now_ns().saturating_sub(start_ns),
+        crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_RECORD_DETAIL,
+        crate::runtime::market_trace::dpdk_track(handle.worker_index()),
+        pack_trace_aux3(header_checks, copy_attempts, mbufs_popped),
+    );
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Identifies a TCP flow registered in the DPDK raw-tail receiver.
@@ -721,6 +752,14 @@ impl RawTailTable {
             return None;
         };
         let poll_generation = conn.poll_generation;
+        #[cfg(feature = "market-trace")]
+        let trace_start_ns = crate::runtime::market_trace::now_ns();
+        #[cfg(feature = "market-trace")]
+        let mut trace_header_checks = 0usize;
+        #[cfg(feature = "market-trace")]
+        let mut trace_copy_attempts = 0usize;
+        #[cfg(feature = "market-trace")]
+        let mut trace_mbufs_popped = 0usize;
 
         loop {
             if let Some(segment) = conn.cursor.current_segment {
@@ -730,7 +769,15 @@ impl RawTailTable {
                     continue;
                 };
                 loop {
+                    #[cfg(feature = "market-trace")]
+                    {
+                        trace_header_checks += 1;
+                    }
                     if looks_like_tls_header(&segment.payload[offset..]) {
+                        #[cfg(feature = "market-trace")]
+                        {
+                            trace_copy_attempts += 1;
+                        }
                         let record_len =
                             5 + u16::from_be_bytes([segment.payload[offset + 3], segment.payload[offset + 4]]) as usize;
                         let start_seq = segment.tcp_seq.wrapping_add(offset as u32);
@@ -745,6 +792,14 @@ impl RawTailTable {
                         conn.segments.pop();
                         conn.cursor.next_offset = offset.checked_sub(1);
                         if copied {
+                            #[cfg(feature = "market-trace")]
+                            complete_raw_tail_record_detail(
+                                trace_start_ns,
+                                conn.handle,
+                                trace_header_checks,
+                                trace_copy_attempts,
+                                trace_mbufs_popped,
+                            );
                             return Some(RawTailRecord {
                                 handle: conn.handle,
                                 rss_hash,
@@ -766,8 +821,20 @@ impl RawTailTable {
             }
 
             let Some(mbuf) = Self::pop_cursor_mbuf(conn) else {
+                #[cfg(feature = "market-trace")]
+                complete_raw_tail_record_detail(
+                    trace_start_ns,
+                    conn.handle,
+                    trace_header_checks,
+                    trace_copy_attempts,
+                    trace_mbufs_popped,
+                );
                 return None;
             };
+            #[cfg(feature = "market-trace")]
+            {
+                trace_mbufs_popped += 1;
+            }
             let Some(segment) = build_tail_segment(
                 mbuf,
                 conn.cursor.inferred_payload_offset,

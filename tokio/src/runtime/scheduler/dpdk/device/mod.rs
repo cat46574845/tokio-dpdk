@@ -38,6 +38,13 @@ pub(crate) struct DrainRxStats {
     pub(crate) trace_dur_ns: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TxFlushStats {
+    pub(crate) total_packets: usize,
+    pub(crate) burst_calls: usize,
+    pub(crate) zero_retries: usize,
+}
+
 impl DrainRxStats {
     #[inline(always)]
     pub(crate) fn received_any(self) -> bool {
@@ -281,17 +288,24 @@ impl DpdkDevice {
     ///
     /// This should be called periodically to ensure packets are sent.
     pub(crate) fn flush_tx(&mut self) -> std::io::Result<()> {
+        self.flush_tx_with_stats().map(|_| ())
+    }
+
+    pub(crate) fn flush_tx_with_stats(&mut self) -> std::io::Result<TxFlushStats> {
+        let mut stats = TxFlushStats::default();
         if self.tx_buffer.is_empty() {
-            return Ok(());
+            return Ok(stats);
         }
 
         let mut sent_count = 0usize;
         let total = self.tx_buffer.len();
+        stats.total_packets = total;
         let mut retry_count = 0;
         const MAX_RETRIES: usize = 10;
 
         // Try to send all buffered packets with retry
         while sent_count < total {
+            stats.burst_calls = stats.burst_calls.saturating_add(1);
             let n = unsafe {
                 dpdk_wrappers::tx_burst(
                     self.port_id,
@@ -303,6 +317,7 @@ impl DpdkDevice {
 
             if n == 0 {
                 retry_count += 1;
+                stats.zero_retries = stats.zero_retries.saturating_add(1);
                 if retry_count >= MAX_RETRIES {
                     // Failed to send after max retries, log and free remaining mbufs
                     eprintln!(
@@ -335,7 +350,7 @@ impl DpdkDevice {
         }
 
         self.tx_buffer.clear();
-        Ok(())
+        Ok(stats)
     }
 
     #[inline(always)]

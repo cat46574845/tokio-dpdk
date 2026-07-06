@@ -29,6 +29,11 @@ impl Defer {
         self.deferred.borrow().is_empty()
     }
 
+    #[cfg(feature = "market-trace")]
+    pub(crate) fn len(&self) -> usize {
+        self.deferred.borrow().len()
+    }
+
     pub(crate) fn wake(&self) {
         while let Some(waker) = self.deferred.borrow_mut().pop() {
             waker.wake();

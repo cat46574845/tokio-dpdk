@@ -178,6 +178,9 @@ pub(crate) struct Header {
     #[cfg(feature = "market-trace")]
     pub(super) market_trace_queue_source: crate::loom::sync::atomic::AtomicU8,
 
+    #[cfg(feature = "market-trace")]
+    pub(super) market_trace_task_kind_id: crate::loom::sync::atomic::AtomicU32,
+
     #[cfg(feature = "dpdk")]
     pub(super) dpdk_worker_affinity: crate::loom::sync::atomic::AtomicUsize,
 
@@ -247,6 +250,7 @@ impl<T: Future, S: Schedule> Cell<T, S> {
         fn new_header(
             state: State,
             vtable: &'static Vtable,
+            #[cfg(feature = "market-trace")] market_trace_task_kind_id: u32,
             #[cfg(all(tokio_unstable, feature = "tracing"))] tracing_id: Option<tracing::Id>,
         ) -> Header {
             Header {
@@ -257,6 +261,10 @@ impl<T: Future, S: Schedule> Cell<T, S> {
                 #[cfg(feature = "market-trace")]
                 market_trace_queue_source: crate::loom::sync::atomic::AtomicU8::new(
                     crate::runtime::market_trace::QUEUE_SOURCE_UNKNOWN,
+                ),
+                #[cfg(feature = "market-trace")]
+                market_trace_task_kind_id: crate::loom::sync::atomic::AtomicU32::new(
+                    market_trace_task_kind_id,
                 ),
                 #[cfg(feature = "dpdk")]
                 dpdk_worker_affinity: crate::loom::sync::atomic::AtomicUsize::new(usize::MAX),
@@ -270,11 +278,16 @@ impl<T: Future, S: Schedule> Cell<T, S> {
         #[cfg(all(tokio_unstable, feature = "tracing"))]
         let tracing_id = future.id();
         let vtable = raw::vtable::<T, S>();
+        #[cfg(feature = "market-trace")]
+        let market_trace_task_kind_id =
+            crate::runtime::market_trace::task_name_id(std::any::type_name::<T>());
         let result = Box::new(Cell {
             trailer: Trailer::new(scheduler.hooks()),
             header: new_header(
                 state,
                 vtable,
+                #[cfg(feature = "market-trace")]
+                market_trace_task_kind_id,
                 #[cfg(all(tokio_unstable, feature = "tracing"))]
                 tracing_id,
             ),

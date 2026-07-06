@@ -442,6 +442,8 @@ struct TraceQueueDepths {
     per_worker_inject: usize,
     global_inject: usize,
     lifo: usize,
+    local_spawn: usize,
+    defer: usize,
     total: usize,
 }
 
@@ -454,6 +456,8 @@ impl TraceQueueDepths {
             per_worker_inject: usize::MAX,
             global_inject: usize::MAX,
             lifo: usize::MAX,
+            local_spawn: usize::MAX,
+            defer: usize::MAX,
             total: usize::MAX,
         }
     }
@@ -1512,8 +1516,11 @@ impl Context {
     fn trace_queue_depths(&self) {
         let index = self.worker.index;
         let track_id = crate::runtime::market_trace::dpdk_track(index);
-        let per_worker_inject = self.worker.handle.shared.remotes[index].per_inject.len();
+        let remote = &self.worker.handle.shared.remotes[index];
+        let per_worker_inject = remote.per_inject.len();
         let global_inject = self.worker.handle.shared.inject.len();
+        let local_spawn = remote.local_spawn_queue.lock().unwrap().len();
+        let defer = self.defer.len();
 
         let mut core = self.core.borrow_mut();
         let Some(core) = core.as_mut() else {
@@ -1527,7 +1534,9 @@ impl Context {
             .saturating_add(overflow)
             .saturating_add(per_worker_inject)
             .saturating_add(global_inject)
-            .saturating_add(lifo);
+            .saturating_add(lifo)
+            .saturating_add(local_spawn)
+            .saturating_add(defer);
 
         if core.trace_queue_depths.total != total {
             crate::runtime::market_trace::counter(
@@ -1577,6 +1586,47 @@ impl Context {
             );
             core.trace_queue_depths.lifo = lifo;
         }
+        if core.trace_queue_depths.local_spawn != local_spawn {
+            crate::runtime::market_trace::counter(
+                crate::runtime::market_trace::COUNTER_DPDK_LOCAL_SPAWN_DEPTH,
+                track_id,
+                local_spawn as u64,
+            );
+            core.trace_queue_depths.local_spawn = local_spawn;
+        }
+        if core.trace_queue_depths.defer != defer {
+            crate::runtime::market_trace::counter(
+                crate::runtime::market_trace::COUNTER_DPDK_DEFER_DEPTH,
+                track_id,
+                defer as u64,
+            );
+            core.trace_queue_depths.defer = defer;
+        }
+    }
+
+    #[cfg(feature = "market-trace")]
+    fn trace_queue_total_depth(&self) -> usize {
+        let index = self.worker.index;
+        let remote = &self.worker.handle.shared.remotes[index];
+        let per_worker_inject = remote.per_inject.len();
+        let global_inject = self.worker.handle.shared.inject.len();
+        let local_spawn = remote.local_spawn_queue.lock().unwrap().len();
+        let defer = self.defer.len();
+        let core = self.core.borrow();
+        let Some(core) = core.as_ref() else {
+            return per_worker_inject
+                .saturating_add(global_inject)
+                .saturating_add(local_spawn)
+                .saturating_add(defer);
+        };
+        core.run_queue
+            .len()
+            .saturating_add(core.local_overflow.len())
+            .saturating_add(usize::from(core.lifo_slot.is_some()))
+            .saturating_add(per_worker_inject)
+            .saturating_add(global_inject)
+            .saturating_add(local_spawn)
+            .saturating_add(defer)
     }
 
     fn tick(&self) {
@@ -1737,7 +1787,19 @@ impl Context {
         #[cfg(feature = "market-trace")]
         let task_id = task.market_trace_task_id();
         #[cfg(feature = "market-trace")]
+        let task_kind_id = task.market_trace_task_kind_id();
+        #[cfg(feature = "market-trace")]
+        let task_queue_depth = self.trace_queue_total_depth().min(u32::MAX as usize) as u32;
+        #[cfg(feature = "market-trace")]
         let run_start_ns = crate::runtime::market_trace::now_ns();
+        #[cfg(feature = "market-trace")]
+        let _task_queue_guard = crate::runtime::market_trace::enter_task_queue(
+            task_queue_source,
+            task_queue_wait_ns,
+            task_id,
+            task_kind_id,
+            task_queue_depth,
+        );
         crate::task::coop::budget(|| {
             task.run();
         });
@@ -1754,12 +1816,14 @@ impl Context {
             let threshold_ns = long_task_threshold_ns();
             if threshold_ns != 0 && run_dur_ns >= threshold_ns {
                 eprintln!(
-                    "[tokio-dpdk] long_task id={} worker={} dur_ns={} queue_source={} queue_wait_ns={}",
+                    "[tokio-dpdk] long_task id={} kind={} worker={} dur_ns={} queue_source={} queue_wait_ns={} queue_depth={}",
                     task_id,
+                    task_kind_id,
                     self.worker.index,
                     run_dur_ns,
                     task_queue_source,
-                    task_queue_wait_ns
+                    task_queue_wait_ns,
+                    task_queue_depth
                 );
             }
         }
