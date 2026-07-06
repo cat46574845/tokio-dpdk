@@ -226,10 +226,19 @@ impl Handle {
                     );
 
                     if same_runtime && worker::current_worker_index() == Some(worker_index) {
-                        if let Some(core) = cx.core.borrow_mut().as_mut() {
-                            self.schedule_local(core, task, is_yield);
-                            return;
+                        match cx.core.try_borrow_mut() {
+                            Ok(mut core_slot) => {
+                                if let Some(core) = core_slot.as_mut() {
+                                    self.schedule_local(core, task, is_yield);
+                                } else {
+                                    self.push_current_worker_task_no_core(worker_index, task);
+                                }
+                            }
+                            Err(_) => {
+                                self.push_current_worker_task_no_core(worker_index, task);
+                            }
                         }
+                        return;
                     }
                 }
 
@@ -249,12 +258,18 @@ impl Handle {
                 );
 
                 if same_runtime {
-                    // Schedule locally
-                    if let Some(core) = cx.core.borrow_mut().as_mut() {
-                        self.schedule_local(core, task, is_yield);
-                        return;
+                    match cx.core.try_borrow_mut() {
+                        Ok(mut core_slot) => {
+                            if let Some(core) = core_slot.as_mut() {
+                                self.schedule_local(core, task, is_yield);
+                            } else {
+                                self.push_current_worker_task_no_core(cx.worker.index, task);
+                            }
+                        }
+                        Err(_) => {
+                            self.push_current_worker_task_no_core(cx.worker.index, task);
+                        }
                     }
-                    self.push_current_worker_task_no_core(cx.worker.index, task);
                     return;
                 }
 
@@ -434,10 +449,19 @@ impl Handle {
             if worker::current_worker_index() == Some(worker_index) {
                 worker::with_current(|ctx| {
                     if let Some(cx) = ctx {
-                        if let Some(core) = cx.core.borrow_mut().as_mut() {
-                            me.schedule_local(core, task, false);
-                            return;
+                        match cx.core.try_borrow_mut() {
+                            Ok(mut core_slot) => {
+                                if let Some(core) = core_slot.as_mut() {
+                                    me.schedule_local(core, task, false);
+                                } else {
+                                    me.push_current_worker_task_no_core(worker_index, task);
+                                }
+                            }
+                            Err(_) => {
+                                me.push_current_worker_task_no_core(worker_index, task);
+                            }
                         }
+                        return;
                     }
                     me.push_worker_task(worker_index, task);
                 });
@@ -507,10 +531,17 @@ impl Handle {
             // Schedule to local queue
             if let Some(task) = notified {
                 task.dpdk_set_worker_affinity(cx.worker.index);
-                if let Some(core) = cx.core.borrow_mut().as_mut() {
-                    me.schedule_local(core, task, false);
-                } else {
-                    me.push_current_worker_task_no_core(cx.worker.index, task);
+                match cx.core.try_borrow_mut() {
+                    Ok(mut core_slot) => {
+                        if let Some(core) = core_slot.as_mut() {
+                            me.schedule_local(core, task, false);
+                        } else {
+                            me.push_current_worker_task_no_core(cx.worker.index, task);
+                        }
+                    }
+                    Err(_) => {
+                        me.push_current_worker_task_no_core(cx.worker.index, task);
+                    }
                 }
             }
 
