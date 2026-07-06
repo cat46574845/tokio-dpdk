@@ -34,7 +34,7 @@ pub(crate) use worker::Context;
 // Re-export worker context API for TcpDpdkStream
 pub(crate) use worker::{current_worker_index, with_current_driver};
 
-pub use raw_tail::{RawTailCallback, RawTailCallbackResult, RawTailHandle, RawTailRecord};
+pub use raw_tail::{RawTailRecordDecision, RawTailHandle, RawTailReadRequest, RawTailRecord};
 
 // Re-export debug APIs
 pub use worker::{current_tick, current_exec_count, current_scheduler_stats, DpdkSchedulerStats};

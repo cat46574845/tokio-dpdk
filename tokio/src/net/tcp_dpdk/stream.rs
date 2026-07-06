@@ -19,7 +19,9 @@ use crate::net::{to_socket_addrs, ToSocketAddrs};
 
 // Import worker context from dpdk scheduler
 use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver};
-use crate::runtime::scheduler::dpdk::{RawTailCallback, RawTailHandle};
+use crate::runtime::scheduler::dpdk::{
+    RawTailHandle, RawTailReadRequest, RawTailRecord,
+};
 
 use std::marker::PhantomData;
 
@@ -936,8 +938,8 @@ impl TcpDpdkStream {
     /// Divert this connected TCP flow into the DPDK raw-tail market-data path.
     ///
     /// After activation, inbound packets for this flow are captured by RSS hash
-    /// before smoltcp receives them. The caller must register a poll-time
-    /// callback and should not continue reading this stream as a normal TCP stream.
+    /// before smoltcp receives them. The caller must poll raw-tail readiness and
+    /// drain captured TLS candidates explicitly.
     pub fn activate_raw_tail(&self) -> io::Result<RawTailHandle> {
         self.assert_on_correct_worker();
         let handle = self.handle;
@@ -952,15 +954,28 @@ impl TcpDpdkStream {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))?
     }
 
-    /// Register the callback invoked inside the DPDK driver poll for this raw-tail flow.
-    pub fn set_raw_tail_callback(
+    /// Poll until raw-tail has captured packets for this flow.
+    pub fn poll_raw_tail_ready(
         &self,
         handle: RawTailHandle,
-        ctx: *mut (),
-        callback: RawTailCallback,
-    ) -> io::Result<()> {
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         self.assert_on_correct_worker();
-        with_current_driver(|driver| driver.set_raw_tail_callback(handle, ctx, callback))
+        match with_current_driver(|driver| driver.poll_raw_tail_ready(handle, cx)) {
+            Some(result) => result,
+            None => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "driver unavailable"))),
+        }
+    }
+
+    /// Copy the next raw-tail TLS candidate into `out`.
+    pub fn try_next_raw_tail_record<'a>(
+        &self,
+        handle: RawTailHandle,
+        request: RawTailReadRequest,
+        out: &'a mut Vec<u8>,
+    ) -> io::Result<Option<RawTailRecord<'a>>> {
+        self.assert_on_correct_worker();
+        with_current_driver(|driver| driver.next_raw_tail_record(handle, request, out))
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))?
     }
 

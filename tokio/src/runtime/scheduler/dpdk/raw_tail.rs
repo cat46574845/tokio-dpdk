@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ptr;
+use std::task::{Context, Poll, Waker};
 
 use super::device::DpdkDevice;
 use super::ffi;
@@ -9,7 +10,7 @@ use super::ffi;
 const RAW_TAIL_RING_CAP: usize = 256;
 const RAW_TAIL_DIRTY_CAP: usize = 8192;
 const RAW_TAIL_RSS_MAP_CAP: usize = RAW_TAIL_DIRTY_CAP * 4;
-const RAW_TAIL_MAX_TLS_RECORD: usize = 16_640 + 5;
+const RAW_TAIL_DIRTY_NONE: usize = usize::MAX;
 const ETHERNET_HEADER_LEN: usize = 14;
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const TCP_MIN_HEADER_LEN: usize = 20;
@@ -66,8 +67,8 @@ pub struct RawTailRecord<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Result returned by a raw-tail poll-time callback.
-pub enum RawTailCallbackResult {
+/// Result returned by a raw-tail record consumer.
+pub enum RawTailRecordDecision {
     /// A market-data frame was produced for this flow during this driver poll.
     Accepted,
     /// The TLS record decrypted, but the websocket frame was incomplete; try older records.
@@ -76,8 +77,14 @@ pub enum RawTailCallbackResult {
     Rejected,
 }
 
-/// Function invoked inside one DPDK driver poll for each raw-tail TLS candidate.
-pub type RawTailCallback = unsafe fn(*mut (), RawTailRecord<'_>) -> RawTailCallbackResult;
+/// Request for the next raw-tail TLS candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawTailReadRequest {
+    /// Start reading the newest candidate from the current dirty packet batch.
+    Start,
+    /// Continue after the previous candidate was consumed by the caller.
+    After(RawTailRecordDecision),
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct RawTailTuple {
@@ -301,13 +308,47 @@ struct TailConn {
     handle: RawTailHandle,
     rss_hash: Option<u32>,
     ring: TailRing,
-    record_bytes: Vec<u8>,
     segments: Vec<TailSegment>,
-    callback: Option<RawTailCallback>,
-    callback_ctx: *mut (),
-    dirty: bool,
+    waker: Option<Waker>,
+    dirty_slot_pos: usize,
     poll_generation: u64,
     active: bool,
+    cursor: TailCursor,
+}
+
+struct TailCursor {
+    active: bool,
+    remaining: usize,
+    inferred_payload_offset: Option<usize>,
+    inferred_next_seq: Option<u32>,
+    current_segment: Option<TailSegment>,
+    next_offset: Option<usize>,
+}
+
+impl TailCursor {
+    const fn inactive() -> Self {
+        Self {
+            active: false,
+            remaining: 0,
+            inferred_payload_offset: None,
+            inferred_next_seq: None,
+            current_segment: None,
+            next_offset: None,
+        }
+    }
+
+    fn reset(&mut self, ring_len: usize) {
+        self.active = true;
+        self.remaining = ring_len;
+        self.inferred_payload_offset = None;
+        self.inferred_next_seq = None;
+        self.current_segment = None;
+        self.next_offset = None;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::inactive();
+    }
 }
 
 impl Drop for TailConn {
@@ -402,13 +443,12 @@ impl RawTailTable {
             handle,
             rss_hash: Some(rss_hash),
             ring: TailRing::new(),
-            record_bytes: Vec::with_capacity(RAW_TAIL_MAX_TLS_RECORD),
             segments: Vec::with_capacity(RAW_TAIL_RING_CAP),
-            callback: None,
-            callback_ctx: ptr::null_mut(),
-            dirty: false,
+            waker: None,
+            dirty_slot_pos: RAW_TAIL_DIRTY_NONE,
             poll_generation: 0,
             active: false,
+            cursor: TailCursor::inactive(),
         }));
         Ok(handle)
     }
@@ -437,23 +477,6 @@ impl RawTailTable {
         Ok(())
     }
 
-    pub(crate) fn set_callback(
-        &mut self,
-        handle: RawTailHandle,
-        ctx: *mut (),
-        callback: RawTailCallback,
-    ) -> io::Result<()> {
-        let Some(conn) = self.conn_for_handle_mut(handle) else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "raw-tail handle not registered on this worker",
-            ));
-        };
-        conn.callback = Some(callback);
-        conn.callback_ctx = ctx;
-        Ok(())
-    }
-
     pub(crate) fn unregister(&mut self, handle: RawTailHandle) {
         if let Some(idx) = self.slot_for_handle(handle) {
             let Some(conn) = self.conns[idx].as_ref() else {
@@ -475,6 +498,7 @@ impl RawTailTable {
                     .expect("raw-tail active_count underflow");
             }
             self.id_to_slot.remove(&handle.id);
+            self.remove_dirty_slot(idx);
             self.conns[idx] = None;
         }
     }
@@ -490,17 +514,30 @@ impl RawTailTable {
         }
         let rss = unsafe { mbuf_rss_hash(mbuf) };
         if let Some(slot) = self.rss_to_slot.get(rss) {
-            let newly_dirty = {
+            let waker = {
                 let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
                     return false;
                 };
                 if !conn.active {
                     return false;
                 }
-                Self::push_conn_mbuf(conn, mbuf)
+                Self::push_conn_mbuf(conn, mbuf);
+                if conn.dirty_slot_pos == RAW_TAIL_DIRTY_NONE {
+                    conn.waker.take()
+                } else {
+                    None
+                }
             };
-            if newly_dirty {
+            if self
+                .conns
+                .get(slot)
+                .and_then(|conn| conn.as_ref())
+                .is_some_and(|conn| conn.dirty_slot_pos == RAW_TAIL_DIRTY_NONE)
+            {
                 self.push_dirty_slot(slot);
+            }
+            if let Some(waker) = waker {
+                waker.wake();
             }
             return true;
         }
@@ -528,26 +565,88 @@ impl RawTailTable {
         let _ = device.flush_tx();
     }
 
-    pub(crate) fn yield_dirty_records(&mut self) {
-        while let Some(slot) = self.dirty_slots.pop() {
-            let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
-                continue;
-            };
-            conn.dirty = false;
-            Self::yield_latest_tls_records(conn);
-            conn.ring.drain_free();
+    pub(crate) fn poll_ready(
+        &mut self,
+        handle: RawTailHandle,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let Some(conn) = self.conn_for_handle_mut(handle) else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "raw-tail handle not registered on this worker",
+            )));
+        };
+        if conn.dirty_slot_pos != RAW_TAIL_DIRTY_NONE {
+            return Poll::Ready(Ok(()));
         }
+        match conn.waker.as_mut() {
+            Some(waker) => waker.clone_from(cx.waker()),
+            None => conn.waker = Some(cx.waker().clone()),
+        }
+        Poll::Pending
     }
 
-    fn push_conn_mbuf(conn: &mut TailConn, mbuf: *mut ffi::rte_mbuf) -> bool {
+    pub(crate) fn next_record<'a>(
+        &mut self,
+        handle: RawTailHandle,
+        request: RawTailReadRequest,
+        out: &'a mut Vec<u8>,
+    ) -> io::Result<Option<RawTailRecord<'a>>> {
+        let Some(slot) = self.slot_for_handle(handle) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "raw-tail handle not registered on this worker",
+            ));
+        };
+
+        if matches!(request, RawTailReadRequest::After(RawTailRecordDecision::Accepted)) {
+            self.finish_slot(slot);
+            return Ok(None);
+        }
+
+        let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "raw-tail handle not registered on this worker",
+            ));
+        };
+        if conn.dirty_slot_pos == RAW_TAIL_DIRTY_NONE {
+            return Ok(None);
+        }
+        match request {
+            RawTailReadRequest::Start => {
+                if conn.cursor.active {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "raw-tail read started while previous cursor is active",
+                    ));
+                }
+                conn.poll_generation = conn.poll_generation.wrapping_add(1);
+                conn.segments.clear();
+                conn.cursor.reset(conn.ring.len);
+            }
+            RawTailReadRequest::After(RawTailRecordDecision::Rejected | RawTailRecordDecision::NeedPrevious) => {
+                if !conn.cursor.active {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "raw-tail read continued without an active cursor",
+                    ));
+                }
+            }
+            RawTailReadRequest::After(RawTailRecordDecision::Accepted) => unreachable!(),
+        }
+
+        let record = Self::next_record_from_conn(conn, out);
+        if record.is_none() {
+            self.finish_slot(slot);
+        }
+        Ok(record)
+    }
+
+    fn push_conn_mbuf(conn: &mut TailConn, mbuf: *mut ffi::rte_mbuf) {
         if let Some(old) = conn.ring.push(mbuf) {
             unsafe { DpdkDevice::free_mbuf(old) };
         }
-        if !conn.dirty {
-            conn.dirty = true;
-            return true;
-        }
-        false
     }
 
     fn push_dirty_slot(&mut self, slot: usize) {
@@ -557,64 +656,143 @@ impl RawTailTable {
                 RAW_TAIL_DIRTY_CAP
             );
         }
+        let pos = self.dirty_slots.len();
+        let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
+            panic!("raw-tail dirty slot points to empty conn slot={}", slot);
+        };
+        if conn.dirty_slot_pos != RAW_TAIL_DIRTY_NONE {
+            panic!(
+                "raw-tail dirty slot inserted twice slot={} pos={}",
+                slot, conn.dirty_slot_pos
+            );
+        }
+        conn.dirty_slot_pos = pos;
         self.dirty_slots.push(slot);
     }
 
-    fn yield_latest_tls_records(conn: &mut TailConn) {
-        let (Some(callback), Some(rss_hash)) = (conn.callback, conn.rss_hash) else {
+    fn remove_dirty_slot(&mut self, slot: usize) {
+        let Some(pos) = self
+            .conns
+            .get(slot)
+            .and_then(|conn| conn.as_ref())
+            .map(|conn| conn.dirty_slot_pos)
+        else {
             return;
         };
-        conn.poll_generation = conn.poll_generation.wrapping_add(1);
+        if pos == RAW_TAIL_DIRTY_NONE {
+            return;
+        }
+        if pos >= self.dirty_slots.len() || self.dirty_slots[pos] != slot {
+            panic!(
+                "raw-tail dirty position mismatch slot={} pos={} len={}",
+                slot,
+                pos,
+                self.dirty_slots.len()
+            );
+        }
+        let moved = self.dirty_slots.swap_remove(pos);
+        debug_assert_eq!(moved, slot);
+        if pos < self.dirty_slots.len() {
+            let moved_slot = self.dirty_slots[pos];
+            let Some(moved_conn) = self.conns.get_mut(moved_slot).and_then(|conn| conn.as_mut()) else {
+                panic!("raw-tail moved dirty slot points to empty conn slot={}", moved_slot);
+            };
+            moved_conn.dirty_slot_pos = pos;
+        }
+        if let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) {
+            conn.dirty_slot_pos = RAW_TAIL_DIRTY_NONE;
+        }
+    }
+
+    fn finish_slot(&mut self, slot: usize) {
+        self.remove_dirty_slot(slot);
+        if let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) {
+            conn.cursor.clear();
+            conn.segments.clear();
+            conn.ring.drain_free();
+        }
+    }
+
+    fn next_record_from_conn<'a>(
+        conn: &mut TailConn,
+        out: &'a mut Vec<u8>,
+    ) -> Option<RawTailRecord<'a>> {
+        let Some(rss_hash) = conn.rss_hash else {
+            return None;
+        };
         let poll_generation = conn.poll_generation;
-        conn.segments.clear();
-        let mut inferred_payload_offset = None;
-        let mut inferred_next_seq = None;
-        for mbuf in conn.ring.newest_to_oldest() {
-            let Some(segment) = build_tail_segment(mbuf, inferred_payload_offset, inferred_next_seq) else {
+
+        loop {
+            if let Some(segment) = conn.cursor.current_segment {
+                let Some(mut offset) = conn.cursor.next_offset else {
+                    conn.segments.push(segment);
+                    conn.cursor.current_segment = None;
+                    continue;
+                };
+                loop {
+                    if looks_like_tls_header(&segment.payload[offset..]) {
+                        let record_len =
+                            5 + u16::from_be_bytes([segment.payload[offset + 3], segment.payload[offset + 4]]) as usize;
+                        let start_seq = segment.tcp_seq.wrapping_add(offset as u32);
+                        out.resize(record_len, 0);
+                        conn.segments.push(segment);
+                        let copied = copy_tcp_range_from_segments(
+                            &conn.segments,
+                            start_seq,
+                            record_len,
+                            out,
+                        );
+                        conn.segments.pop();
+                        conn.cursor.next_offset = offset.checked_sub(1);
+                        if copied {
+                            return Some(RawTailRecord {
+                                handle: conn.handle,
+                                rss_hash,
+                                tcp_seq: start_seq,
+                                tcp_seq_after_record: start_seq.wrapping_add(record_len as u32),
+                                bytes: &out[..record_len],
+                                poll_generation,
+                            });
+                        }
+                    }
+                    let Some(next) = offset.checked_sub(1) else {
+                        conn.cursor.next_offset = None;
+                        break;
+                    };
+                    offset = next;
+                    conn.cursor.next_offset = Some(offset);
+                }
+                continue;
+            }
+
+            let Some(mbuf) = Self::pop_cursor_mbuf(conn) else {
+                return None;
+            };
+            let Some(segment) = build_tail_segment(
+                mbuf,
+                conn.cursor.inferred_payload_offset,
+                conn.cursor.inferred_next_seq,
+            ) else {
                 continue;
             };
-            inferred_payload_offset = Some(segment.payload_offset);
-            inferred_next_seq = Some(segment.tcp_seq);
+            conn.cursor.inferred_payload_offset = Some(segment.payload_offset);
+            conn.cursor.inferred_next_seq = Some(segment.tcp_seq);
             if segment.payload.len() < 5 {
                 conn.segments.push(segment);
                 continue;
             }
-            let mut offset = segment.payload.len() - 5;
-            loop {
-                if looks_like_tls_header(&segment.payload[offset..]) {
-                    let record_len =
-                        5 + u16::from_be_bytes([segment.payload[offset + 3], segment.payload[offset + 4]]) as usize;
-                    let start_seq = segment.tcp_seq.wrapping_add(offset as u32);
-                    conn.record_bytes.resize(record_len, 0);
-                    conn.segments.push(segment);
-                    if copy_tcp_range_from_segments(
-                        &conn.segments,
-                        start_seq,
-                        record_len,
-                        &mut conn.record_bytes,
-                    ) {
-                        let record = RawTailRecord {
-                            handle: conn.handle,
-                            rss_hash,
-                            tcp_seq: start_seq,
-                            tcp_seq_after_record: start_seq.wrapping_add(record_len as u32),
-                            bytes: &conn.record_bytes[..record_len],
-                            poll_generation,
-                        };
-                        match unsafe { callback(conn.callback_ctx, record) } {
-                            RawTailCallbackResult::Accepted => return,
-                            RawTailCallbackResult::NeedPrevious | RawTailCallbackResult::Rejected => {}
-                        }
-                    }
-                    conn.segments.pop();
-                }
-                if offset == 0 {
-                    break;
-                }
-                offset -= 1;
-            }
-            conn.segments.push(segment);
+            conn.cursor.current_segment = Some(segment);
+            conn.cursor.next_offset = Some(segment.payload.len() - 5);
         }
+    }
+
+    fn pop_cursor_mbuf(conn: &mut TailConn) -> Option<*mut ffi::rte_mbuf> {
+        if conn.cursor.remaining == 0 {
+            return None;
+        }
+        let idx = (conn.ring.head + conn.cursor.remaining - 1) % RAW_TAIL_RING_CAP;
+        conn.cursor.remaining -= 1;
+        Some(conn.ring.slots[idx])
     }
 
     fn conn_for_handle_mut(&mut self, handle: RawTailHandle) -> Option<&mut TailConn> {

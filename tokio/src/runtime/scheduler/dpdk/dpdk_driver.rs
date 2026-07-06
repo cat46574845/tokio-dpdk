@@ -22,7 +22,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
 use super::device::DpdkDevice;
-use super::raw_tail::{RawTailCallback, RawTailHandle, RawTailTable, RawTailTuple};
+use super::raw_tail::{RawTailHandle, RawTailReadRequest, RawTailRecord, RawTailTable, RawTailTuple};
 
 // =============================================================================
 // Constants
@@ -309,20 +309,6 @@ impl DpdkDriver {
             0
         };
 
-        #[cfg(feature = "market-trace")]
-        let yield_raw_tail_start_ns = if trace_poll {
-            crate::runtime::market_trace::now_ns()
-        } else {
-            0
-        };
-        self.raw_tail.yield_dirty_records();
-        #[cfg(feature = "market-trace")]
-        let yield_raw_tail_dur_ns = if trace_poll {
-            crate::runtime::market_trace::now_ns().saturating_sub(yield_raw_tail_start_ns)
-        } else {
-            0
-        };
-
         let has_smoltcp_rx = self.device.has_unprocessed_rx_pending();
 
         // Poll smoltcp (processes RX, generates TX)
@@ -460,13 +446,6 @@ impl DpdkDriver {
                 0,
             );
             crate::runtime::market_trace::complete(
-                yield_raw_tail_start_ns,
-                yield_raw_tail_dur_ns,
-                crate::runtime::market_trace::SPAN_DPDK_YIELD_RAW_TAIL,
-                track_id,
-                0,
-            );
-            crate::runtime::market_trace::complete(
                 smoltcp_poll_start_ns,
                 smoltcp_poll_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_POLL,
@@ -534,13 +513,21 @@ impl DpdkDriver {
         self.raw_tail.unregister(handle);
     }
 
-    pub(crate) fn set_raw_tail_callback(
+    pub(crate) fn poll_raw_tail_ready(
         &mut self,
         handle: RawTailHandle,
-        ctx: *mut (),
-        callback: RawTailCallback,
-    ) -> std::io::Result<()> {
-        self.raw_tail.set_callback(handle, ctx, callback)
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.raw_tail.poll_ready(handle, cx)
+    }
+
+    pub(crate) fn next_raw_tail_record<'a>(
+        &mut self,
+        handle: RawTailHandle,
+        request: RawTailReadRequest,
+        out: &'a mut Vec<u8>,
+    ) -> std::io::Result<Option<RawTailRecord<'a>>> {
+        self.raw_tail.next_record(handle, request, out)
     }
 
     /// Create a new TCP socket using pre-allocated buffers from the pool.

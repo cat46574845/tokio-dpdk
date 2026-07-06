@@ -41,7 +41,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::io;
 
 pub use crate::runtime::scheduler::dpdk::{
-    RawTailCallback, RawTailCallbackResult, RawTailHandle, RawTailRecord,
+    RawTailRecordDecision, RawTailHandle, RawTailReadRequest, RawTailRecord,
 };
 
 /// Identifies a specific DPDK worker thread.
