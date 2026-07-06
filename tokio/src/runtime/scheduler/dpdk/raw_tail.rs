@@ -569,6 +569,8 @@ impl RawTailTable {
                 if !conn.active {
                     return false;
                 }
+                #[cfg(feature = "dpdk-debug")]
+                Self::assert_hit_tuple_matches(self.worker_index, conn, mbuf, rss, slot);
                 Self::push_conn_mbuf(conn, mbuf);
                 if conn.dirty_slot_pos == RAW_TAIL_DIRTY_NONE {
                     conn.waker.take()
@@ -592,6 +594,38 @@ impl RawTailTable {
         #[cfg(feature = "dpdk-debug")]
         self.assert_no_active_tuple_rss_miss(mbuf, rss);
         false
+    }
+
+    #[cfg(feature = "dpdk-debug")]
+    fn assert_hit_tuple_matches(
+        worker_index: usize,
+        conn: &TailConn,
+        mbuf: *mut ffi::rte_mbuf,
+        mbuf_rss: u32,
+        slot: usize,
+    ) {
+        let Some(pkt) = parse_tcp_packet(mbuf) else {
+            return;
+        };
+        if conn.tuple.matches_packet(&pkt) {
+            return;
+        }
+        panic!(
+            "raw-tail RSS hit tuple mismatch worker={} slot={} handle_id={} mbuf_rss={} payload_len={} expected_local={}:{} expected_remote={}:{} actual_local={}:{} actual_remote={}:{}",
+            worker_index,
+            slot,
+            conn.handle.id,
+            mbuf_rss,
+            pkt.payload.len(),
+            conn.tuple.local_ip,
+            conn.tuple.local_port,
+            conn.tuple.remote_ip,
+            conn.tuple.remote_port,
+            pkt.local_ip,
+            pkt.local_port,
+            pkt.remote_ip,
+            pkt.remote_port
+        );
     }
 
     #[cfg(feature = "dpdk-debug")]
