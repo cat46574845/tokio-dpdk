@@ -616,8 +616,8 @@ impl DpdkDriver {
                 ),
             );
             crate::runtime::market_trace::complete(
-                smoltcp_ingress_start_ns,
-                smoltcp_ingress_dur_ns,
+                smoltcp_ingress_done_ns,
+                0,
                 crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_TCP_LOOKUP,
                 track_id,
                 pack_trace_aux3(

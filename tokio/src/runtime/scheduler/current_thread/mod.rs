@@ -339,6 +339,8 @@ impl Core {
     fn push_task(&mut self, handle: &Handle, task: Notified) {
         #[cfg(feature = "sched-probe")]
         task.sched_probe_mark_queued();
+        #[cfg(feature = "market-trace")]
+        task.market_trace_mark_queued(crate::runtime::market_trace::QUEUE_SOURCE_LOCAL_RUN);
 
         self.tasks.push_back(task);
         self.metrics.inc_local_schedule_count();
@@ -714,6 +716,10 @@ impl Schedule for Arc<Handle> {
                 // Schedule the task
                 #[cfg(feature = "sched-probe")]
                 task.sched_probe_mark_queued();
+                #[cfg(feature = "market-trace")]
+                task.market_trace_mark_queued(
+                    crate::runtime::market_trace::QUEUE_SOURCE_SHARED_INJECT_OUTSIDE_WORKER,
+                );
 
                 self.shared.inject.push(task);
 
@@ -857,6 +863,21 @@ impl CoreGuard<'_> {
 
                     #[cfg(tokio_unstable)]
                     let task_meta = task.task_meta();
+                    #[cfg(feature = "market-trace")]
+                    let market_trace_queue_wait_ns = task.market_trace_queue_wait_ns();
+                    #[cfg(feature = "market-trace")]
+                    let market_trace_queue_source = task.market_trace_queue_source();
+                    #[cfg(feature = "market-trace")]
+                    let market_trace_task_id = task.market_trace_task_id();
+                    #[cfg(feature = "market-trace")]
+                    let market_trace_task_kind_id = task.market_trace_task_kind_id();
+                    #[cfg(feature = "market-trace")]
+                    let market_trace_queue_depth = core
+                        .tasks
+                        .len()
+                        .saturating_add(handle.shared.inject.len())
+                        .saturating_add(context.defer.len())
+                        .min(u32::MAX as usize) as u32;
 
                     #[cfg(feature = "sched-probe")]
                     {
@@ -869,6 +890,15 @@ impl CoreGuard<'_> {
                             handle.shared.inject.len(),
                         );
                     }
+
+                    #[cfg(feature = "market-trace")]
+                    let _market_trace_task_queue_guard = crate::runtime::market_trace::enter_task_queue(
+                        market_trace_queue_source,
+                        market_trace_queue_wait_ns,
+                        market_trace_task_id,
+                        market_trace_task_kind_id,
+                        market_trace_queue_depth,
+                    );
 
                     let (c, ()) = context.run_task(core, || {
                         #[cfg(tokio_unstable)]

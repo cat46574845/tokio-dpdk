@@ -83,7 +83,7 @@ signal = [
 ]
 sync = []
 test-util = ["rt", "sync", "time"]
-market-trace = ["smoltcp?/latency-probe"]
+market-trace = ["smoltcp?/market-trace"]
 time = []
 # DPDK scheduler - kernel-bypass networking with busy-poll workers
 dpdk = ["rt-multi-thread", "dep:smoltcp", "dep:serde", "dep:serde_json"]
