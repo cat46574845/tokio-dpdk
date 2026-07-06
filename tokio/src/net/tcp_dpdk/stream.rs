@@ -599,6 +599,7 @@ impl TcpDpdkStream {
             let socket = driver.get_tcp_socket_mut(handle);
             // smoltcp: nagle_enabled = !nodelay
             socket.set_nagle_enabled(!nodelay);
+            driver.mark_socket_egress_pending(handle);
         })
         .ok_or_else(|| {
             io::Error::new(
@@ -911,7 +912,7 @@ impl TcpDpdkStream {
                 }
             };
             if matches!(result, Ok(consumed) if consumed > 0) {
-                driver.mark_smoltcp_dirty();
+                driver.mark_socket_egress_pending(handle);
             }
             result.map(|_| ())
         });
@@ -997,7 +998,7 @@ impl TcpDpdkStream {
                 }
             };
             if matches!(result, Ok(n) if n > 0) {
-                driver.mark_smoltcp_dirty();
+                driver.mark_socket_egress_pending(handle);
             }
             result
         });
@@ -1048,7 +1049,7 @@ impl TcpDpdkStream {
                 }
             };
             if matches!(result, Ok(n) if n > 0) {
-                driver.mark_smoltcp_dirty();
+                driver.mark_socket_egress_pending(handle);
             }
             result
         });
@@ -1278,6 +1279,7 @@ impl TcpDpdkStream {
             socket.set_keep_alive(
                 interval.map(|d| smoltcp::time::Duration::from_millis(d.as_millis() as u64)),
             );
+            driver.mark_socket_egress_pending(handle);
         })
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Cannot access DPDK driver"))
     }
@@ -1315,6 +1317,7 @@ impl TcpDpdkStream {
                 // Default delayed ACK (40ms is typical)
                 socket.set_ack_delay(Some(smoltcp::time::Duration::from_millis(40)));
             }
+            driver.mark_socket_egress_pending(handle);
         });
         Ok(())
     }
@@ -1399,7 +1402,7 @@ impl TcpDpdkStream {
                 with_current_driver(|driver| {
                     let socket = driver.get_tcp_socket_mut(handle);
                     socket.close();
-                    driver.mark_smoltcp_dirty();
+                    driver.mark_socket_egress_pending(handle);
                 });
             }
             Shutdown::Both => {
@@ -1411,11 +1414,18 @@ impl TcpDpdkStream {
                 with_current_driver(|driver| {
                     let socket = driver.get_tcp_socket_mut(handle);
                     socket.close();
-                    driver.mark_smoltcp_dirty();
+                    driver.mark_socket_egress_pending(handle);
                 });
             }
         }
         Ok(())
+    }
+
+    pub(super) fn flush_std(&self) -> io::Result<()> {
+        self.assert_on_correct_worker();
+        let handle = self.handle;
+        with_current_driver(|driver| driver.flush_socket_egress(handle))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Cannot access DPDK driver"))?
     }
 
     /// Try to perform I/O with the given interest.
@@ -1476,32 +1486,38 @@ impl AsyncRead for TcpDpdkStream {
         let waker = cx.waker();
 
         let result = with_current_driver(|driver| {
-            let socket = driver.get_tcp_socket_mut(handle);
+            let result = {
+                let socket = driver.get_tcp_socket_mut(handle);
 
-            // Register waker with smoltcp BEFORE checking state
-            // smoltcp will call wake() when socket becomes readable
-            socket.register_recv_waker(waker);
+                // Register waker with smoltcp BEFORE checking state
+                // smoltcp will call wake() when socket becomes readable
+                socket.register_recv_waker(waker);
 
-            // Check if socket can receive
-            if !socket.can_recv() {
-                if socket.state() == smoltcp::socket::tcp::State::CloseWait
-                    || socket.state() == smoltcp::socket::tcp::State::Closed
-                {
-                    // Connection closed
-                    return Ok(0);
+                // Check if socket can receive
+                if !socket.can_recv() {
+                    if socket.state() == smoltcp::socket::tcp::State::CloseWait
+                        || socket.state() == smoltcp::socket::tcp::State::Closed
+                    {
+                        // Connection closed
+                        return Ok(0);
+                    }
+                    // Not ready yet - waker is registered, smoltcp will wake us
+                    return Err(io::ErrorKind::WouldBlock);
                 }
-                // Not ready yet - waker is registered, smoltcp will wake us
-                return Err(io::ErrorKind::WouldBlock);
-            }
 
-            // Read data into buffer
-            match socket.recv_slice(buf.initialize_unfilled()) {
-                Ok(n) => {
-                    buf.advance(n);
-                    Ok(n)
+                // Read data into buffer
+                match socket.recv_slice(buf.initialize_unfilled()) {
+                    Ok(n) => {
+                        buf.advance(n);
+                        Ok(n)
+                    }
+                    Err(_) => Err(io::ErrorKind::WouldBlock),
                 }
-                Err(_) => Err(io::ErrorKind::WouldBlock),
+            };
+            if matches!(result, Ok(n) if n > 0) {
+                driver.mark_socket_egress_pending(handle);
             }
+            result
         });
 
         match result {
@@ -1571,7 +1587,7 @@ impl AsyncWrite for TcpDpdkStream {
                 }
             };
             if matches!(result, Ok(n) if n > 0) {
-                driver.mark_smoltcp_dirty();
+                driver.mark_socket_egress_pending(handle);
             }
             result
         });
@@ -1597,12 +1613,12 @@ impl AsyncWrite for TcpDpdkStream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // DPDK/smoltcp handles flushing via the driver poll loop
-        Poll::Ready(Ok(()))
+        Poll::Ready(self.flush_std())
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.shutdown_std(Shutdown::Write)?;
+        self.flush_std()?;
         Poll::Ready(Ok(()))
     }
 }

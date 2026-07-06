@@ -62,24 +62,30 @@ impl AsyncRead for ReadHalf<'_> {
         // Read from smoltcp socket via worker context
         let handle = self.handle();
         let result = with_current_driver(|driver| {
-            let socket = driver.get_tcp_socket_mut(handle);
+            let result = {
+                let socket = driver.get_tcp_socket_mut(handle);
 
-            if !socket.can_recv() {
-                if socket.state() == smoltcp::socket::tcp::State::CloseWait
-                    || socket.state() == smoltcp::socket::tcp::State::Closed
-                {
-                    return Ok(0);
+                if !socket.can_recv() {
+                    if socket.state() == smoltcp::socket::tcp::State::CloseWait
+                        || socket.state() == smoltcp::socket::tcp::State::Closed
+                    {
+                        return Ok(0);
+                    }
+                    return Err(io::ErrorKind::WouldBlock);
                 }
-                return Err(io::ErrorKind::WouldBlock);
-            }
 
-            match socket.recv_slice(buf.initialize_unfilled()) {
-                Ok(n) => {
-                    buf.advance(n);
-                    Ok(n)
+                match socket.recv_slice(buf.initialize_unfilled()) {
+                    Ok(n) => {
+                        buf.advance(n);
+                        Ok(n)
+                    }
+                    Err(_) => Err(io::ErrorKind::WouldBlock),
                 }
-                Err(_) => Err(io::ErrorKind::WouldBlock),
+            };
+            if matches!(result, Ok(n) if n > 0) {
+                driver.mark_socket_egress_pending(handle);
             }
+            result
         });
 
         match result {
@@ -141,21 +147,27 @@ impl AsyncWrite for WriteHalf<'_> {
         // Write to smoltcp socket via worker context
         let handle = self.handle();
         let result = with_current_driver(|driver| {
-            let socket = driver.get_tcp_socket_mut(handle);
+            let result = {
+                let socket = driver.get_tcp_socket_mut(handle);
 
-            if !socket.can_send() {
-                if socket.state() == smoltcp::socket::tcp::State::Closed
-                    || socket.state() == smoltcp::socket::tcp::State::Closing
-                {
-                    return Err(io::ErrorKind::BrokenPipe);
+                if !socket.can_send() {
+                    if socket.state() == smoltcp::socket::tcp::State::Closed
+                        || socket.state() == smoltcp::socket::tcp::State::Closing
+                    {
+                        return Err(io::ErrorKind::BrokenPipe);
+                    }
+                    return Err(io::ErrorKind::WouldBlock);
                 }
-                return Err(io::ErrorKind::WouldBlock);
-            }
 
-            match socket.send_slice(buf) {
-                Ok(n) => Ok(n),
-                Err(_) => Err(io::ErrorKind::WouldBlock),
+                match socket.send_slice(buf) {
+                    Ok(n) => Ok(n),
+                    Err(_) => Err(io::ErrorKind::WouldBlock),
+                }
+            };
+            if matches!(result, Ok(n) if n > 0) {
+                driver.mark_socket_egress_pending(handle);
             }
+            result
         });
 
         match result {
@@ -173,11 +185,12 @@ impl AsyncWrite for WriteHalf<'_> {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+        Poll::Ready(self.stream.flush_std())
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.stream.shutdown_std(Shutdown::Write)?;
+        self.stream.flush_std()?;
         Poll::Ready(Ok(()))
     }
 }
@@ -229,24 +242,30 @@ impl AsyncRead for OwnedReadHalf {
         // Read from smoltcp socket via worker context
         let handle = self.handle();
         let result = with_current_driver(|driver| {
-            let socket = driver.get_tcp_socket_mut(handle);
+            let result = {
+                let socket = driver.get_tcp_socket_mut(handle);
 
-            if !socket.can_recv() {
-                if socket.state() == smoltcp::socket::tcp::State::CloseWait
-                    || socket.state() == smoltcp::socket::tcp::State::Closed
-                {
-                    return Ok(0);
+                if !socket.can_recv() {
+                    if socket.state() == smoltcp::socket::tcp::State::CloseWait
+                        || socket.state() == smoltcp::socket::tcp::State::Closed
+                    {
+                        return Ok(0);
+                    }
+                    return Err(io::ErrorKind::WouldBlock);
                 }
-                return Err(io::ErrorKind::WouldBlock);
-            }
 
-            match socket.recv_slice(buf.initialize_unfilled()) {
-                Ok(n) => {
-                    buf.advance(n);
-                    Ok(n)
+                match socket.recv_slice(buf.initialize_unfilled()) {
+                    Ok(n) => {
+                        buf.advance(n);
+                        Ok(n)
+                    }
+                    Err(_) => Err(io::ErrorKind::WouldBlock),
                 }
-                Err(_) => Err(io::ErrorKind::WouldBlock),
+            };
+            if matches!(result, Ok(n) if n > 0) {
+                driver.mark_socket_egress_pending(handle);
             }
+            result
         });
 
         match result {
@@ -308,21 +327,27 @@ impl AsyncWrite for OwnedWriteHalf {
         // Write to smoltcp socket via worker context
         let handle = self.handle();
         let result = with_current_driver(|driver| {
-            let socket = driver.get_tcp_socket_mut(handle);
+            let result = {
+                let socket = driver.get_tcp_socket_mut(handle);
 
-            if !socket.can_send() {
-                if socket.state() == smoltcp::socket::tcp::State::Closed
-                    || socket.state() == smoltcp::socket::tcp::State::Closing
-                {
-                    return Err(io::ErrorKind::BrokenPipe);
+                if !socket.can_send() {
+                    if socket.state() == smoltcp::socket::tcp::State::Closed
+                        || socket.state() == smoltcp::socket::tcp::State::Closing
+                    {
+                        return Err(io::ErrorKind::BrokenPipe);
+                    }
+                    return Err(io::ErrorKind::WouldBlock);
                 }
-                return Err(io::ErrorKind::WouldBlock);
-            }
 
-            match socket.send_slice(buf) {
-                Ok(n) => Ok(n),
-                Err(_) => Err(io::ErrorKind::WouldBlock),
+                match socket.send_slice(buf) {
+                    Ok(n) => Ok(n),
+                    Err(_) => Err(io::ErrorKind::WouldBlock),
+                }
+            };
+            if matches!(result, Ok(n) if n > 0) {
+                driver.mark_socket_egress_pending(handle);
             }
+            result
         });
 
         match result {
@@ -340,11 +365,12 @@ impl AsyncWrite for OwnedWriteHalf {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+        Poll::Ready(self.stream.flush_std())
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.stream.shutdown_std(Shutdown::Write)?;
+        self.stream.flush_std()?;
         Poll::Ready(Ok(()))
     }
 }

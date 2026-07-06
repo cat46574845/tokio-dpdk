@@ -10,11 +10,11 @@
 //! (`register_recv_waker`/`register_send_waker`), not by a separate ScheduledIo.
 
 use std::collections::HashSet;
-use std::time::Duration;
 use std::time::Instant;
 
 use smoltcp::iface::{
-    Config as IfaceConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
+    Config as IfaceConfig, Interface, PollEgressHandleResult, PollIngressSingleResult, PollResult,
+    SocketHandle, SocketSet,
 };
 use smoltcp::socket::tcp::Socket as TcpSocket;
 use smoltcp::storage::LinearBuffer;
@@ -39,8 +39,7 @@ const TCP_TX_BUFFER_SIZE: usize = 65536;
 
 /// Default buffer pool size (number of connections)
 const DEFAULT_BUFFER_POOL_SIZE: usize = 2048;
-const SMOLTCP_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
-
+const PENDING_EGRESS_NONE: usize = usize::MAX;
 // =============================================================================
 // TcpBufferPool - Pre-allocated buffer management
 // =============================================================================
@@ -170,10 +169,14 @@ pub(crate) struct DpdkDriver {
     bound_ports: HashSet<u16>,
     /// RSS-hash based lossy tail receiver for market-data flows.
     raw_tail: RawTailTable,
-    /// Set by local socket mutations that can require smoltcp egress work.
-    smoltcp_dirty: bool,
-    /// Periodic safety poll for smoltcp timers when raw-tail consumed all RX packets.
-    next_smoltcp_poll_at: Instant,
+    /// Min-heap of socket handles with pending smoltcp egress work and their due time.
+    pending_egress_heap: Vec<(SmolInstant, SocketHandle)>,
+    /// Dense handle-index to pending_egress_heap slot map. PENDING_EGRESS_NONE means absent.
+    pending_egress_pos: Vec<usize>,
+    /// Socket handles touched by the current smoltcp ingress drain.
+    ingress_touched: Vec<SocketHandle>,
+    /// Dense bitset used to deduplicate ingress touched handles.
+    ingress_touched_bits: Vec<u64>,
 }
 
 impl DpdkDriver {
@@ -250,8 +253,10 @@ impl DpdkDriver {
             buffer_pool: TcpBufferPool::with_defaults(),
             bound_ports: HashSet::new(),
             raw_tail: RawTailTable::new(worker_index),
-            smoltcp_dirty: true,
-            next_smoltcp_poll_at: start_time,
+            pending_egress_heap: Vec::new(),
+            pending_egress_pos: Vec::new(),
+            ingress_touched: Vec::new(),
+            ingress_touched_bits: Vec::new(),
         }
     }
 
@@ -266,8 +271,7 @@ impl DpdkDriver {
     pub(crate) fn poll(&mut self, now: Instant) -> bool {
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(self.worker_index);
-        let smol_now =
-            SmolInstant::from_millis(now.duration_since(self.start_time).as_millis() as i64);
+        let smol_now = self.smol_instant(now);
         // Flush pending TX packets first.
         #[cfg(feature = "market-trace")]
         let flush_tx_before_start_ns = crate::runtime::market_trace::now_ns();
@@ -324,7 +328,6 @@ impl DpdkDriver {
         };
 
         let has_smoltcp_rx = self.device.has_unprocessed_rx_pending();
-        let run_smoltcp = has_smoltcp_rx || self.smoltcp_dirty || now >= self.next_smoltcp_poll_at;
 
         // Poll smoltcp (processes RX, generates TX)
         // smoltcp will automatically call wake() on registered wakers when:
@@ -345,17 +348,40 @@ impl DpdkDriver {
         } else {
             0
         };
-        if run_smoltcp {
+        if has_smoltcp_rx {
+            let mut ingress_touched = std::mem::take(&mut self.ingress_touched);
+            let mut ingress_touched_bits = std::mem::take(&mut self.ingress_touched_bits);
+            ingress_touched.clear();
+            ingress_touched_bits.fill(0);
             loop {
                 match self
                     .iface
-                    .poll_ingress_single(smol_now, &mut self.device, &mut self.sockets)
+                    .poll_ingress_single_touched(
+                        smol_now,
+                        &mut self.device,
+                        &mut self.sockets,
+                        |handle| {
+                            Self::push_handle_dedup(
+                                &mut ingress_touched,
+                                &mut ingress_touched_bits,
+                                handle,
+                            );
+                        },
+                    )
                 {
                     PollIngressSingleResult::None => break,
                     PollIngressSingleResult::PacketProcessed => {}
                     PollIngressSingleResult::SocketStateChanged => result = PollResult::SocketStateChanged,
                 }
             }
+            for handle in ingress_touched.iter().copied() {
+                if let Some(next_due) = self.iface.poll_at_handle(smol_now, &self.sockets, handle) {
+                    self.queue_egress_at(handle, next_due);
+                }
+            }
+            ingress_touched.clear();
+            self.ingress_touched = ingress_touched;
+            self.ingress_touched_bits = ingress_touched_bits;
         }
         #[cfg(feature = "market-trace")]
         let smoltcp_ingress_dur_ns = if trace_poll {
@@ -370,18 +396,8 @@ impl DpdkDriver {
         } else {
             0
         };
-        if run_smoltcp {
-            loop {
-                match self
-                    .iface
-                    .poll_egress(smol_now, &mut self.device, &mut self.sockets)
-                {
-                    PollResult::None => break,
-                    PollResult::SocketStateChanged => result = PollResult::SocketStateChanged,
-                }
-            }
-            self.smoltcp_dirty = false;
-            self.next_smoltcp_poll_at = now + SMOLTCP_IDLE_POLL_INTERVAL;
+        if self.poll_pending_egress(smol_now) == PollResult::SocketStateChanged {
+            result = PollResult::SocketStateChanged;
         }
         #[cfg(feature = "market-trace")]
         let smoltcp_egress_dur_ns = if trace_poll {
@@ -459,7 +475,7 @@ impl DpdkDriver {
                 smoltcp_poll_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_POLL,
                 track_id,
-                u64::from(!run_smoltcp),
+                u64::from(!has_smoltcp_rx),
             );
             crate::runtime::market_trace::complete(
                 smoltcp_ingress_start_ns,
@@ -564,9 +580,7 @@ impl DpdkDriver {
         // This adds significant latency for request-response patterns.
         socket.set_nagle_enabled(false);
 
-        let handle = self.sockets.add(socket);
-        self.mark_smoltcp_dirty();
-        Some(handle)
+        Some(self.sockets.add(socket))
     }
 
     /// Register a connect socket for tracking.
@@ -609,7 +623,7 @@ impl DpdkDriver {
             .get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle)
             .connect(cx, remote_endpoint, local_endpoint);
         if result.is_ok() {
-            self.mark_smoltcp_dirty();
+            self.mark_socket_egress_pending(handle);
         }
         result
     }
@@ -622,7 +636,7 @@ impl DpdkDriver {
     /// Remove a socket from the socket set and return its buffers to the pool.
     pub(crate) fn remove_socket(&mut self, handle: SocketHandle) {
         self.unregister_socket(handle);
-        self.mark_smoltcp_dirty();
+        self.clear_socket_egress_pending(handle);
 
         // Remove socket and get its buffers
         let socket = self.sockets.remove(handle);
@@ -658,8 +672,206 @@ impl DpdkDriver {
     }
 
     #[inline(always)]
-    pub(crate) fn mark_smoltcp_dirty(&mut self) {
-        self.smoltcp_dirty = true;
+    pub(crate) fn mark_socket_egress_pending(&mut self, handle: SocketHandle) {
+        self.queue_egress_at(handle, SmolInstant::ZERO);
+    }
+
+    pub(crate) fn flush_socket_egress(&mut self, handle: SocketHandle) -> std::io::Result<()> {
+        let now = self.smol_instant(Instant::now());
+        self.clear_socket_egress_pending(handle);
+        loop {
+            match self
+                .iface
+                .poll_egress_handle(now, &mut self.device, &mut self.sockets, handle)
+            {
+                PollEgressHandleResult::SocketStateChanged => {
+                    self.device.flush_tx();
+                }
+                PollEgressHandleResult::None => {
+                    self.device.flush_tx();
+                    if let Some(next_due) = self.iface.poll_at_handle(now, &self.sockets, handle) {
+                        self.queue_egress_at(handle, next_due);
+                    }
+                    return Ok(());
+                }
+                PollEgressHandleResult::DeviceExhausted => {
+                    self.device.flush_tx();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "DPDK TX device exhausted during best-effort socket egress flush",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn poll_pending_egress(&mut self, now: SmolInstant) -> PollResult {
+        let mut result = PollResult::None;
+        loop {
+            let Some((due, _)) = self.pending_egress_heap.first().copied() else {
+                break;
+            };
+            if due > now {
+                break;
+            }
+            let Some((_, handle)) = self.pop_pending_egress_min() else {
+                break;
+            };
+            match self
+                .iface
+                .poll_egress_handle(now, &mut self.device, &mut self.sockets, handle)
+            {
+                PollEgressHandleResult::SocketStateChanged => {
+                    result = PollResult::SocketStateChanged;
+                }
+                PollEgressHandleResult::None => {}
+                PollEgressHandleResult::DeviceExhausted => {
+                    self.queue_egress_at(handle, now);
+                    return result;
+                }
+            }
+            if let Some(next_due) = self.iface.poll_at_handle(now, &self.sockets, handle) {
+                self.queue_egress_at(handle, next_due);
+            }
+        }
+        result
+    }
+
+    fn clear_socket_egress_pending(&mut self, handle: SocketHandle) {
+        let index = handle.index();
+        let Some(pos) = self.pending_egress_pos.get(index).copied() else {
+            return;
+        };
+        if pos == PENDING_EGRESS_NONE {
+            return;
+        }
+        if pos >= self.pending_egress_heap.len() || self.pending_egress_heap[pos].1 != handle {
+            return;
+        }
+        self.remove_pending_egress_at(pos);
+    }
+
+    fn queue_egress_at(&mut self, handle: SocketHandle, due: SmolInstant) {
+        let index = handle.index();
+        if self.pending_egress_pos.len() <= index {
+            self.pending_egress_pos.resize(index + 1, PENDING_EGRESS_NONE);
+        }
+        let pos = self.pending_egress_pos[index];
+        if pos == PENDING_EGRESS_NONE {
+            let pos = self.pending_egress_heap.len();
+            self.pending_egress_pos[index] = pos;
+            self.pending_egress_heap.push((due, handle));
+            self.sift_pending_egress_up(pos);
+            return;
+        }
+        if pos < self.pending_egress_heap.len() && self.pending_egress_heap[pos].1 == handle {
+            if due < self.pending_egress_heap[pos].0 {
+                self.pending_egress_heap[pos].0 = due;
+                self.sift_pending_egress_up(pos);
+            }
+            return;
+        }
+        let pos = self.pending_egress_heap.len();
+        self.pending_egress_pos[index] = pos;
+        self.pending_egress_heap.push((due, handle));
+        self.sift_pending_egress_up(pos);
+    }
+
+    fn pop_pending_egress_min(&mut self) -> Option<(SmolInstant, SocketHandle)> {
+        if self.pending_egress_heap.is_empty() {
+            return None;
+        }
+        Some(self.remove_pending_egress_at(0))
+    }
+
+    fn remove_pending_egress_at(&mut self, pos: usize) -> (SmolInstant, SocketHandle) {
+        let last = self.pending_egress_heap.len() - 1;
+        self.swap_pending_egress(pos, last);
+        let removed = self
+            .pending_egress_heap
+            .pop()
+            .expect("pending egress heap cannot be empty after checked remove");
+        self.pending_egress_pos[removed.1.index()] = PENDING_EGRESS_NONE;
+        if pos < self.pending_egress_heap.len() {
+            if pos > 0 && self.pending_egress_less(pos, (pos - 1) / 2) {
+                self.sift_pending_egress_up(pos);
+            } else {
+                self.sift_pending_egress_down(pos);
+            }
+        }
+        removed
+    }
+
+    fn sift_pending_egress_up(&mut self, mut pos: usize) {
+        while pos > 0 {
+            let parent = (pos - 1) / 2;
+            if !self.pending_egress_less(pos, parent) {
+                break;
+            }
+            self.swap_pending_egress(pos, parent);
+            pos = parent;
+        }
+    }
+
+    fn sift_pending_egress_down(&mut self, mut pos: usize) {
+        loop {
+            let left = pos * 2 + 1;
+            let right = left + 1;
+            let mut smallest = pos;
+            if left < self.pending_egress_heap.len()
+                && self.pending_egress_less(left, smallest)
+            {
+                smallest = left;
+            }
+            if right < self.pending_egress_heap.len()
+                && self.pending_egress_less(right, smallest)
+            {
+                smallest = right;
+            }
+            if smallest == pos {
+                break;
+            }
+            self.swap_pending_egress(pos, smallest);
+            pos = smallest;
+        }
+    }
+
+    fn pending_egress_less(&self, lhs: usize, rhs: usize) -> bool {
+        let (lhs_due, lhs_handle) = self.pending_egress_heap[lhs];
+        let (rhs_due, rhs_handle) = self.pending_egress_heap[rhs];
+        lhs_due < rhs_due
+            || (lhs_due == rhs_due && lhs_handle.index() < rhs_handle.index())
+    }
+
+    fn swap_pending_egress(&mut self, lhs: usize, rhs: usize) {
+        self.pending_egress_heap.swap(lhs, rhs);
+        let lhs_handle = self.pending_egress_heap[lhs].1;
+        let rhs_handle = self.pending_egress_heap[rhs].1;
+        self.pending_egress_pos[lhs_handle.index()] = lhs;
+        self.pending_egress_pos[rhs_handle.index()] = rhs;
+    }
+
+    fn push_handle_dedup(
+        handles: &mut Vec<SocketHandle>,
+        bits: &mut Vec<u64>,
+        handle: SocketHandle,
+    ) {
+        let index = handle.index();
+        let word = index / 64;
+        let bit = 1u64 << (index % 64);
+        if bits.len() <= word {
+            bits.resize(word + 1, 0);
+        }
+        if bits[word] & bit != 0 {
+            return;
+        }
+        bits[word] |= bit;
+        handles.push(handle);
+    }
+
+    #[inline(always)]
+    fn smol_instant(&self, now: Instant) -> SmolInstant {
+        SmolInstant::from_millis(now.duration_since(self.start_time).as_millis() as i64)
     }
 
     /// Get the first IPv4 address configured on this interface.
