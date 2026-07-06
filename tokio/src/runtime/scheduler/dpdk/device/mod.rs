@@ -21,8 +21,8 @@ const RX_BURST_SIZE_DEFAULT: u16 = 256;
 /// Maximum packets per tx_burst call
 const TX_BURST_SIZE: u16 = 32;
 
-/// Preallocated mbuf pointers retained for one full driver poll.
-const RX_DRAIN_BATCH_CAP: usize = 8192;
+/// Default preallocated mbuf pointers retained for one full driver poll.
+const RX_DRAIN_BATCH_CAP_DEFAULT: usize = 262_144;
 
 /// Default MTU (Maximum Transmission Unit)
 const DEFAULT_MTU: usize = 1500;
@@ -53,6 +53,22 @@ fn configured_rx_burst_size() -> u16 {
         .unwrap_or_else(|e| panic!("TOKIO_DPDK_RX_BURST_SIZE parse failed value={} error={}", value, e));
     if parsed == 0 {
         panic!("TOKIO_DPDK_RX_BURST_SIZE must be greater than zero");
+    }
+    parsed
+}
+
+fn configured_rx_drain_batch_cap() -> usize {
+    let Some(value) = std::env::var_os("TOKIO_DPDK_RX_DRAIN_BATCH_CAP") else {
+        return RX_DRAIN_BATCH_CAP_DEFAULT;
+    };
+    let value = value
+        .into_string()
+        .unwrap_or_else(|_| panic!("TOKIO_DPDK_RX_DRAIN_BATCH_CAP is not valid UTF-8"));
+    let parsed = value
+        .parse::<usize>()
+        .unwrap_or_else(|e| panic!("TOKIO_DPDK_RX_DRAIN_BATCH_CAP parse failed value={} error={}", value, e));
+    if parsed == 0 {
+        panic!("TOKIO_DPDK_RX_DRAIN_BATCH_CAP must be greater than zero");
     }
     parsed
 }
@@ -176,6 +192,7 @@ impl DpdkDevice {
     pub(crate) unsafe fn new(port_id: u16, queue_id: u16, mempool: *mut ffi::rte_mempool) -> Self {
         let rx_burst_size = configured_rx_burst_size();
         let rx_burst_len = rx_burst_size as usize;
+        let rx_drain_batch_cap = configured_rx_drain_batch_cap();
         Self {
             port_id,
             queue_id,
@@ -185,7 +202,7 @@ impl DpdkDevice {
             rx_index: 0,
             rx_burst_buf: vec![ptr::null_mut(); rx_burst_len],
             rx_burst_size,
-            rx_drain_batch: Vec::with_capacity(RX_DRAIN_BATCH_CAP.max(rx_burst_len)),
+            rx_drain_batch: Vec::with_capacity(rx_drain_batch_cap.max(rx_burst_len)),
         }
     }
 
@@ -229,7 +246,7 @@ impl DpdkDevice {
                 }
             }
 
-            if n < self.rx_burst_size {
+            if n == 0 {
                 break;
             }
         }

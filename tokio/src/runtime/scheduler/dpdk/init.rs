@@ -401,22 +401,13 @@ pub(crate) fn initialize_dpdk_from_plan(
             )
         })?;
 
-        // Build addresses list from allocation
-        let mut addresses = Vec::new();
-        if let Some(ipv4) = allocation.ipv4 {
-            addresses.push(ipv4);
-        }
-        if let Some(ipv6) = allocation.ipv6 {
-            addresses.push(ipv6);
-        }
-
         // Create DpdkDevice with specific queue_id
         let dpdk_device = unsafe { DpdkDevice::new(port_id, allocation.queue_id, mempool) };
 
         workers.push(InitializedWorker {
             device: dpdk_device,
             mac: allocation.mac,
-            addresses,
+            addresses: allocation.addresses.clone(),
             gateway_v4: allocation.gateway_v4,
             gateway_v6: allocation.gateway_v6,
             core_id: allocation.core_id,

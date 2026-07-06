@@ -15,7 +15,7 @@ use crate::runtime::{blocking, driver, Config, WorkerMetrics};
 use crate::util::atomic_cell::AtomicCell;
 use crate::util::rand::FastRand;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -333,10 +333,18 @@ pub(crate) struct BlockOnState {
 
 /// A scheduler worker
 pub(crate) struct Worker {
+    /// Per-worker DPDK network driver.
+    ///
+    /// This is intentionally outside `Core`: scheduler operations may re-enter
+    /// while the driver is being polled, but they must not borrow the driver.
+    /// Field order is important: `driver` drops before `handle`, so DPDK device
+    /// resources are released before `Shared::dpdk_resources` cleans up EAL.
+    pub(super) driver: DriverSlot,
+
     /// Used to hand-off a worker's core to another thread.
     ///
-    /// This field must be dropped before `handle`: `Core` owns the DPDK driver,
-    /// while `handle.shared.dpdk_resources` owns the EAL/mempool cleanup.
+    /// This contains scheduler state only. The DPDK driver stays pinned in
+    /// `driver` and is accessed through `with_current_driver()`.
     pub(super) core: AtomicCell<Core>,
 
     /// Reference to scheduler's handle
@@ -351,9 +359,6 @@ pub(crate) struct Worker {
 
 /// Core data - each worker owns one
 pub(crate) struct Core {
-    /// DPDK network driver owned by this transferable core.
-    pub(crate) driver: DpdkDriver,
-
     /// Used to schedule bookkeeping tasks every so often.
     /// Incremented on every event loop iteration (including idle).
     pub(crate) tick: u32,
@@ -393,6 +398,40 @@ pub(crate) struct Core {
 
     #[cfg(feature = "market-trace")]
     trace_queue_depths: TraceQueueDepths,
+}
+
+pub(super) struct DriverSlot {
+    driver: UnsafeCell<Option<DpdkDriver>>,
+    borrowed: Cell<bool>,
+}
+
+unsafe impl Sync for DriverSlot {}
+
+impl DriverSlot {
+    fn new(driver: DpdkDriver) -> Self {
+        Self {
+            driver: UnsafeCell::new(Some(driver)),
+            borrowed: Cell::new(false),
+        }
+    }
+
+    fn with_mut<R>(&self, f: impl FnOnce(&mut DpdkDriver) -> R) -> Option<R> {
+        if self.borrowed.replace(true) {
+            panic!("DPDK driver mutable reentry on the same worker");
+        }
+        struct BorrowGuard<'a>(&'a Cell<bool>);
+        impl Drop for BorrowGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _guard = BorrowGuard(&self.borrowed);
+        // SAFETY: DriverSlot is pinned to one worker. The borrowed guard prevents
+        // same-worker mutable reentry; other threads cannot access this slot
+        // through `with_current_driver()` because current worker TLS differs.
+        let driver = unsafe { &mut *self.driver.get() }.as_mut()?;
+        Some(f(driver))
+    }
 }
 
 #[cfg(feature = "market-trace")]
@@ -539,42 +578,8 @@ pub(crate) struct Launch {
     pub(super) before_stop: Option<crate::runtime::Callback>,
 }
 
-/// Running a task may consume the core.
+/// Running a task may consume the scheduler core.
 pub(crate) type RunResult = Result<Box<Core>, ()>;
-
-struct CoreTakeGuard<'a> {
-    slot: &'a RefCell<Option<Box<Core>>>,
-    core: Option<Box<Core>>,
-}
-
-impl<'a> CoreTakeGuard<'a> {
-    fn take(slot: &'a RefCell<Option<Box<Core>>>) -> Option<Self> {
-        let core = slot.borrow_mut().take()?;
-        Some(Self {
-            slot,
-            core: Some(core),
-        })
-    }
-
-    fn core_mut(&mut self) -> &mut Core {
-        self.core
-            .as_mut()
-            .expect("DPDK scheduler CoreTakeGuard lost Core")
-    }
-}
-
-impl Drop for CoreTakeGuard<'_> {
-    fn drop(&mut self) {
-        let Some(core) = self.core.take() else {
-            return;
-        };
-        let mut slot = self.slot.borrow_mut();
-        if slot.is_some() {
-            panic!("DPDK scheduler Core slot was repopulated while CoreTakeGuard was active");
-        }
-        *slot = Some(core);
-    }
-}
 
 /// A notified task handle
 pub(crate) type Notified = task::Notified<Arc<Handle>>;
@@ -670,13 +675,12 @@ pub(super) fn create(
     }
 
     // Create the local queues
-    for (driver, &core_id) in drivers.drain(..).zip(core_ids.iter()) {
+    for &core_id in core_ids.iter() {
         let run_queue = queue::local();
         let metrics = WorkerMetrics::from_config(&config);
         let stats = Stats::new(&metrics);
 
         cores.push(Box::new(Core {
-            driver,
             tick: 0,
             exec_count: 0,
             lifo_slot: None,
@@ -744,8 +748,14 @@ pub(super) fn create(
         before_stop,
     };
 
-    for (index, (core, &core_id)) in cores.drain(..).zip(core_ids.iter()).enumerate() {
+    for (index, ((core, driver), &core_id)) in cores
+        .drain(..)
+        .zip(drivers.drain(..))
+        .zip(core_ids.iter())
+        .enumerate()
+    {
         launch.workers.push(Arc::new(Worker {
+            driver: DriverSlot::new(driver),
             handle: handle.clone(),
             index,
             core_id,
@@ -1199,9 +1209,7 @@ pub fn current_scheduler_stats() -> Option<DpdkSchedulerStats> {
 pub(crate) fn with_current_driver<R>(f: impl FnOnce(&mut DpdkDriver) -> R) -> Option<R> {
     with_current(|ctx| {
         let ctx = ctx?;
-        let mut core = ctx.core.borrow_mut();
-        let core = core.as_mut()?;
-        Some(f(&mut core.driver))
+        ctx.worker.driver.with_mut(f)
     })
 }
 
@@ -1453,11 +1461,7 @@ impl Context {
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(self.worker.index);
 
-        let Some(mut core_guard) = CoreTakeGuard::take(&self.core) else {
-            return;
-        };
-        {
-            let driver = &mut core_guard.core_mut().driver;
+        self.worker.driver.with_mut(|driver| {
             // Skip poll if no sockets are registered (optimization)
             if !driver.has_registered_sockets() {
                 return;
@@ -1494,7 +1498,7 @@ impl Context {
                     0,
                 );
             }
-        }
+        });
     }
 
     #[cfg(feature = "market-trace")]
@@ -1823,8 +1827,7 @@ impl Context {
     fn replenish_buffer_pool_if_needed(&self) {
         const REPLENISH_BATCH_SIZE: usize = 16;
 
-        if let Some(core) = self.core.borrow_mut().as_mut() {
-            let driver = &mut core.driver;
+        self.worker.driver.with_mut(|driver| {
             let needs = driver.buffer_pool_needs_replenish();
             if needs {
                 let replenished = driver.buffer_pool_replenish(REPLENISH_BATCH_SIZE);
@@ -1832,7 +1835,7 @@ impl Context {
                     super::counters::inc_num_maintenance(); // Track as maintenance work
                 }
             }
-        }
+        });
     }
 
     fn shutdown_core(&self) -> RunResult {

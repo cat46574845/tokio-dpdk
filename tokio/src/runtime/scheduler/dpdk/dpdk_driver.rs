@@ -300,9 +300,9 @@ impl DpdkDriver {
         let flush_tx_before_dur_ns =
             crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_before_start_ns);
 
-        // Drain the hardware RX queue at poll entry until rx_burst cannot fill
-        // the preallocated batch buffer. The collected mbufs are then processed
-        // newest-first inside this same poll.
+        // Drain the hardware RX queue at poll entry until rx_burst returns no
+        // packets. The collected mbufs are then processed newest-first inside
+        // this same poll.
         #[cfg(feature = "market-trace")]
         let drain_rx_start_ns = crate::runtime::market_trace::now_ns();
         let drain_rx_stats = self.device.drain_rx(&mut self.raw_tail);

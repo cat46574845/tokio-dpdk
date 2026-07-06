@@ -219,14 +219,11 @@ impl Dpdk {
                         .iter()
                         .filter(|w| w.pci_address == pci_address)
                         .flat_map(|w| {
-                            let mut ips = Vec::new();
-                            if let Some(ipv4) = w.ipv4 {
-                                ips.push((ipv4, w.queue_id));
-                            }
-                            if let Some(ipv6) = w.ipv6 {
-                                ips.push((ipv6, w.queue_id));
-                            }
-                            ips
+                            w.addresses
+                                .iter()
+                                .copied()
+                                .map(|addr| (addr, w.queue_id))
+                                .collect::<Vec<_>>()
                         })
                         .collect();
 

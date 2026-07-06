@@ -101,10 +101,8 @@ pub(crate) struct WorkerAllocation {
     pub queue_id: u16,
     /// CPU core to bind this worker to.
     pub core_id: usize,
-    /// Assigned IPv4 address (if available).
-    pub ipv4: Option<IpCidr>,
-    /// Assigned IPv6 address (if available).
-    pub ipv6: Option<IpCidr>,
+    /// IP addresses assigned to this worker.
+    pub addresses: Vec<IpCidr>,
     /// MAC address of the device.
     pub mac: [u8; 6],
     /// IPv4 gateway for this device.
@@ -197,19 +195,8 @@ pub(crate) fn create_allocation_plan(
     if num_workers <= num_devices {
         // Case: fewer workers than devices - one worker per device, no multi-queue
         for (i, device) in available_devices.iter().take(num_workers).enumerate() {
-            let ipv4 = device
-                .addresses
-                .iter()
-                .find(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv4(_)))
-                .cloned();
-            let ipv6 = device
-                .addresses
-                .iter()
-                .find(|a| matches!(a.address(), smoltcp::wire::IpAddress::Ipv6(_)))
-                .cloned();
-
-            // Each worker needs at least one IP
-            if ipv4.is_none() && ipv6.is_none() {
+            let addresses = device.addresses.clone();
+            if addresses.is_empty() {
                 return Err(AllocationError::InsufficientIps {
                     device: device.pci_address.clone(),
                     workers: 1,
@@ -222,8 +209,7 @@ pub(crate) fn create_allocation_plan(
                 pci_address: device.pci_address.clone(),
                 queue_id: 0,
                 core_id: available_cores[i],
-                ipv4,
-                ipv6,
+                addresses,
                 mac: device.mac,
                 gateway_v4: device.gateway_v4,
                 gateway_v6: device.gateway_v6,
@@ -274,22 +260,17 @@ pub(crate) fn create_allocation_plan(
 
             // Distribute IPs to workers for this device
             for queue_id in 0..workers_for_device {
-                // Assign IPv4 if available (round-robin if not enough)
-                let ipv4 = if !ipv4_addrs.is_empty() {
-                    Some(*ipv4_addrs[queue_id % ipv4_addrs.len()])
-                } else {
-                    None
-                };
+                let mut addresses = Vec::with_capacity(2);
+                if !ipv4_addrs.is_empty() {
+                    addresses.push(*ipv4_addrs[queue_id % ipv4_addrs.len()]);
+                }
 
-                // Assign IPv6 if available (round-robin if not enough)
-                let ipv6 = if !ipv6_addrs.is_empty() {
-                    Some(*ipv6_addrs[queue_id % ipv6_addrs.len()])
-                } else {
-                    None
-                };
+                if !ipv6_addrs.is_empty() {
+                    addresses.push(*ipv6_addrs[queue_id % ipv6_addrs.len()]);
+                }
 
                 // Each worker needs at least one IP
-                if ipv4.is_none() && ipv6.is_none() {
+                if addresses.is_empty() {
                     return Err(AllocationError::InsufficientIps {
                         device: device.pci_address.clone(),
                         workers: workers_for_device,
@@ -302,8 +283,7 @@ pub(crate) fn create_allocation_plan(
                     pci_address: device.pci_address.clone(),
                     queue_id: queue_id as u16,
                     core_id: available_cores[worker_idx],
-                    ipv4,
-                    ipv6,
+                    addresses,
                     mac: device.mac,
                     gateway_v4: device.gateway_v4,
                     gateway_v6: device.gateway_v6,
@@ -370,6 +350,20 @@ mod tests {
         }
     }
 
+    fn has_ipv4(worker: &WorkerAllocation) -> bool {
+        worker
+            .addresses
+            .iter()
+            .any(|addr| matches!(addr.address(), smoltcp::wire::IpAddress::Ipv4(_)))
+    }
+
+    fn has_ipv6(worker: &WorkerAllocation) -> bool {
+        worker
+            .addresses
+            .iter()
+            .any(|addr| matches!(addr.address(), smoltcp::wire::IpAddress::Ipv6(_)))
+    }
+
     #[test]
     fn test_allocation_single_device_single_core() {
         let config = make_test_config(
@@ -382,6 +376,28 @@ mod tests {
         assert_eq!(plan.workers[0].pci_address, "0000:01:00.0");
         assert_eq!(plan.workers[0].core_id, 1);
         assert_eq!(plan.workers[0].queue_id, 0);
+    }
+
+    #[test]
+    fn test_allocation_single_worker_keeps_all_device_ips() {
+        let device = make_test_device_with_ips(
+            "0000:01:00.0",
+            &["10.0.0.1/24", "10.0.0.2/24", "10.0.0.3/24"],
+            &["2001:db8::1/64"],
+        );
+        let config = make_test_config(vec![device], vec![1]);
+
+        let plan = create_allocation_plan(&config, None, Some(1)).unwrap();
+        assert_eq!(plan.workers.len(), 1);
+        assert_eq!(plan.workers[0].addresses.len(), 4);
+        assert_eq!(
+            plan.workers[0]
+                .addresses
+                .iter()
+                .filter(|addr| matches!(addr.address(), smoltcp::wire::IpAddress::Ipv4(_)))
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -425,8 +441,7 @@ mod tests {
                     pci_address: "0000:01:00.0".to_string(),
                     queue_id: 0,
                     core_id: 1,
-                    ipv4: Some("10.0.0.1/24".parse().unwrap()),
-                    ipv6: None,
+                    addresses: vec!["10.0.0.1/24".parse().unwrap()],
                     mac: [0; 6],
                     gateway_v4: None,
                     gateway_v6: None,
@@ -437,8 +452,7 @@ mod tests {
                     pci_address: "0000:01:00.0".to_string(),
                     queue_id: 1,
                     core_id: 2,
-                    ipv4: Some("10.0.0.2/24".parse().unwrap()),
-                    ipv6: None,
+                    addresses: vec!["10.0.0.2/24".parse().unwrap()],
                     mac: [0; 6],
                     gateway_v4: None,
                     gateway_v6: None,
@@ -449,8 +463,7 @@ mod tests {
                     pci_address: "0000:02:00.0".to_string(),
                     queue_id: 0,
                     core_id: 3,
-                    ipv4: Some("10.0.0.3/24".parse().unwrap()),
-                    ipv6: None,
+                    addresses: vec!["10.0.0.3/24".parse().unwrap()],
                     mac: [0; 6],
                     gateway_v4: None,
                     gateway_v6: None,
@@ -506,9 +519,9 @@ mod tests {
         assert_eq!(plan.workers[2].queue_id, 2);
 
         // Each worker should have its own IP
-        assert!(plan.workers[0].ipv4.is_some());
-        assert!(plan.workers[1].ipv4.is_some());
-        assert!(plan.workers[2].ipv4.is_some());
+        assert!(has_ipv4(&plan.workers[0]));
+        assert!(has_ipv4(&plan.workers[1]));
+        assert!(has_ipv4(&plan.workers[2]));
     }
 
     #[test]
@@ -525,11 +538,11 @@ mod tests {
         assert_eq!(plan.workers.len(), 3);
 
         // First 2 workers get IPv4
-        assert!(plan.workers[0].ipv4.is_some());
-        assert!(plan.workers[1].ipv4.is_some());
+        assert!(has_ipv4(&plan.workers[0]));
+        assert!(has_ipv4(&plan.workers[1]));
         // Third worker might not have IPv4 (depends on distribution)
         // But should have IPv6
-        assert!(plan.workers[2].ipv6.is_some());
+        assert!(has_ipv6(&plan.workers[2]));
     }
 
     #[test]
@@ -619,8 +632,8 @@ mod tests {
         assert_eq!(plan.workers.len(), 3);
 
         // Each worker should have IPv6
-        assert!(plan.workers[0].ipv6.is_some());
-        assert!(plan.workers[1].ipv6.is_some());
-        assert!(plan.workers[2].ipv6.is_some());
+        assert!(has_ipv6(&plan.workers[0]));
+        assert!(has_ipv6(&plan.workers[1]));
+        assert!(has_ipv6(&plan.workers[2]));
     }
 }
