@@ -935,6 +935,15 @@ impl TcpDpdkStream {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))
     }
 
+    /// Return the next TCP sequence number expected from the remote peer.
+    pub fn recv_next_seq(&self) -> io::Result<u32> {
+        self.assert_on_correct_worker();
+
+        let handle = self.handle;
+        with_current_driver(|driver| driver.get_tcp_socket_mut(handle).recv_next_seq())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))
+    }
+
     /// Divert this connected TCP flow into the DPDK raw-tail market-data path.
     ///
     /// After activation, inbound packets for this flow are captured by RSS hash
