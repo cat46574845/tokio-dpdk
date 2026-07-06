@@ -226,7 +226,6 @@ impl DpdkDevice {
             self.rx_pending.push(*mbuf);
         }
         self.rx_drain_batch.clear();
-        raw_tail.collect_dirty_from_conns();
         received_any
     }
 

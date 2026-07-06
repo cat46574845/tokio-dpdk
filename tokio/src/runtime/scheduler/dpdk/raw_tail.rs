@@ -198,8 +198,10 @@ pub(crate) struct RawTailTable {
     next_id: u64,
     worker_index: usize,
     conns: Vec<Option<TailConn>>,
-    rss_to_id: HashMap<u32, u64>,
-    dirty_ids: Vec<u64>,
+    rss_to_slot: HashMap<u32, usize>,
+    id_to_slot: HashMap<u64, usize>,
+    dirty_slots: Vec<usize>,
+    active_count: usize,
 }
 
 unsafe impl Send for RawTailTable {}
@@ -210,19 +212,41 @@ impl RawTailTable {
             next_id: 1,
             worker_index,
             conns: Vec::new(),
-            rss_to_id: HashMap::new(),
-            dirty_ids: Vec::with_capacity(RAW_TAIL_DIRTY_CAP),
+            rss_to_slot: HashMap::new(),
+            id_to_slot: HashMap::new(),
+            dirty_slots: Vec::with_capacity(RAW_TAIL_DIRTY_CAP),
+            active_count: 0,
         }
     }
 
     pub(crate) fn register(&mut self, tuple: RawTailTuple) -> io::Result<RawTailHandle> {
         let rss_hash = tuple.rss_hash();
-        if let Some(existing_id) = self.rss_to_id.get(&rss_hash) {
+        if let Some(existing_slot) = self.rss_to_slot.get(&rss_hash).copied() {
+            let Some(existing_id) = self
+                .conns
+                .get(existing_slot)
+                .and_then(|conn| conn.as_ref())
+                .map(|conn| conn.handle.id)
+            else {
+                panic!(
+                    "raw-tail RSS map points to empty slot rss={} slot={}",
+                    rss_hash, existing_slot
+                );
+            };
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
                     "raw-tail RSS hash collision rss={} existing_id={}",
                     rss_hash, existing_id
+                ),
+            ));
+        }
+        if self.conns.len() >= RAW_TAIL_DIRTY_CAP {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "raw-tail connection capacity exceeded cap={}",
+                    RAW_TAIL_DIRTY_CAP
                 ),
             ));
         }
@@ -232,7 +256,9 @@ impl RawTailTable {
             .checked_add(1)
             .expect("raw-tail handle id overflow");
         let handle = RawTailHandle::new(id, self.worker_index);
-        self.rss_to_id.insert(rss_hash, handle.id);
+        let slot = self.conns.len();
+        self.rss_to_slot.insert(rss_hash, slot);
+        self.id_to_slot.insert(handle.id, slot);
         self.conns.push(Some(TailConn {
             handle,
             rss_hash: Some(rss_hash),
@@ -249,13 +275,26 @@ impl RawTailTable {
     }
 
     pub(crate) fn activate(&mut self, handle: RawTailHandle) -> io::Result<()> {
-        let Some((_idx, conn)) = self.find_conn_mut(handle.id) else {
+        let Some(slot) = self.slot_for_handle(handle) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "raw-tail handle not registered on this worker",
             ));
         };
-        conn.active = true;
+        let was_inactive = {
+            let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "raw-tail handle not registered on this worker",
+                ));
+            };
+            let was_inactive = !conn.active;
+            conn.active = true;
+            was_inactive
+        };
+        if was_inactive {
+            self.active_count += 1;
+        }
         Ok(())
     }
 
@@ -265,7 +304,7 @@ impl RawTailTable {
         ctx: *mut (),
         callback: RawTailCallback,
     ) -> io::Result<()> {
-        let Some((_idx, conn)) = self.find_conn_mut(handle.id) else {
+        let Some(conn) = self.conn_for_handle_mut(handle) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "raw-tail handle not registered on this worker",
@@ -277,37 +316,56 @@ impl RawTailTable {
     }
 
     pub(crate) fn unregister(&mut self, handle: RawTailHandle) {
-        if let Some((idx, conn)) = self.find_conn_mut(handle.id) {
+        if let Some(idx) = self.slot_for_handle(handle) {
+            let Some(conn) = self.conns[idx].as_ref() else {
+                return;
+            };
             if let Some(rss) = conn.rss_hash {
-                self.rss_to_id.remove(&rss);
+                self.rss_to_slot.remove(&rss);
             }
+            if conn.active {
+                self.active_count = self
+                    .active_count
+                    .checked_sub(1)
+                    .expect("raw-tail active_count underflow");
+            }
+            self.id_to_slot.remove(&handle.id);
             self.conns[idx] = None;
         }
     }
 
     #[inline(always)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.conns.iter().all(|conn| conn.is_none())
+        self.active_count == 0
     }
 
     pub(crate) fn capture_mbuf(&mut self, mbuf: *mut ffi::rte_mbuf) -> bool {
+        if self.active_count == 0 {
+            return false;
+        }
         let rss = unsafe { mbuf_rss_hash(mbuf) };
-        if let Some(id) = self.rss_to_id.get(&rss).copied() {
-            if let Some((_idx, conn)) = self.find_conn_mut(id) {
+        if let Some(slot) = self.rss_to_slot.get(&rss).copied() {
+            let newly_dirty = {
+                let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
+                    return false;
+                };
                 if !conn.active {
                     return false;
                 }
-                Self::push_conn_mbuf(conn, mbuf);
-                return true;
+                Self::push_conn_mbuf(conn, mbuf)
+            };
+            if newly_dirty {
+                self.push_dirty_slot(slot);
             }
+            return true;
         }
         false
     }
 
     pub(crate) fn flush_acks(&mut self, device: &mut DpdkDevice) {
-        let dirty_ids = self.dirty_ids.clone();
-        for id in dirty_ids {
-            let Some((_idx, conn)) = self.find_conn_mut(id) else {
+        for idx in 0..self.dirty_slots.len() {
+            let slot = self.dirty_slots[idx];
+            let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
                 continue;
             };
             let Some(mbuf) = conn.ring.newest_to_oldest().next() else {
@@ -326,9 +384,8 @@ impl RawTailTable {
     }
 
     pub(crate) fn yield_dirty_records(&mut self) {
-        let dirty_ids: Vec<u64> = self.dirty_ids.drain(..).collect();
-        for id in dirty_ids {
-            let Some((_idx, conn)) = self.find_conn_mut(id) else {
+        while let Some(slot) = self.dirty_slots.pop() {
+            let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
                 continue;
             };
             conn.dirty = false;
@@ -337,22 +394,25 @@ impl RawTailTable {
         }
     }
 
-    fn push_conn_mbuf(conn: &mut TailConn, mbuf: *mut ffi::rte_mbuf) {
+    fn push_conn_mbuf(conn: &mut TailConn, mbuf: *mut ffi::rte_mbuf) -> bool {
         if let Some(old) = conn.ring.push(mbuf) {
             unsafe { DpdkDevice::free_mbuf(old) };
         }
         if !conn.dirty {
             conn.dirty = true;
+            return true;
         }
+        false
     }
 
-    pub(crate) fn collect_dirty_from_conns(&mut self) {
-        self.dirty_ids.clear();
-        for conn in self.conns.iter().flatten() {
-            if conn.dirty {
-                self.dirty_ids.push(conn.handle.id);
-            }
+    fn push_dirty_slot(&mut self, slot: usize) {
+        if self.dirty_slots.len() >= RAW_TAIL_DIRTY_CAP {
+            panic!(
+                "raw-tail dirty queue capacity exceeded cap={}",
+                RAW_TAIL_DIRTY_CAP
+            );
         }
+        self.dirty_slots.push(slot);
     }
 
     fn yield_latest_tls_records(conn: &mut TailConn) {
@@ -412,13 +472,16 @@ impl RawTailTable {
         }
     }
 
-    fn find_conn_mut(&mut self, id: u64) -> Option<(usize, &mut TailConn)> {
-        for (idx, conn) in self.conns.iter_mut().enumerate() {
-            if conn.as_ref().map(|conn| conn.handle.id) == Some(id) {
-                return conn.as_mut().map(|conn| (idx, conn));
-            }
+    fn conn_for_handle_mut(&mut self, handle: RawTailHandle) -> Option<&mut TailConn> {
+        let slot = self.slot_for_handle(handle)?;
+        self.conns.get_mut(slot)?.as_mut()
+    }
+
+    fn slot_for_handle(&self, handle: RawTailHandle) -> Option<usize> {
+        if handle.worker_index != self.worker_index {
+            return None;
         }
-        None
+        self.id_to_slot.get(&handle.id).copied()
     }
 }
 
