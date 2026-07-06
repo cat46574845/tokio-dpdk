@@ -295,6 +295,11 @@ impl DpdkDevice {
     }
 
     #[inline(always)]
+    pub(crate) fn has_unprocessed_rx_pending(&self) -> bool {
+        self.rx_index < self.rx_pending.len()
+    }
+
+    #[inline(always)]
     pub(crate) unsafe fn free_mbuf(mbuf: *mut ffi::rte_mbuf) {
         unsafe { dpdk_wrappers::pktmbuf_free(mbuf) }
     }

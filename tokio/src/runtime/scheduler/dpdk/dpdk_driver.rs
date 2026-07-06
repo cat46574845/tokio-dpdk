@@ -10,6 +10,7 @@
 //! (`register_recv_waker`/`register_send_waker`), not by a separate ScheduledIo.
 
 use std::collections::HashSet;
+use std::time::Duration;
 use std::time::Instant;
 
 use smoltcp::iface::{
@@ -38,6 +39,7 @@ const TCP_TX_BUFFER_SIZE: usize = 65536;
 
 /// Default buffer pool size (number of connections)
 const DEFAULT_BUFFER_POOL_SIZE: usize = 2048;
+const SMOLTCP_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 // =============================================================================
 // TcpBufferPool - Pre-allocated buffer management
@@ -168,6 +170,10 @@ pub(crate) struct DpdkDriver {
     bound_ports: HashSet<u16>,
     /// RSS-hash based lossy tail receiver for market-data flows.
     raw_tail: RawTailTable,
+    /// Set by local socket mutations that can require smoltcp egress work.
+    smoltcp_dirty: bool,
+    /// Periodic safety poll for smoltcp timers when raw-tail consumed all RX packets.
+    next_smoltcp_poll_at: Instant,
 }
 
 impl DpdkDriver {
@@ -244,6 +250,8 @@ impl DpdkDriver {
             buffer_pool: TcpBufferPool::with_defaults(),
             bound_ports: HashSet::new(),
             raw_tail: RawTailTable::new(worker_index),
+            smoltcp_dirty: true,
+            next_smoltcp_poll_at: start_time,
         }
     }
 
@@ -315,6 +323,9 @@ impl DpdkDriver {
             0
         };
 
+        let has_smoltcp_rx = self.device.has_unprocessed_rx_pending();
+        let run_smoltcp = has_smoltcp_rx || self.smoltcp_dirty || now >= self.next_smoltcp_poll_at;
+
         // Poll smoltcp (processes RX, generates TX)
         // smoltcp will automatically call wake() on registered wakers when:
         // - rx_buffer has new data (register_recv_waker)
@@ -334,14 +345,16 @@ impl DpdkDriver {
         } else {
             0
         };
-        loop {
-            match self
-                .iface
-                .poll_ingress_single(smol_now, &mut self.device, &mut self.sockets)
-            {
-                PollIngressSingleResult::None => break,
-                PollIngressSingleResult::PacketProcessed => {}
-                PollIngressSingleResult::SocketStateChanged => result = PollResult::SocketStateChanged,
+        if run_smoltcp {
+            loop {
+                match self
+                    .iface
+                    .poll_ingress_single(smol_now, &mut self.device, &mut self.sockets)
+                {
+                    PollIngressSingleResult::None => break,
+                    PollIngressSingleResult::PacketProcessed => {}
+                    PollIngressSingleResult::SocketStateChanged => result = PollResult::SocketStateChanged,
+                }
             }
         }
         #[cfg(feature = "market-trace")]
@@ -357,14 +370,18 @@ impl DpdkDriver {
         } else {
             0
         };
-        loop {
-            match self
-                .iface
-                .poll_egress(smol_now, &mut self.device, &mut self.sockets)
-            {
-                PollResult::None => break,
-                PollResult::SocketStateChanged => result = PollResult::SocketStateChanged,
+        if run_smoltcp {
+            loop {
+                match self
+                    .iface
+                    .poll_egress(smol_now, &mut self.device, &mut self.sockets)
+                {
+                    PollResult::None => break,
+                    PollResult::SocketStateChanged => result = PollResult::SocketStateChanged,
+                }
             }
+            self.smoltcp_dirty = false;
+            self.next_smoltcp_poll_at = now + SMOLTCP_IDLE_POLL_INTERVAL;
         }
         #[cfg(feature = "market-trace")]
         let smoltcp_egress_dur_ns = if trace_poll {
@@ -442,7 +459,7 @@ impl DpdkDriver {
                 smoltcp_poll_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_POLL,
                 track_id,
-                0,
+                u64::from(!run_smoltcp),
             );
             crate::runtime::market_trace::complete(
                 smoltcp_ingress_start_ns,
@@ -547,7 +564,9 @@ impl DpdkDriver {
         // This adds significant latency for request-response patterns.
         socket.set_nagle_enabled(false);
 
-        Some(self.sockets.add(socket))
+        let handle = self.sockets.add(socket);
+        self.mark_smoltcp_dirty();
+        Some(handle)
     }
 
     /// Register a connect socket for tracking.
@@ -586,9 +605,13 @@ impl DpdkDriver {
         U: Into<smoltcp::wire::IpListenEndpoint>,
     {
         let cx = self.iface.context();
-        self.sockets
+        let result = self.sockets
             .get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle)
-            .connect(cx, remote_endpoint, local_endpoint)
+            .connect(cx, remote_endpoint, local_endpoint);
+        if result.is_ok() {
+            self.mark_smoltcp_dirty();
+        }
+        result
     }
 
     /// Get TCP socket mutable reference.
@@ -599,6 +622,7 @@ impl DpdkDriver {
     /// Remove a socket from the socket set and return its buffers to the pool.
     pub(crate) fn remove_socket(&mut self, handle: SocketHandle) {
         self.unregister_socket(handle);
+        self.mark_smoltcp_dirty();
 
         // Remove socket and get its buffers
         let socket = self.sockets.remove(handle);
@@ -631,6 +655,11 @@ impl DpdkDriver {
     /// Used to skip polling when no sockets need service.
     pub(crate) fn has_registered_sockets(&self) -> bool {
         !self.registered_sockets.is_empty()
+    }
+
+    #[inline(always)]
+    pub(crate) fn mark_smoltcp_dirty(&mut self) {
+        self.smoltcp_dirty = true;
     }
 
     /// Get the first IPv4 address configured on this interface.

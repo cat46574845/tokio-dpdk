@@ -898,16 +898,22 @@ impl TcpDpdkStream {
 
         let handle = self.handle;
         let result = with_current_driver(|driver| {
-            let socket = driver.get_tcp_socket_mut(handle);
+            let result = {
+                let socket = driver.get_tcp_socket_mut(handle);
 
-            // recv() with a closure that just discards the data
-            match socket.recv(|data| {
-                let consume = n.min(data.len());
-                (consume, consume)
-            }) {
-                Ok(_consumed) => Ok(()),
-                Err(_) => Err(io::ErrorKind::Other),
+                // recv() with a closure that just discards the data
+                match socket.recv(|data| {
+                    let consume = n.min(data.len());
+                    (consume, consume)
+                }) {
+                    Ok(consumed) => Ok(consumed),
+                    Err(_) => Err(io::ErrorKind::Other),
+                }
+            };
+            if matches!(result, Ok(consumed) if consumed > 0) {
+                driver.mark_smoltcp_dirty();
             }
+            result.map(|_| ())
         });
 
         match result {
@@ -973,21 +979,27 @@ impl TcpDpdkStream {
 
         let handle = self.handle;
         let result = with_current_driver(|driver| {
-            let socket = driver.get_tcp_socket_mut(handle);
+            let result = {
+                let socket = driver.get_tcp_socket_mut(handle);
 
-            if !socket.can_recv() {
-                if socket.state() == smoltcp::socket::tcp::State::CloseWait
-                    || socket.state() == smoltcp::socket::tcp::State::Closed
-                {
-                    return Ok(0);
+                if !socket.can_recv() {
+                    if socket.state() == smoltcp::socket::tcp::State::CloseWait
+                        || socket.state() == smoltcp::socket::tcp::State::Closed
+                    {
+                        return Ok(0);
+                    }
+                    return Err(io::ErrorKind::WouldBlock);
                 }
-                return Err(io::ErrorKind::WouldBlock);
-            }
 
-            match socket.recv_slice(buf) {
-                Ok(n) => Ok(n),
-                Err(_) => Err(io::ErrorKind::WouldBlock),
+                match socket.recv_slice(buf) {
+                    Ok(n) => Ok(n),
+                    Err(_) => Err(io::ErrorKind::WouldBlock),
+                }
+            };
+            if matches!(result, Ok(n) if n > 0) {
+                driver.mark_smoltcp_dirty();
             }
+            result
         });
 
         match result {
@@ -1018,21 +1030,27 @@ impl TcpDpdkStream {
 
         let handle = self.handle;
         let result = with_current_driver(|driver| {
-            let socket = driver.get_tcp_socket_mut(handle);
+            let result = {
+                let socket = driver.get_tcp_socket_mut(handle);
 
-            if !socket.can_send() {
-                if socket.state() == smoltcp::socket::tcp::State::Closed
-                    || socket.state() == smoltcp::socket::tcp::State::Closing
-                {
-                    return Err(io::ErrorKind::BrokenPipe);
+                if !socket.can_send() {
+                    if socket.state() == smoltcp::socket::tcp::State::Closed
+                        || socket.state() == smoltcp::socket::tcp::State::Closing
+                    {
+                        return Err(io::ErrorKind::BrokenPipe);
+                    }
+                    return Err(io::ErrorKind::WouldBlock);
                 }
-                return Err(io::ErrorKind::WouldBlock);
-            }
 
-            match socket.send_slice(buf) {
-                Ok(n) => Ok(n),
-                Err(_) => Err(io::ErrorKind::WouldBlock),
+                match socket.send_slice(buf) {
+                    Ok(n) => Ok(n),
+                    Err(_) => Err(io::ErrorKind::WouldBlock),
+                }
+            };
+            if matches!(result, Ok(n) if n > 0) {
+                driver.mark_smoltcp_dirty();
             }
+            result
         });
 
         match result {
@@ -1381,6 +1399,7 @@ impl TcpDpdkStream {
                 with_current_driver(|driver| {
                     let socket = driver.get_tcp_socket_mut(handle);
                     socket.close();
+                    driver.mark_smoltcp_dirty();
                 });
             }
             Shutdown::Both => {
@@ -1392,6 +1411,7 @@ impl TcpDpdkStream {
                 with_current_driver(|driver| {
                     let socket = driver.get_tcp_socket_mut(handle);
                     socket.close();
+                    driver.mark_smoltcp_dirty();
                 });
             }
         }
@@ -1525,29 +1545,35 @@ impl AsyncWrite for TcpDpdkStream {
         let waker = cx.waker();
 
         let result = with_current_driver(|driver| {
-            let socket = driver.get_tcp_socket_mut(handle);
+            let result = {
+                let socket = driver.get_tcp_socket_mut(handle);
 
-            // Register waker with smoltcp BEFORE checking state
-            // smoltcp will call wake() when socket becomes writable
-            socket.register_send_waker(waker);
+                // Register waker with smoltcp BEFORE checking state
+                // smoltcp will call wake() when socket becomes writable
+                socket.register_send_waker(waker);
 
-            // Check if socket can send
-            if !socket.can_send() {
-                let state = socket.state();
-                if state == smoltcp::socket::tcp::State::Closed
-                    || state == smoltcp::socket::tcp::State::Closing
-                {
-                    return Err(io::ErrorKind::BrokenPipe);
+                // Check if socket can send
+                if !socket.can_send() {
+                    let state = socket.state();
+                    if state == smoltcp::socket::tcp::State::Closed
+                        || state == smoltcp::socket::tcp::State::Closing
+                    {
+                        return Err(io::ErrorKind::BrokenPipe);
+                    }
+                    // Not ready yet - waker is registered, smoltcp will wake us
+                    return Err(io::ErrorKind::WouldBlock);
                 }
-                // Not ready yet - waker is registered, smoltcp will wake us
-                return Err(io::ErrorKind::WouldBlock);
-            }
 
-            // Write data to socket
-            match socket.send_slice(buf) {
-                Ok(n) => Ok(n),
-                Err(_) => Err(io::ErrorKind::WouldBlock),
+                // Write data to socket
+                match socket.send_slice(buf) {
+                    Ok(n) => Ok(n),
+                    Err(_) => Err(io::ErrorKind::WouldBlock),
+                }
+            };
+            if matches!(result, Ok(n) if n > 0) {
+                driver.mark_smoltcp_dirty();
             }
+            result
         });
 
         match result {
