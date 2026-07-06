@@ -566,38 +566,30 @@ impl Handle {
 
     /// Returns the IPv4 address configured on the specified worker's DPDK interface.
     pub(crate) fn worker_ipv4(&self, worker_index: usize) -> Option<Ipv4Addr> {
-        let driver_mutex = self.shared.drivers.get(worker_index)?;
-        let driver = driver_mutex.lock().ok()?;
-        // smoltcp::wire::Ipv4Address is a type alias for std::net::Ipv4Addr
-        driver.get_ipv4_address()
+        self.shared.worker_ipv4.get(worker_index).copied().flatten()
     }
 
     /// Returns the IPv6 address configured on the specified worker's DPDK interface.
     pub(crate) fn worker_ipv6(&self, worker_index: usize) -> Option<Ipv6Addr> {
-        let driver_mutex = self.shared.drivers.get(worker_index)?;
-        let driver = driver_mutex.lock().ok()?;
-        // smoltcp::wire::Ipv6Address is a type alias for std::net::Ipv6Addr
-        driver.get_ipv6_address()
+        self.shared.worker_ipv6.get(worker_index).copied().flatten()
     }
 
     /// Returns all IPv4 addresses configured on the specified worker's DPDK interface.
     pub(crate) fn worker_ipv4s(&self, worker_index: usize) -> Vec<Ipv4Addr> {
-        let driver_mutex = self.shared.drivers.get(worker_index)
-            .expect("worker_index out of range");
-        driver_mutex.lock()
-            .ok()
-            .map(|driver| driver.get_ipv4_addresses())
-            .unwrap_or_default()
+        self.shared
+            .worker_ipv4s
+            .get(worker_index)
+            .expect("worker_index out of range")
+            .clone()
     }
 
     /// Returns all IPv6 addresses configured on the specified worker's DPDK interface.
     pub(crate) fn worker_ipv6s(&self, worker_index: usize) -> Vec<Ipv6Addr> {
-        let driver_mutex = self.shared.drivers.get(worker_index)
-            .expect("worker_index out of range");
-        driver_mutex.lock()
-            .ok()
-            .map(|driver| driver.get_ipv6_addresses())
-            .unwrap_or_default()
+        self.shared
+            .worker_ipv6s
+            .get(worker_index)
+            .expect("worker_index out of range")
+            .clone()
     }
 
     /// Shuts down a worker's core.
