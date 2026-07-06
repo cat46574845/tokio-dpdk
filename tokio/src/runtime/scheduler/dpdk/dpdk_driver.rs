@@ -277,7 +277,7 @@ impl DpdkDriver {
         // Flush pending TX packets first.
         #[cfg(feature = "market-trace")]
         let flush_tx_before_start_ns = crate::runtime::market_trace::now_ns();
-        self.device.flush_tx();
+        let _ = self.device.flush_tx();
         #[cfg(feature = "market-trace")]
         let flush_tx_before_dur_ns =
             crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_before_start_ns);
@@ -416,7 +416,7 @@ impl DpdkDriver {
         } else {
             0
         };
-        self.device.flush_tx();
+        let _ = self.device.flush_tx();
         #[cfg(feature = "market-trace")]
         let flush_tx_after_dur_ns = if trace_poll {
             crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_after_start_ns)
@@ -681,17 +681,17 @@ impl DpdkDriver {
                 .poll_egress_handle(now, &mut self.device, &mut self.sockets, handle)
             {
                 PollEgressHandleResult::SocketStateChanged => {
-                    self.device.flush_tx();
+                    self.device.flush_tx()?;
                 }
                 PollEgressHandleResult::None => {
-                    self.device.flush_tx();
+                    self.device.flush_tx()?;
                     if let Some(next_due) = self.iface.poll_at_handle(now, &self.sockets, handle) {
                         self.queue_egress_at(handle, next_due);
                     }
                     return Ok(());
                 }
                 PollEgressHandleResult::DeviceExhausted => {
-                    self.device.flush_tx();
+                    let _ = self.device.flush_tx();
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
                         "DPDK TX device exhausted during best-effort socket egress flush",

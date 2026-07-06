@@ -232,9 +232,9 @@ impl DpdkDevice {
     /// Flush the transmit buffer.
     ///
     /// This should be called periodically to ensure packets are sent.
-    pub(crate) fn flush_tx(&mut self) {
+    pub(crate) fn flush_tx(&mut self) -> std::io::Result<()> {
         if self.tx_buffer.is_empty() {
-            return;
+            return Ok(());
         }
 
         let mut sent_count = 0usize;
@@ -267,7 +267,15 @@ impl DpdkDevice {
                             dpdk_wrappers::pktmbuf_free(*mbuf);
                         }
                     }
-                    break;
+                    self.tx_buffer.clear();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "DPDK TX burst failed to send {} packets after {} retries",
+                            total - sent_count,
+                            MAX_RETRIES
+                        ),
+                    ));
                 }
                 // Brief pause before retry (yield CPU)
                 std::hint::spin_loop();
@@ -279,6 +287,7 @@ impl DpdkDevice {
         }
 
         self.tx_buffer.clear();
+        Ok(())
     }
 
     pub(crate) fn drop_unprocessed_rx_pending(&mut self) {

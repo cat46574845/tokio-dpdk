@@ -523,7 +523,7 @@ impl RawTailTable {
             let ack = tcp_seq_after_payload(pkt.tcp_seq, pkt.payload.len());
             device.send_raw_tcp_ack(&pkt, pkt.tcp_ack, ack);
         }
-        device.flush_tx();
+        let _ = device.flush_tx();
     }
 
     pub(crate) fn yield_dirty_records(&mut self) {
