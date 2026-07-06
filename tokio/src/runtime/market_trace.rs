@@ -73,7 +73,7 @@ pub(crate) fn sched_detail_enabled() -> bool {
     *SCHED_DETAIL.get_or_init(|| {
         std::env::var_os("TOKIO_DPDK_MARKET_TRACE_SCHED_DETAIL")
             .map(|value| value != "0" && value != "false" && value != "FALSE")
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
