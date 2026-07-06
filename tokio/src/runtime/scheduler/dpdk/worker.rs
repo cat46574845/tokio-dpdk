@@ -1466,6 +1466,9 @@ impl Context {
             let now = Instant::now();
             #[cfg(feature = "market-trace")]
             let poll_driver_outer_start_ns = crate::runtime::market_trace::now_ns();
+            #[cfg(feature = "market-trace")]
+            let active = driver.poll(now, poll_driver_outer_start_ns);
+            #[cfg(not(feature = "market-trace"))]
             let active = driver.poll(now);
             #[cfg(not(feature = "market-trace"))]
             let _ = active;

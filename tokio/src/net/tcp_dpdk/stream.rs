@@ -308,6 +308,12 @@ impl TcpDpdkStream {
 
             // Poll the driver to process network I/O (including SYN-ACK)
             let connected = with_current_driver(|driver| {
+                #[cfg(feature = "market-trace")]
+                driver.poll(
+                    std::time::Instant::now(),
+                    crate::runtime::market_trace::now_ns(),
+                );
+                #[cfg(not(feature = "market-trace"))]
                 driver.poll(std::time::Instant::now());
 
                 // Check socket state
@@ -503,6 +509,12 @@ impl TcpDpdkStream {
             }
 
             let connected = with_current_driver(|driver| {
+                #[cfg(feature = "market-trace")]
+                driver.poll(
+                    std::time::Instant::now(),
+                    crate::runtime::market_trace::now_ns(),
+                );
+                #[cfg(not(feature = "market-trace"))]
                 driver.poll(std::time::Instant::now());
                 let socket = driver.get_tcp_socket_mut(handle);
                 let state = socket.state();

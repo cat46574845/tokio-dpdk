@@ -268,11 +268,13 @@ impl DpdkDriver {
     /// 3. smoltcp internally wakes registered wakers on socket state changes
     ///
     /// Returns `true` if there was network activity.
-    pub(crate) fn poll(&mut self, now: Instant) -> bool {
+    pub(crate) fn poll(
+        &mut self,
+        now: Instant,
+        #[cfg(feature = "market-trace")] poll_start_ns: u64,
+    ) -> bool {
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(self.worker_index);
-        #[cfg(feature = "market-trace")]
-        let poll_start_ns = crate::runtime::market_trace::now_ns();
         let smol_now = self.smol_instant(now);
         // Flush pending TX packets first.
         #[cfg(feature = "market-trace")]
