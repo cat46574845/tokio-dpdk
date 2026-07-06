@@ -284,35 +284,43 @@ impl DpdkDriver {
     /// 3. smoltcp internally wakes registered wakers on socket state changes
     ///
     /// Returns `true` if there was network activity.
-    pub(crate) fn poll(
-        &mut self,
-        now: Instant,
-        #[cfg(feature = "market-trace")] poll_start_ns: u64,
-    ) -> bool {
+    pub(crate) fn poll(&mut self, now: Instant) -> bool {
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(self.worker_index);
         let smol_now = self.smol_instant(now);
         // Flush pending TX packets first.
         #[cfg(feature = "market-trace")]
-        let flush_tx_before_start_ns = crate::runtime::market_trace::now_ns();
+        let trace_flush_tx_before = self.device.has_pending_tx();
+        #[cfg(feature = "market-trace")]
+        let flush_tx_before_start_ns = if trace_flush_tx_before {
+            crate::runtime::market_trace::now_ns()
+        } else {
+            0
+        };
         let _ = self.device.flush_tx();
         #[cfg(feature = "market-trace")]
-        let flush_tx_before_dur_ns =
-            crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_before_start_ns);
+        let flush_tx_before_dur_ns = if trace_flush_tx_before {
+            crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_before_start_ns)
+        } else {
+            0
+        };
 
         // Drain the hardware RX queue at poll entry until rx_burst returns no
         // packets. The collected mbufs are then processed newest-first inside
         // this same poll.
-        #[cfg(feature = "market-trace")]
-        let drain_rx_start_ns = crate::runtime::market_trace::now_ns();
         let drain_rx_stats = self.device.drain_rx(&mut self.raw_tail);
         let received_rx = drain_rx_stats.received_any();
-        #[cfg(feature = "market-trace")]
-        let drain_rx_dur_ns =
-            crate::runtime::market_trace::now_ns().saturating_sub(drain_rx_start_ns);
 
         #[cfg(feature = "market-trace")]
-        let trace_poll = received_rx;
+        let trace_poll = trace_flush_tx_before || received_rx;
+        #[cfg(feature = "market-trace")]
+        let poll_start_ns = if flush_tx_before_start_ns != 0 {
+            flush_tx_before_start_ns
+        } else if drain_rx_stats.trace_start_ns != 0 {
+            drain_rx_stats.trace_start_ns
+        } else {
+            0
+        };
 
         #[cfg(feature = "market-trace")]
         let flush_acks_start_ns = if trace_poll {
@@ -445,14 +453,16 @@ impl DpdkDriver {
 
         // Flush any new TX packets (e.g., ACKs, SYN-ACK)
         #[cfg(feature = "market-trace")]
-        let flush_tx_after_start_ns = if trace_poll {
+        let trace_flush_tx_after = trace_poll && self.device.has_pending_tx();
+        #[cfg(feature = "market-trace")]
+        let flush_tx_after_start_ns = if trace_flush_tx_after {
             crate::runtime::market_trace::now_ns()
         } else {
             0
         };
         let _ = self.device.flush_tx();
         #[cfg(feature = "market-trace")]
-        let flush_tx_after_dur_ns = if trace_poll {
+        let flush_tx_after_dur_ns = if trace_flush_tx_after {
             crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_after_start_ns)
         } else {
             0
@@ -479,17 +489,19 @@ impl DpdkDriver {
                 track_id,
                 0,
             );
-            crate::runtime::market_trace::complete(
-                drain_rx_start_ns,
-                drain_rx_dur_ns,
-                crate::runtime::market_trace::SPAN_DPDK_DRAIN_RX,
-                track_id,
-                pack_trace_aux3(
-                    drain_rx_stats.received,
-                    drain_rx_stats.raw_tail_captured,
-                    drain_rx_stats.smoltcp_pending,
-                ),
-            );
+            if drain_rx_stats.trace_start_ns != 0 {
+                crate::runtime::market_trace::complete(
+                    drain_rx_stats.trace_start_ns,
+                    drain_rx_stats.trace_dur_ns,
+                    crate::runtime::market_trace::SPAN_DPDK_DRAIN_RX,
+                    track_id,
+                    pack_trace_aux3(
+                        drain_rx_stats.received,
+                        drain_rx_stats.raw_tail_captured,
+                        drain_rx_stats.smoltcp_pending,
+                    ),
+                );
+            }
             crate::runtime::market_trace::complete(
                 flush_acks_start_ns,
                 flush_acks_dur_ns,

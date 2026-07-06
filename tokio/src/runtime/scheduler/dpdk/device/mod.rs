@@ -32,6 +32,10 @@ pub(crate) struct DrainRxStats {
     pub(crate) received: usize,
     pub(crate) raw_tail_captured: usize,
     pub(crate) smoltcp_pending: usize,
+    #[cfg(feature = "market-trace")]
+    pub(crate) trace_start_ns: u64,
+    #[cfg(feature = "market-trace")]
+    pub(crate) trace_dur_ns: u64,
 }
 
 impl DrainRxStats {
@@ -228,6 +232,8 @@ impl DpdkDevice {
         }
         self.rx_drain_batch.clear();
         let mut stats = DrainRxStats::default();
+        #[cfg(feature = "market-trace")]
+        let mut trace_start_ns = 0u64;
 
         loop {
             let n = unsafe {
@@ -240,6 +246,10 @@ impl DpdkDevice {
             };
 
             if n > 0 {
+                #[cfg(feature = "market-trace")]
+                if trace_start_ns == 0 {
+                    trace_start_ns = crate::runtime::market_trace::now_ns();
+                }
                 stats.received += n as usize;
                 for mbuf in &self.rx_burst_buf[..n as usize] {
                     self.rx_drain_batch.push(*mbuf);
@@ -257,6 +267,11 @@ impl DpdkDevice {
             }
             self.rx_pending.push(*mbuf);
             stats.smoltcp_pending += 1;
+        }
+        #[cfg(feature = "market-trace")]
+        if trace_start_ns != 0 {
+            stats.trace_start_ns = trace_start_ns;
+            stats.trace_dur_ns = crate::runtime::market_trace::now_ns().saturating_sub(trace_start_ns);
         }
         self.rx_drain_batch.clear();
         stats
@@ -321,6 +336,11 @@ impl DpdkDevice {
 
         self.tx_buffer.clear();
         Ok(())
+    }
+
+    #[inline(always)]
+    pub(crate) fn has_pending_tx(&self) -> bool {
+        !self.tx_buffer.is_empty()
     }
 
     pub(crate) fn drop_unprocessed_rx_pending(&mut self) {

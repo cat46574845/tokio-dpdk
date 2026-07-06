@@ -1306,7 +1306,9 @@ impl Context {
             // Poll DPDK network stack (receive packets, process TCP/IP, wake socket tasks)
             self.poll_dpdk_driver();
             #[cfg(feature = "market-trace")]
-            self.trace_queue_depths();
+            if crate::runtime::market_trace::sched_detail_enabled() {
+                self.trace_queue_depths();
+            }
 
             // Debug: record poll_dpdk_driver end
             #[cfg(feature = "dpdk-debug")]
@@ -1391,7 +1393,9 @@ impl Context {
                 core.stats.end_processing_scheduled_tasks();
             }
             #[cfg(feature = "market-trace")]
-            self.trace_queue_depths();
+            if crate::runtime::market_trace::sched_detail_enabled() {
+                self.trace_queue_depths();
+            }
 
             // Poll block_on future if present (unified event loop design)
             // This allows the block_on future to be polled alongside spawned tasks
@@ -1469,15 +1473,18 @@ impl Context {
             // Poll with current time
             let now = Instant::now();
             #[cfg(feature = "market-trace")]
-            let poll_driver_outer_start_ns = crate::runtime::market_trace::now_ns();
+            let sched_detail = crate::runtime::market_trace::sched_detail_enabled();
             #[cfg(feature = "market-trace")]
-            let active = driver.poll(now, poll_driver_outer_start_ns);
-            #[cfg(not(feature = "market-trace"))]
+            let poll_driver_outer_start_ns = if sched_detail {
+                crate::runtime::market_trace::now_ns()
+            } else {
+                0
+            };
             let active = driver.poll(now);
             #[cfg(not(feature = "market-trace"))]
             let _ = active;
             #[cfg(feature = "market-trace")]
-            if active {
+            if sched_detail && active {
                 let poll_driver_outer_dur_ns = crate::runtime::market_trace::now_ns()
                     .saturating_sub(poll_driver_outer_start_ns);
                 crate::runtime::market_trace::complete(
@@ -1487,7 +1494,7 @@ impl Context {
                     track_id,
                     0,
                 );
-            } else if crate::runtime::market_trace::sched_detail_enabled() {
+            } else if sched_detail {
                 let poll_driver_idle_dur_ns = crate::runtime::market_trace::now_ns()
                     .saturating_sub(poll_driver_outer_start_ns);
                 crate::runtime::market_trace::complete(
@@ -1730,17 +1737,6 @@ impl Context {
         #[cfg(feature = "market-trace")]
         let task_id = task.market_trace_task_id();
         #[cfg(feature = "market-trace")]
-        let _task_queue_guard = crate::runtime::market_trace::enter_task_queue(
-            task_queue_source,
-            task_queue_wait_ns,
-        );
-        #[cfg(feature = "market-trace")]
-        let _trace_scope = crate::runtime::market_trace::scope(
-            crate::runtime::market_trace::SPAN_DPDK_RUN_TASK,
-            crate::runtime::market_trace::dpdk_track(self.worker.index),
-            crate::runtime::market_trace::pack_task_aux(task_queue_source, task_queue_wait_ns),
-        );
-        #[cfg(feature = "market-trace")]
         let run_start_ns = crate::runtime::market_trace::now_ns();
         crate::task::coop::budget(|| {
             task.run();
@@ -1748,6 +1744,13 @@ impl Context {
         #[cfg(feature = "market-trace")]
         {
             let run_dur_ns = crate::runtime::market_trace::now_ns().saturating_sub(run_start_ns);
+            crate::runtime::market_trace::complete(
+                run_start_ns,
+                run_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_RUN_TASK,
+                crate::runtime::market_trace::dpdk_track(self.worker.index),
+                crate::runtime::market_trace::pack_task_aux(task_queue_source, task_queue_wait_ns),
+            );
             let threshold_ns = long_task_threshold_ns();
             if threshold_ns != 0 && run_dur_ns >= threshold_ns {
                 eprintln!(
