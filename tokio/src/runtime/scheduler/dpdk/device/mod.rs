@@ -27,6 +27,20 @@ const RX_DRAIN_BATCH_CAP: usize = 8192;
 /// Default MTU (Maximum Transmission Unit)
 const DEFAULT_MTU: usize = 1500;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DrainRxStats {
+    pub(crate) received: usize,
+    pub(crate) raw_tail_captured: usize,
+    pub(crate) smoltcp_pending: usize,
+}
+
+impl DrainRxStats {
+    #[inline(always)]
+    pub(crate) fn received_any(self) -> bool {
+        self.received != 0
+    }
+}
+
 fn configured_rx_burst_size() -> u16 {
     let Some(value) = std::env::var_os("TOKIO_DPDK_RX_BURST_SIZE") else {
         return RX_BURST_SIZE_DEFAULT;
@@ -189,14 +203,14 @@ impl DpdkDevice {
     }
 
     /// Try to receive packets from DPDK.
-    pub(crate) fn drain_rx(&mut self, raw_tail: &mut RawTailTable) -> bool {
+    pub(crate) fn drain_rx(&mut self, raw_tail: &mut RawTailTable) -> DrainRxStats {
         // Only receive if we've consumed all pending packets
         if self.rx_index >= self.rx_pending.len() {
             self.rx_pending.clear();
             self.rx_index = 0;
         }
         self.rx_drain_batch.clear();
-        let mut received_any = false;
+        let mut stats = DrainRxStats::default();
 
         loop {
             let n = unsafe {
@@ -209,7 +223,7 @@ impl DpdkDevice {
             };
 
             if n > 0 {
-                received_any = true;
+                stats.received += n as usize;
                 for mbuf in &self.rx_burst_buf[..n as usize] {
                     self.rx_drain_batch.push(*mbuf);
                 }
@@ -221,12 +235,14 @@ impl DpdkDevice {
         }
         for mbuf in self.rx_drain_batch.iter().rev() {
             if !raw_tail.is_empty() && raw_tail.capture_mbuf(*mbuf) {
+                stats.raw_tail_captured += 1;
                 continue;
             }
             self.rx_pending.push(*mbuf);
+            stats.smoltcp_pending += 1;
         }
         self.rx_drain_batch.clear();
-        received_any
+        stats
     }
 
     /// Flush the transmit buffer.

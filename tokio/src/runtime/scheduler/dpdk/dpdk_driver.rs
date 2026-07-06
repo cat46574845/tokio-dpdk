@@ -40,6 +40,22 @@ const TCP_TX_BUFFER_SIZE: usize = 65536;
 /// Default buffer pool size (number of connections)
 const DEFAULT_BUFFER_POOL_SIZE: usize = 2048;
 const PENDING_EGRESS_NONE: usize = usize::MAX;
+#[cfg(feature = "market-trace")]
+const TRACE_AUX_FIELD_BITS: u64 = 21;
+#[cfg(feature = "market-trace")]
+const TRACE_AUX_FIELD_MASK: u64 = (1u64 << TRACE_AUX_FIELD_BITS) - 1;
+
+#[cfg(feature = "market-trace")]
+#[inline(always)]
+fn pack_trace_aux3(a: usize, b: usize, c: usize) -> u64 {
+    let a = a as u64;
+    let b = b as u64;
+    let c = c as u64;
+    assert!(a <= TRACE_AUX_FIELD_MASK, "market trace aux field a overflow value={}", a);
+    assert!(b <= TRACE_AUX_FIELD_MASK, "market trace aux field b overflow value={}", b);
+    assert!(c <= TRACE_AUX_FIELD_MASK, "market trace aux field c overflow value={}", c);
+    a | (b << TRACE_AUX_FIELD_BITS) | (c << (TRACE_AUX_FIELD_BITS * 2))
+}
 // =============================================================================
 // TcpBufferPool - Pre-allocated buffer management
 // =============================================================================
@@ -289,7 +305,8 @@ impl DpdkDriver {
         // newest-first inside this same poll.
         #[cfg(feature = "market-trace")]
         let drain_rx_start_ns = crate::runtime::market_trace::now_ns();
-        let received_rx = self.device.drain_rx(&mut self.raw_tail);
+        let drain_rx_stats = self.device.drain_rx(&mut self.raw_tail);
+        let received_rx = drain_rx_stats.received_any();
         #[cfg(feature = "market-trace")]
         let drain_rx_dur_ns =
             crate::runtime::market_trace::now_ns().saturating_sub(drain_rx_start_ns);
@@ -325,6 +342,12 @@ impl DpdkDriver {
             0
         };
         let mut result = PollResult::None;
+        #[cfg(feature = "market-trace")]
+        let mut smoltcp_ingress_packets = 0usize;
+        #[cfg(feature = "market-trace")]
+        let mut smoltcp_ingress_state_changes = 0usize;
+        #[cfg(feature = "market-trace")]
+        let mut smoltcp_ingress_touched = 0usize;
 
         #[cfg(feature = "market-trace")]
         let smoltcp_ingress_start_ns = if trace_poll {
@@ -354,9 +377,25 @@ impl DpdkDriver {
                     )
                 {
                     PollIngressSingleResult::None => break,
-                    PollIngressSingleResult::PacketProcessed => {}
-                    PollIngressSingleResult::SocketStateChanged => result = PollResult::SocketStateChanged,
+                    PollIngressSingleResult::PacketProcessed => {
+                        #[cfg(feature = "market-trace")]
+                        {
+                            smoltcp_ingress_packets += 1;
+                        }
+                    }
+                    PollIngressSingleResult::SocketStateChanged => {
+                        result = PollResult::SocketStateChanged;
+                        #[cfg(feature = "market-trace")]
+                        {
+                            smoltcp_ingress_packets += 1;
+                            smoltcp_ingress_state_changes += 1;
+                        }
+                    }
                 }
+            }
+            #[cfg(feature = "market-trace")]
+            {
+                smoltcp_ingress_touched = ingress_touched.len();
             }
             for handle in ingress_touched.iter().copied() {
                 if let Some(next_due) = self.iface.poll_at_handle(smol_now, &self.sockets, handle) {
@@ -380,9 +419,16 @@ impl DpdkDriver {
         } else {
             0
         };
-        if self.poll_pending_egress(smol_now) == PollResult::SocketStateChanged {
+        #[cfg(feature = "market-trace")]
+        let smoltcp_egress_pending_start = self.pending_egress_heap.len();
+        let (egress_result, smoltcp_egress_processed) = self.poll_pending_egress(smol_now);
+        #[cfg(not(feature = "market-trace"))]
+        let _ = smoltcp_egress_processed;
+        if egress_result == PollResult::SocketStateChanged {
             result = PollResult::SocketStateChanged;
         }
+        #[cfg(feature = "market-trace")]
+        let smoltcp_egress_pending_end = self.pending_egress_heap.len();
         #[cfg(feature = "market-trace")]
         let smoltcp_egress_dur_ns = if trace_poll {
             crate::runtime::market_trace::now_ns().saturating_sub(smoltcp_egress_start_ns)
@@ -438,7 +484,11 @@ impl DpdkDriver {
                 drain_rx_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_DRAIN_RX,
                 track_id,
-                0,
+                pack_trace_aux3(
+                    drain_rx_stats.received,
+                    drain_rx_stats.raw_tail_captured,
+                    drain_rx_stats.smoltcp_pending,
+                ),
             );
             crate::runtime::market_trace::complete(
                 flush_acks_start_ns,
@@ -452,21 +502,33 @@ impl DpdkDriver {
                 smoltcp_poll_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_POLL,
                 track_id,
-                u64::from(!has_smoltcp_rx),
+                pack_trace_aux3(
+                    usize::from(has_smoltcp_rx),
+                    smoltcp_egress_pending_start,
+                    usize::from(matches!(result, PollResult::SocketStateChanged)),
+                ),
             );
             crate::runtime::market_trace::complete(
                 smoltcp_ingress_start_ns,
                 smoltcp_ingress_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_INGRESS,
                 track_id,
-                0,
+                pack_trace_aux3(
+                    smoltcp_ingress_packets,
+                    smoltcp_ingress_touched,
+                    smoltcp_ingress_state_changes,
+                ),
             );
             crate::runtime::market_trace::complete(
                 smoltcp_egress_start_ns,
                 smoltcp_egress_dur_ns,
                 crate::runtime::market_trace::SPAN_DPDK_SMOLTCP_EGRESS,
                 track_id,
-                0,
+                pack_trace_aux3(
+                    smoltcp_egress_pending_start,
+                    smoltcp_egress_processed,
+                    smoltcp_egress_pending_end,
+                ),
             );
             crate::runtime::market_trace::complete(
                 flush_tx_after_start_ns,
@@ -690,8 +752,9 @@ impl DpdkDriver {
         }
     }
 
-    fn poll_pending_egress(&mut self, now: SmolInstant) -> PollResult {
+    fn poll_pending_egress(&mut self, now: SmolInstant) -> (PollResult, usize) {
         let mut result = PollResult::None;
+        let mut processed = 0usize;
         loop {
             let Some((due, _)) = self.pending_egress_heap.first().copied() else {
                 break;
@@ -702,6 +765,7 @@ impl DpdkDriver {
             let Some((_, handle)) = self.pop_pending_egress_min() else {
                 break;
             };
+            processed += 1;
             match self
                 .iface
                 .poll_egress_handle(now, &mut self.device, &mut self.sockets, handle)
@@ -712,14 +776,14 @@ impl DpdkDriver {
                 PollEgressHandleResult::None => {}
                 PollEgressHandleResult::DeviceExhausted => {
                     self.queue_egress_at(handle, now);
-                    return result;
+                    return (result, processed);
                 }
             }
             if let Some(next_due) = self.iface.poll_at_handle(now, &self.sockets, handle) {
                 self.queue_egress_at(handle, next_due);
             }
         }
-        result
+        (result, processed)
     }
 
     fn clear_socket_egress_pending(&mut self, handle: SocketHandle) {
