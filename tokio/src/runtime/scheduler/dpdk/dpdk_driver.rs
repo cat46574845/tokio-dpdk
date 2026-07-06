@@ -271,6 +271,8 @@ impl DpdkDriver {
     pub(crate) fn poll(&mut self, now: Instant) -> bool {
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(self.worker_index);
+        #[cfg(feature = "market-trace")]
+        let poll_start_ns = crate::runtime::market_trace::now_ns();
         let smol_now = self.smol_instant(now);
         // Flush pending TX packets first.
         #[cfg(feature = "market-trace")]
@@ -292,12 +294,6 @@ impl DpdkDriver {
 
         #[cfg(feature = "market-trace")]
         let trace_poll = received_rx;
-        #[cfg(feature = "market-trace")]
-        let poll_start_ns = if trace_poll {
-            crate::runtime::market_trace::now_ns()
-        } else {
-            0
-        };
 
         #[cfg(feature = "market-trace")]
         let flush_acks_start_ns = if trace_poll {
