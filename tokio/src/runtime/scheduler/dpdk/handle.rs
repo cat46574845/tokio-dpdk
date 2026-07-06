@@ -254,7 +254,7 @@ impl Handle {
                         self.schedule_local(core, task, is_yield);
                         return;
                     }
-                    self.push_remote_task_no_core(task);
+                    self.push_current_worker_task_no_core(cx.worker.index, task);
                     return;
                 }
 
@@ -327,13 +327,8 @@ impl Handle {
     }
 
     /// Pushes a task to the global queue
+    #[cfg(not(feature = "market-trace"))]
     pub(crate) fn push_remote_task(&self, task: WorkerNotified) {
-        #[cfg(feature = "market-trace")]
-        self.push_remote_task_with_source(
-            task,
-            crate::runtime::market_trace::QUEUE_SOURCE_SHARED_INJECT,
-        );
-        #[cfg(not(feature = "market-trace"))]
         self.push_remote_task_raw(task);
     }
 
@@ -387,19 +382,6 @@ impl Handle {
 
     #[cfg(not(feature = "market-trace"))]
     fn push_remote_task_different_runtime(&self, task: WorkerNotified) {
-        self.push_remote_task(task);
-    }
-
-    #[cfg(feature = "market-trace")]
-    fn push_remote_task_no_core(&self, task: WorkerNotified) {
-        self.push_remote_task_with_source(
-            task,
-            crate::runtime::market_trace::QUEUE_SOURCE_SHARED_INJECT_NO_CORE,
-        );
-    }
-
-    #[cfg(not(feature = "market-trace"))]
-    fn push_remote_task_no_core(&self, task: WorkerNotified) {
         self.push_remote_task(task);
     }
 
@@ -527,6 +509,8 @@ impl Handle {
                 task.dpdk_set_worker_affinity(cx.worker.index);
                 if let Some(core) = cx.core.borrow_mut().as_mut() {
                     me.schedule_local(core, task, false);
+                } else {
+                    me.push_current_worker_task_no_core(cx.worker.index, task);
                 }
             }
 
@@ -538,6 +522,14 @@ impl Handle {
     pub(crate) fn push_worker_task(&self, worker_index: usize, task: WorkerNotified) {
         #[cfg(feature = "market-trace")]
         task.market_trace_mark_queued(crate::runtime::market_trace::QUEUE_SOURCE_PER_WORKER_INJECT);
+        self.shared.remotes[worker_index].per_inject.push(task);
+    }
+
+    fn push_current_worker_task_no_core(&self, worker_index: usize, task: WorkerNotified) {
+        #[cfg(feature = "market-trace")]
+        task.market_trace_mark_queued(
+            crate::runtime::market_trace::QUEUE_SOURCE_PER_WORKER_INJECT_NO_CORE,
+        );
         self.shared.remotes[worker_index].per_inject.push(task);
     }
 
