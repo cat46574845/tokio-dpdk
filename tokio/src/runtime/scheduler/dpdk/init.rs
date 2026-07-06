@@ -14,6 +14,7 @@ use super::ffi;
 use super::raw_tail::RAW_TAIL_RSS_KEY;
 
 const RTE_ETH_RSS_NONFRAG_IPV4_TCP: u64 = 1u64 << 4;
+const RTE_ETH_RX_OFFLOAD_RSS_HASH: u64 = 1u64 << 19;
 
 /// A fully initialized DPDK worker for multi-queue mode.
 ///
@@ -171,7 +172,26 @@ pub(crate) fn init_port(
             ),
         ));
     }
+    if dev_info.flow_type_rss_offloads & RTE_ETH_RSS_NONFRAG_IPV4_TCP == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "DPDK device does not support NONFRAG_IPV4_TCP RSS flow hashing: flow_type_rss_offloads=0x{:x}",
+                dev_info.flow_type_rss_offloads
+            ),
+        ));
+    }
+    if dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_RSS_HASH == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "DPDK device does not support RX RSS hash mbuf metadata: rx_offload_capa=0x{:x}",
+                dev_info.rx_offload_capa
+            ),
+        ));
+    }
     port_conf.rxmode.mq_mode = ffi::rte_eth_rx_mq_mode_RTE_ETH_MQ_RX_RSS;
+    port_conf.rxmode.offloads = RTE_ETH_RX_OFFLOAD_RSS_HASH;
     port_conf.rx_adv_conf.rss_conf.rss_key = RAW_TAIL_RSS_KEY.as_ptr() as *mut u8;
     port_conf.rx_adv_conf.rss_conf.rss_key_len = dev_info.hash_key_size;
     port_conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP;
