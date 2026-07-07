@@ -1098,6 +1098,12 @@ impl TcpDpdkStream {
         }
     }
 
+    /// Tries to flush pending DPDK TCP egress without registering a waker.
+    pub fn try_flush(&self) -> io::Result<()> {
+        self.assert_on_correct_worker();
+        self.flush_std()
+    }
+
     /// Tries to read data into multiple buffers (vectored I/O).
     ///
     /// smoltcp doesn't support native vectored I/O, so we iterate over buffers.
