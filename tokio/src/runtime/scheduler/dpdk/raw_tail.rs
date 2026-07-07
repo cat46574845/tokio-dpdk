@@ -94,9 +94,11 @@ pub struct RawTailRecord<'a> {
     pub tcp_seq_after_record: u32,
     /// Complete TLS record including the 5-byte TLS header.
     pub bytes: &'a [u8],
-    /// Number of complete TLS records between the caller supplied TCP base
+    /// Estimated TLS record sequence delta between the caller supplied TCP base
     /// sequence and this record.
-    pub tls_seq_delta: Option<u64>,
+    pub tls_seq_delta_hint: u64,
+    /// Symmetric sequence-search radius around `tls_seq_delta_hint`.
+    pub tls_seq_delta_radius: u16,
     /// Per-flow generation incremented once for each DPDK poll yield pass.
     pub poll_generation: u64,
 }
@@ -118,7 +120,9 @@ pub enum RawTailReadRequest {
     /// Start reading the newest candidate from the current dirty packet batch.
     Start {
         /// TCP sequence immediately after the last committed TLS record.
-        tcp_seq_base: Option<u32>,
+        tcp_seq_base: u32,
+        /// Typical TLS record wire length observed by the caller.
+        tls_wire_len_hint: u16,
     },
     /// Continue after the previous candidate was consumed by the caller.
     After(RawTailRecordDecision),
@@ -366,11 +370,6 @@ struct TailConn {
 
 struct TailCursor {
     active: bool,
-    remaining: usize,
-    inferred_payload_offset: Option<usize>,
-    inferred_next_seq: Option<u32>,
-    current_segment: Option<TailSegment>,
-    next_offset: Option<usize>,
     deterministic_candidate_count: Option<usize>,
 }
 
@@ -378,32 +377,12 @@ impl TailCursor {
     const fn inactive() -> Self {
         Self {
             active: false,
-            remaining: 0,
-            inferred_payload_offset: None,
-            inferred_next_seq: None,
-            current_segment: None,
-            next_offset: None,
             deterministic_candidate_count: None,
         }
     }
 
-    fn reset_scanner(&mut self, ring_len: usize) {
-        self.active = true;
-        self.remaining = ring_len;
-        self.inferred_payload_offset = None;
-        self.inferred_next_seq = None;
-        self.current_segment = None;
-        self.next_offset = None;
-        self.deterministic_candidate_count = None;
-    }
-
     fn reset_deterministic(&mut self, candidate_count: usize) {
         self.active = true;
-        self.remaining = 0;
-        self.inferred_payload_offset = None;
-        self.inferred_next_seq = None;
-        self.current_segment = None;
-        self.next_offset = None;
         self.deterministic_candidate_count = Some(candidate_count);
     }
 
@@ -750,7 +729,10 @@ impl RawTailTable {
             return Ok(None);
         }
         match request {
-            RawTailReadRequest::Start { tcp_seq_base } => {
+            RawTailReadRequest::Start {
+                tcp_seq_base,
+                tls_wire_len_hint,
+            } => {
                 if conn.cursor.active {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -760,12 +742,8 @@ impl RawTailTable {
                 conn.poll_generation = conn.poll_generation.wrapping_add(1);
                 conn.segments.clear();
                 conn.candidates.clear();
-                if let Some(tcp_seq_base) = tcp_seq_base {
-                    Self::prepare_deterministic_candidates(conn, tcp_seq_base)?;
-                    conn.cursor.reset_deterministic(conn.candidates.len());
-                } else {
-                    conn.cursor.reset_scanner(conn.ring.len);
-                }
+                Self::prepare_deterministic_candidates(conn, tcp_seq_base, tls_wire_len_hint)?;
+                conn.cursor.reset_deterministic(conn.candidates.len());
             }
             RawTailReadRequest::After(RawTailRecordDecision::Rejected | RawTailRecordDecision::NeedPrevious) => {
                 if !conn.cursor.active {
@@ -863,115 +841,20 @@ impl RawTailTable {
             return None;
         };
         let poll_generation = conn.poll_generation;
-        if conn.cursor.deterministic_candidate_count.is_some() {
-            return Self::next_deterministic_record_from_conn(conn, out, rss_hash, poll_generation);
-        }
-        #[cfg(feature = "market-trace")]
-        let trace_start_ns = crate::runtime::market_trace::now_ns();
-        #[cfg(feature = "market-trace")]
-        let mut trace_header_checks = 0usize;
-        #[cfg(feature = "market-trace")]
-        let mut trace_copy_attempts = 0usize;
-        #[cfg(feature = "market-trace")]
-        let mut trace_mbufs_popped = 0usize;
-
-        loop {
-            if let Some(segment) = conn.cursor.current_segment {
-                let Some(mut offset) = conn.cursor.next_offset else {
-                    conn.segments.push(segment);
-                    conn.cursor.current_segment = None;
-                    continue;
-                };
-                loop {
-                    #[cfg(feature = "market-trace")]
-                    {
-                        trace_header_checks += 1;
-                    }
-                    if looks_like_tls_header(&segment.payload[offset..]) {
-                        #[cfg(feature = "market-trace")]
-                        {
-                            trace_copy_attempts += 1;
-                        }
-                        let record_len =
-                            5 + u16::from_be_bytes([segment.payload[offset + 3], segment.payload[offset + 4]]) as usize;
-                        let start_seq = segment.tcp_seq.wrapping_add(offset as u32);
-                        out.resize(record_len, 0);
-                        conn.segments.push(segment);
-                        let copied = copy_tcp_range_from_segments(
-                            &conn.segments,
-                            start_seq,
-                            record_len,
-                            out,
-                        );
-                        conn.segments.pop();
-                        conn.cursor.next_offset = offset.checked_sub(1);
-                        if copied {
-                            #[cfg(feature = "market-trace")]
-                            complete_raw_tail_record_detail(
-                                trace_start_ns,
-                                conn.handle,
-                                trace_header_checks,
-                                trace_copy_attempts,
-                                trace_mbufs_popped,
-                            );
-                            return Some(RawTailRecord {
-                                handle: conn.handle,
-                                rss_hash,
-                                tcp_seq: start_seq,
-                                tcp_seq_after_record: start_seq.wrapping_add(record_len as u32),
-                                bytes: &out[..record_len],
-                                tls_seq_delta: None,
-                                poll_generation,
-                            });
-                        }
-                    }
-                    let Some(next) = offset.checked_sub(1) else {
-                        conn.cursor.next_offset = None;
-                        break;
-                    };
-                    offset = next;
-                    conn.cursor.next_offset = Some(offset);
-                }
-                continue;
-            }
-
-            let Some(mbuf) = Self::pop_cursor_mbuf(conn) else {
-                #[cfg(feature = "market-trace")]
-                complete_raw_tail_record_detail(
-                    trace_start_ns,
-                    conn.handle,
-                    trace_header_checks,
-                    trace_copy_attempts,
-                    trace_mbufs_popped,
-                );
-                return None;
-            };
-            #[cfg(feature = "market-trace")]
-            {
-                trace_mbufs_popped += 1;
-            }
-            let Some(segment) = build_tail_segment(
-                mbuf,
-                conn.cursor.inferred_payload_offset,
-                conn.cursor.inferred_next_seq,
-            ) else {
-                continue;
-            };
-            conn.cursor.inferred_payload_offset = Some(segment.payload_offset);
-            conn.cursor.inferred_next_seq = Some(segment.tcp_seq);
-            if segment.payload.len() < 5 {
-                conn.segments.push(segment);
-                continue;
-            }
-            conn.cursor.current_segment = Some(segment);
-            conn.cursor.next_offset = Some(segment.payload.len() - 5);
-        }
+        Self::next_deterministic_record_from_conn(conn, out, rss_hash, poll_generation)
     }
 
     fn prepare_deterministic_candidates(
         conn: &mut TailConn,
         tcp_seq_base: u32,
+        tls_wire_len_hint: u16,
     ) -> io::Result<()> {
+        if tls_wire_len_hint == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "raw-tail TLS wire length hint must be non-zero",
+            ));
+        }
         for mbuf in conn.ring.newest_to_oldest() {
             let Some(pkt) = parse_tcp_packet(mbuf) else {
                 continue;
@@ -985,7 +868,6 @@ impl RawTailTable {
             }
             conn.segments.push(TailSegment {
                 tcp_seq: pkt.tcp_seq,
-                payload_offset: pkt.payload_offset,
                 payload: pkt.payload,
             });
         }
@@ -993,48 +875,43 @@ impl RawTailTable {
             .sort_unstable_by_key(|segment| segment.tcp_seq.wrapping_sub(tcp_seq_base));
         conn.segments.dedup_by_key(|segment| segment.tcp_seq);
 
-        let mut seq = tcp_seq_base;
-        let mut tls_seq_delta = 0u64;
-        let mut header = [0u8; 5];
-        loop {
-            if !copy_tcp_range_from_segments(&conn.segments, seq, header.len(), &mut header) {
-                if !segment_covers_seq(&conn.segments, seq)
-                    && has_segment_after_seq(&conn.segments, seq)
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("raw-tail deterministic TLS chain gap at tcp_seq={seq}"),
-                    ));
+        let hint = u32::from(tls_wire_len_hint);
+        let radius = ((conn.segments.len() * 2) + 8).min(u16::MAX as usize) as u16;
+        for segment in &conn.segments {
+            let mut offset = 0usize;
+            while offset + 5 <= segment.payload.len() {
+                let header = &segment.payload[offset..];
+                if !looks_like_tls_header(header) {
+                    break;
                 }
-                break;
-            }
-            if !looks_like_tls_header(&header) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("raw-tail deterministic TLS boundary mismatch at tcp_seq={seq}"),
-                ));
-            }
-            let record_len = 5 + u16::from_be_bytes([header[3], header[4]]) as usize;
-            if !tcp_range_available(&conn.segments, seq, record_len) {
-                if has_segment_after_seq(&conn.segments, seq.wrapping_add(record_len as u32)) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "raw-tail deterministic TLS record gap at tcp_seq={} len={}",
-                            seq, record_len
-                        ),
-                    ));
+                let record_len =
+                    5 + u16::from_be_bytes([header[3], header[4]]) as usize;
+                let start_seq = segment.tcp_seq.wrapping_add(offset as u32);
+                if tcp_range_available(&conn.segments, start_seq, record_len) {
+                    let delta_bytes = start_seq.wrapping_sub(tcp_seq_base);
+                    if delta_bytes < (1u32 << 31) {
+                        let tls_seq_delta_hint =
+                            ((delta_bytes + (hint / 2)) / hint) as u64;
+                        conn.candidates.push(TailCandidate {
+                            tcp_seq: start_seq,
+                            record_len,
+                            tls_seq_delta_hint,
+                            tls_seq_delta_radius: radius,
+                        });
+                    }
                 }
-                break;
+                let Some(next_offset) = offset.checked_add(record_len) else {
+                    break;
+                };
+                if next_offset <= offset || next_offset > segment.payload.len() {
+                    break;
+                }
+                offset = next_offset;
             }
-            conn.candidates.push(TailCandidate {
-                tcp_seq: seq,
-                record_len,
-                tls_seq_delta,
-            });
-            seq = seq.wrapping_add(record_len as u32);
-            tls_seq_delta = tls_seq_delta.wrapping_add(1);
         }
+        conn.candidates
+            .sort_unstable_by_key(|candidate| candidate.tcp_seq.wrapping_sub(tcp_seq_base));
+        conn.candidates.dedup_by_key(|candidate| candidate.tcp_seq);
         Ok(())
     }
 
@@ -1091,18 +968,10 @@ impl RawTailTable {
             tcp_seq: candidate.tcp_seq,
             tcp_seq_after_record: candidate.tcp_seq.wrapping_add(candidate.record_len as u32),
             bytes: &out[..candidate.record_len],
-            tls_seq_delta: Some(candidate.tls_seq_delta),
+            tls_seq_delta_hint: candidate.tls_seq_delta_hint,
+            tls_seq_delta_radius: candidate.tls_seq_delta_radius,
             poll_generation,
         })
-    }
-
-    fn pop_cursor_mbuf(conn: &mut TailConn) -> Option<*mut ffi::rte_mbuf> {
-        if conn.cursor.remaining == 0 {
-            return None;
-        }
-        let idx = (conn.ring.head + conn.cursor.remaining - 1) % RAW_TAIL_RING_CAP;
-        conn.cursor.remaining -= 1;
-        Some(conn.ring.slots[idx])
     }
 
     fn conn_for_handle_mut(&mut self, handle: RawTailHandle) -> Option<&mut TailConn> {
@@ -1189,7 +1058,6 @@ pub(crate) fn parse_tcp_packet(mbuf: *mut ffi::rte_mbuf) -> Option<ParsedTcpPack
 #[derive(Clone, Copy)]
 struct TailSegment {
     tcp_seq: u32,
-    payload_offset: usize,
     payload: &'static [u8],
 }
 
@@ -1197,34 +1065,8 @@ struct TailSegment {
 struct TailCandidate {
     tcp_seq: u32,
     record_len: usize,
-    tls_seq_delta: u64,
-}
-
-fn build_tail_segment(
-    mbuf: *mut ffi::rte_mbuf,
-    known_payload_offset: Option<usize>,
-    next_seq: Option<u32>,
-) -> Option<TailSegment> {
-    if let (Some(payload_offset), Some(next_seq)) = (known_payload_offset, next_seq) {
-        let data = unsafe { mbuf_data(mbuf) }?;
-        if data.len() < payload_offset {
-            return None;
-        }
-        let payload = &data[payload_offset..];
-        let tcp_seq = next_seq.wrapping_sub(payload.len() as u32);
-        return Some(TailSegment {
-            tcp_seq,
-            payload_offset,
-            payload,
-        });
-    }
-
-    let pkt = parse_tcp_packet(mbuf)?;
-    Some(TailSegment {
-        tcp_seq: pkt.tcp_seq,
-        payload_offset: pkt.payload_offset,
-        payload: pkt.payload,
-    })
+    tls_seq_delta_hint: u64,
+    tls_seq_delta_radius: u16,
 }
 
 fn toeplitz_hash(input: &[u8], key: &[u8]) -> u32 {
@@ -1327,19 +1169,6 @@ fn tcp_range_available(segments: &[TailSegment], start_seq: u32, len: usize) -> 
         }
     }
     true
-}
-
-fn segment_covers_seq(segments: &[TailSegment], seq: u32) -> bool {
-    segments.iter().any(|segment| {
-        let seg_end = segment.tcp_seq.wrapping_add(segment.payload.len() as u32);
-        seq_in_range(seq, segment.tcp_seq, seg_end)
-    })
-}
-
-fn has_segment_after_seq(segments: &[TailSegment], seq: u32) -> bool {
-    segments
-        .iter()
-        .any(|segment| segment.tcp_seq.wrapping_sub(seq) < (1u32 << 31))
 }
 
 #[inline(always)]
