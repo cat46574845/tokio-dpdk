@@ -11,6 +11,7 @@ const RAW_TAIL_RING_CAP: usize = 256;
 const RAW_TAIL_DIRTY_CAP: usize = 8192;
 const RAW_TAIL_RSS_MAP_CAP: usize = RAW_TAIL_DIRTY_CAP * 4;
 const RAW_TAIL_DIRTY_NONE: usize = usize::MAX;
+const RAW_TAIL_MAX_RECORD_CANDIDATES: usize = 16;
 const ETHERNET_HEADER_LEN: usize = 14;
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const TCP_MIN_HEADER_LEN: usize = 20;
@@ -877,13 +878,32 @@ impl RawTailTable {
 
         let hint = u32::from(tls_wire_len_hint);
         let radius = ((conn.segments.len() * 2) + 8).min(u16::MAX as usize) as u16;
-        for segment in &conn.segments {
+        for segment in conn.segments.iter().rev() {
+            let mut offsets = [0usize; 64];
+            let mut offset_count = 0usize;
             let mut offset = 0usize;
             while offset + 5 <= segment.payload.len() {
                 let header = &segment.payload[offset..];
                 if !looks_like_tls_header(header) {
                     break;
                 }
+                let record_len =
+                    5 + u16::from_be_bytes([header[3], header[4]]) as usize;
+                if offset_count < offsets.len() {
+                    offsets[offset_count] = offset;
+                    offset_count += 1;
+                }
+                let Some(next_offset) = offset.checked_add(record_len) else {
+                    break;
+                };
+                if next_offset <= offset || next_offset > segment.payload.len() {
+                    break;
+                }
+                offset = next_offset;
+            }
+            for offset_idx in (0..offset_count).rev() {
+                let offset = offsets[offset_idx];
+                let header = &segment.payload[offset..];
                 let record_len =
                     5 + u16::from_be_bytes([header[3], header[4]]) as usize;
                 let start_seq = segment.tcp_seq.wrapping_add(offset as u32);
@@ -898,20 +918,13 @@ impl RawTailTable {
                             tls_seq_delta_hint,
                             tls_seq_delta_radius: radius,
                         });
+                        if conn.candidates.len() >= RAW_TAIL_MAX_RECORD_CANDIDATES {
+                            return Ok(());
+                        }
                     }
                 }
-                let Some(next_offset) = offset.checked_add(record_len) else {
-                    break;
-                };
-                if next_offset <= offset || next_offset > segment.payload.len() {
-                    break;
-                }
-                offset = next_offset;
             }
         }
-        conn.candidates
-            .sort_unstable_by_key(|candidate| candidate.tcp_seq.wrapping_sub(tcp_seq_base));
-        conn.candidates.dedup_by_key(|candidate| candidate.tcp_seq);
         Ok(())
     }
 
@@ -923,8 +936,8 @@ impl RawTailTable {
     ) -> Option<RawTailRecord<'a>> {
         #[cfg(feature = "market-trace")]
         let trace_start_ns = crate::runtime::market_trace::now_ns();
-        let candidate_count = conn.cursor.deterministic_candidate_count?;
-        if candidate_count == 0 {
+        let remaining = conn.cursor.deterministic_candidate_count?;
+        if remaining == 0 {
             #[cfg(feature = "market-trace")]
             complete_raw_tail_record_detail(
                 trace_start_ns,
@@ -935,8 +948,9 @@ impl RawTailTable {
             );
             return None;
         }
-        let candidate = conn.candidates[candidate_count - 1];
-        conn.cursor.deterministic_candidate_count = Some(candidate_count - 1);
+        let candidate_idx = conn.candidates.len() - remaining;
+        let candidate = conn.candidates[candidate_idx];
+        conn.cursor.deterministic_candidate_count = Some(remaining - 1);
         out.resize(candidate.record_len, 0);
         if !copy_tcp_range_from_segments(
             &conn.segments,
