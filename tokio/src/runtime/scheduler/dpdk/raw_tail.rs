@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ptr::NonNull;
@@ -19,9 +18,8 @@ use super::WorkerIdentity;
 #[cfg(test)]
 use super::DpdkRuntimeId;
 
-pub(crate) const RAW_TAIL_CONNECTION_CAP: usize = 8192;
+pub(crate) const RAW_TAIL_CONNECTION_CAP: usize = super::SOCKET_LIFECYCLE_CAPACITY;
 const RAW_TAIL_RSS_MAP_CAP: usize = RAW_TAIL_CONNECTION_CAP * 4;
-const RAW_TAIL_PENDING_NONE: usize = usize::MAX;
 const TLS_HEADER_LEN: usize = 5;
 const TLS_MAX_CIPHERTEXT_LEN: usize = 16_640;
 pub(crate) const RAW_TAIL_REQUIRED_RSS_HF: u64 = 1u64 << 4;
@@ -38,6 +36,7 @@ pub(crate) const RAW_TAIL_RSS_KEY: [u8; 40] = [
 /// Identifies one TCP flow registered in a worker-local raw-tail table.
 pub struct RawTailHandle {
     id: u64,
+    slot: usize,
     owner: WorkerIdentity,
 }
 
@@ -51,8 +50,8 @@ pub enum RawTailUnregisterStatus {
 }
 
 impl RawTailHandle {
-    pub(crate) fn new(id: u64, owner: WorkerIdentity) -> Self {
-        Self { id, owner }
+    pub(crate) fn new(id: u64, slot: usize, owner: WorkerIdentity) -> Self {
+        Self { id, slot, owner }
     }
 
     /// Runtime-local raw-tail flow id.
@@ -74,19 +73,13 @@ impl RawTailHandle {
 /// Borrowed input passed synchronously from the DPDK driver to a parser.
 #[derive(Debug, Clone, Copy)]
 pub struct RawTailInput<'a> {
-    /// Flow whose selected packet produced this input.
-    pub handle: RawTailHandle,
-    /// NIC RSS hash used to select the flow slot.
-    pub rss_hash: u32,
     /// TCP sequence number at the first byte of `records`.
     pub tcp_seq: u32,
-    /// TCP sequence number immediately after `records`.
-    pub tcp_seq_after_record: u32,
     /// Complete TLS records borrowed directly from the selected mbuf.
     pub records: &'a [u8],
     /// Number of complete TLS records in `records`.
     pub record_count: u16,
-    /// Saturating count of RSS-matched packets observed for this flow.
+    /// Wrapping count of RSS-matched packets observed for this flow.
     pub packet_ordinal: u64,
     /// The selected TCP segment carried FIN/RST or closed smoltcp state.
     pub connection_closed: bool,
@@ -104,7 +97,6 @@ pub enum RawTailParseDisposition {
     TerminalReady,
 }
 
-type RawTailInvalidateFn = unsafe fn(NonNull<()>);
 type RawTailParseFn =
     for<'input> unsafe fn(NonNull<()>, RawTailInput<'input>) -> RawTailParseDisposition;
 
@@ -112,7 +104,6 @@ type RawTailParseFn =
 #[derive(Debug, Clone, Copy)]
 pub struct RawTailParserBinding {
     context: NonNull<()>,
-    invalidate: RawTailInvalidateFn,
     parse: RawTailParseFn,
 }
 
@@ -122,26 +113,13 @@ impl RawTailParserBinding {
     /// # Safety
     ///
     /// `context` must remain valid and pinned until `unregister_raw_tail`
-    /// removes this binding (or returns `OwnerReclaimed`). Both callbacks must
-    /// use that allocation with their declared signatures and return
+    /// removes this binding (or returns `OwnerReclaimed`). The callback must
+    /// use that allocation with its declared signature and return
     /// synchronously. The caller's single-worker DriverSlot call graph must
     /// statically exclude overlapping entry; this hot path deliberately has no
     /// dynamic re-entry guard.
-    pub unsafe fn new(
-        context: NonNull<()>,
-        invalidate: RawTailInvalidateFn,
-        parse: RawTailParseFn,
-    ) -> Self {
-        Self {
-            context,
-            invalidate,
-            parse,
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn invalidate(self) {
-        unsafe { (self.invalidate)(self.context) }
+    pub unsafe fn new(context: NonNull<()>, parse: RawTailParseFn) -> Self {
+        Self { context, parse }
     }
 
     #[inline(always)]
@@ -304,33 +282,15 @@ struct TailConn {
     parser: Option<RawTailParserBinding>,
     pending_mbuf: Option<OwnedMbuf>,
     receiver_waker: Option<Waker>,
-    pending_slot_pos: usize,
     packet_ordinal: u64,
     publication_ready: bool,
     terminal_ready: bool,
-    active: bool,
 }
 
 impl TailConn {
     #[inline(always)]
-    fn advance_packet_ordinal(&mut self) -> bool {
-        if self.packet_ordinal == u64::MAX {
-            true
-        } else {
-            self.packet_ordinal += 1;
-            false
-        }
-    }
-
-    fn invalidate_for_selected_tail(&mut self) -> RawTailParserBinding {
-        let parser = self
-            .parser
-            .expect("active raw-tail connection must have a parser binding");
-        self.publication_ready = false;
-        // SAFETY: activation installed the caller's unsafe pinned binding and
-        // DriverSlot statically excludes overlapping driver entry.
-        unsafe { parser.invalidate() };
-        parser
+    fn advance_packet_ordinal(&mut self) {
+        self.packet_ordinal = self.packet_ordinal.wrapping_add(1);
     }
 
     fn latch_parser_disposition(&mut self, disposition: RawTailParseDisposition) {
@@ -352,26 +312,10 @@ impl TailConn {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RawTailErrorCounters {
-    pub(crate) packet_ordinal_overflow: u64,
-    pub(crate) pending_capacity_exceeded: u64,
     pub(crate) packet_parse_failed: u64,
     pub(crate) tuple_mismatch: u64,
     pub(crate) tcp_state_rejected: u64,
     pub(crate) tls_tail_not_found: u64,
-    pub(crate) parser_input_invalid: u64,
-}
-
-impl RawTailErrorCounters {
-    #[inline(always)]
-    pub(crate) fn is_empty(self) -> bool {
-        self.packet_ordinal_overflow == 0
-            && self.pending_capacity_exceeded == 0
-            && self.packet_parse_failed == 0
-            && self.tuple_mismatch == 0
-            && self.tcp_state_rejected == 0
-            && self.tls_tail_not_found == 0
-            && self.parser_input_invalid == 0
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -384,7 +328,6 @@ enum PrepareError {
 #[derive(Clone, Copy)]
 enum ParserIssue {
     TlsTailNotFound,
-    InvalidInput,
 }
 
 struct ProcessedTail {
@@ -401,11 +344,11 @@ pub(crate) struct RawTailTable {
     conns: Vec<Option<TailConn>>,
     free_slots: Vec<usize>,
     rss_to_slot: RssSlotMap,
-    id_to_slot: HashMap<u64, usize>,
     socket_to_slot: Vec<Option<usize>>,
     pending_slots: Vec<usize>,
     active_count: usize,
     errors: RawTailErrorCounters,
+    errors_dirty: bool,
 }
 
 // SAFETY: DpdkDriver transfers this table only as part of its process-lifetime
@@ -423,11 +366,11 @@ impl RawTailTable {
             conns: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
             free_slots: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
             rss_to_slot: RssSlotMap::new(),
-            id_to_slot: HashMap::with_capacity(RAW_TAIL_CONNECTION_CAP),
             socket_to_slot: vec![None; RAW_TAIL_CONNECTION_CAP],
             pending_slots: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
             active_count: 0,
             errors: RawTailErrorCounters::default(),
+            errors_dirty: false,
         }
     }
 
@@ -464,8 +407,8 @@ impl RawTailTable {
                 "raw-tail handle id space exhausted",
             ));
         };
-        let handle = RawTailHandle::new(id, self.owner);
         let slot = self.free_slots.last().copied().unwrap_or(self.conns.len());
+        let handle = RawTailHandle::new(id, slot, self.owner);
         match self.rss_to_slot.insert(rss_hash, slot) {
             Ok(None) => {}
             Ok(Some(_)) => {
@@ -479,7 +422,6 @@ impl RawTailTable {
             }
         }
         self.next_id = next_id;
-        self.id_to_slot.insert(id, slot);
         let conn = TailConn {
             handle,
             tuple,
@@ -488,11 +430,9 @@ impl RawTailTable {
             parser: None,
             pending_mbuf: None,
             receiver_waker: None,
-            pending_slot_pos: RAW_TAIL_PENDING_NONE,
             packet_ordinal: 0,
             publication_ready: false,
             terminal_ready: false,
-            active: false,
         };
         if slot == self.conns.len() {
             self.conns.push(Some(conn));
@@ -540,7 +480,7 @@ impl RawTailTable {
         let conn = self.conns[slot]
             .as_mut()
             .expect("registered raw-tail id must point to an occupied slot");
-        if conn.active || conn.parser.is_some() || conn.socket_handle.is_some() {
+        if conn.parser.is_some() || conn.socket_handle.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "raw-tail parser is already active",
@@ -560,7 +500,6 @@ impl RawTailTable {
         // together so capture can never observe a partially bound parser.
         conn.socket_handle = Some(socket_handle);
         conn.parser = Some(parser);
-        conn.active = true;
         self.socket_to_slot[socket_index] = Some(slot);
         self.active_count += 1;
         Ok(())
@@ -577,7 +516,12 @@ impl RawTailTable {
             let conn = self.conns[slot]
                 .as_mut()
                 .expect("registered raw-tail id must point to an occupied slot");
-            let values = (conn.rss_hash, conn.active, conn.socket_handle);
+            assert_eq!(
+                conn.parser.is_some(),
+                conn.socket_handle.is_some(),
+                "raw-tail parser and socket bindings must share one lifecycle"
+            );
+            let values = (conn.rss_hash, conn.parser.is_some(), conn.socket_handle);
             // Remove the non-owning pointer before any operation that can
             // return. A successful unregister therefore permits caller drop.
             conn.parser = None;
@@ -585,7 +529,6 @@ impl RawTailTable {
             conn.publication_ready = false;
             conn.terminal_ready = false;
             conn.receiver_waker = None;
-            conn.active = false;
             values
         };
         if let Some(socket_handle) = socket_handle {
@@ -612,8 +555,6 @@ impl RawTailTable {
                 .checked_sub(1)
                 .expect("raw-tail active-count invariant prevents underflow");
         }
-        self.id_to_slot.remove(&handle.id);
-        self.remove_pending_slot(slot);
         let removed = self.conns[slot].take();
         drop(removed);
         self.free_slots.push(slot);
@@ -635,19 +576,21 @@ impl RawTailTable {
             let conn = self.conns[slot]
                 .as_mut()
                 .expect("located raw-tail socket binding must remain occupied");
-            let was_active = conn.active;
+            assert!(
+                conn.parser.is_some(),
+                "raw-tail socket reverse index must point to an active parser binding"
+            );
+            let was_active = conn.parser.is_some();
             // Remove non-owning capabilities before releasing the mbuf or
             // allowing the SocketSet index to be recycled.
             conn.parser = None;
             conn.socket_handle = None;
-            conn.active = false;
             conn.publication_ready = false;
             conn.terminal_ready = false;
             let receiver_waker = conn.receiver_waker.take();
             conn.pending_mbuf = None;
             (was_active, receiver_waker)
         };
-        self.remove_pending_slot(slot);
         if was_active {
             self.active_count = self
                 .active_count
@@ -664,7 +607,6 @@ impl RawTailTable {
 
     pub(crate) fn reclaim_all(&mut self) {
         self.pending_slots.clear();
-        self.id_to_slot.clear();
         self.socket_to_slot.fill(None);
         self.rss_to_slot.clear();
         self.free_slots.clear();
@@ -694,11 +636,11 @@ impl RawTailTable {
         let Some(slot) = self.rss_to_slot.get(rss_hash) else {
             return Err(mbuf);
         };
-        let (old_was_none, ordinal_overflow) = {
+        let old_was_none = {
             let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
                 return Err(mbuf);
             };
-            if !conn.active {
+            if conn.parser.is_none() {
                 return Err(mbuf);
             }
             if conn.terminal_ready {
@@ -707,20 +649,14 @@ impl RawTailTable {
                 // touching packet headers or payload.
                 return Ok(());
             }
-            let overflow = conn.advance_packet_ordinal();
+            conn.advance_packet_ordinal();
             let old = replace_latest(&mut conn.pending_mbuf, mbuf);
             let old_was_none = old.is_none();
             drop(old);
-            (old_was_none, overflow)
+            old_was_none
         };
-        if ordinal_overflow {
-            self.errors.packet_ordinal_overflow = self
-                .errors
-                .packet_ordinal_overflow
-                .saturating_add(1);
-        }
         if old_was_none {
-            self.push_pending_slot(slot);
+            self.pending_slots.push(slot);
         }
         Ok(())
     }
@@ -745,14 +681,10 @@ impl RawTailTable {
                 let conn = self.conns[slot]
                     .as_mut()
                     .expect("pending raw-tail slot must contain a connection");
-                if conn.pending_mbuf.is_none() {
-                    None
-                } else {
-                    Some(Self::process_selected_tail(conn, now, sockets))
-                }
+                Self::process_selected_tail(conn, now, sockets)
             };
             match outcome {
-                Some(Ok(processed)) => {
+                Ok(processed) => {
                     if observed_gateway.is_none() {
                         observed_gateway = Some(processed.gateway_mac);
                     }
@@ -760,27 +692,26 @@ impl RawTailTable {
                         Some(ParserIssue::TlsTailNotFound) => {
                             self.errors.tls_tail_not_found =
                                 self.errors.tls_tail_not_found.saturating_add(1);
-                        }
-                        Some(ParserIssue::InvalidInput) => {
-                            self.errors.parser_input_invalid =
-                                self.errors.parser_input_invalid.saturating_add(1);
+                            self.errors_dirty = true;
                         }
                         None => {}
                     }
                     egress_handles.push(processed.socket_handle);
                 }
-                Some(Err(PrepareError::PacketParse)) => {
+                Err(PrepareError::PacketParse) => {
                     self.errors.packet_parse_failed =
                         self.errors.packet_parse_failed.saturating_add(1);
+                    self.errors_dirty = true;
                 }
-                Some(Err(PrepareError::TupleMismatch)) => {
+                Err(PrepareError::TupleMismatch) => {
                     self.errors.tuple_mismatch = self.errors.tuple_mismatch.saturating_add(1);
+                    self.errors_dirty = true;
                 }
-                Some(Err(PrepareError::TcpState)) => {
+                Err(PrepareError::TcpState) => {
                     self.errors.tcp_state_rejected =
                         self.errors.tcp_state_rejected.saturating_add(1);
+                    self.errors_dirty = true;
                 }
-                None => {}
             }
         }
 
@@ -795,7 +726,7 @@ impl RawTailTable {
         } else {
             false
         };
-        self.compact_pending_slots();
+        self.pending_slots.clear();
         gateway_observed
     }
 
@@ -808,38 +739,41 @@ impl RawTailTable {
             .pending_mbuf
             .take()
             .expect("selected raw-tail slot must own one mbuf");
-        with_selected_owner(mbuf, |mbuf| {
-            let parser = conn.invalidate_for_selected_tail();
-            let parsed = parse_selected_tcp(mbuf).ok_or(PrepareError::PacketParse)?;
-            if !conn.tuple.matches_ingress(&parsed.ip_repr, &parsed.tcp_repr) {
-                return Err(PrepareError::TupleMismatch);
-            }
-            let socket_handle = conn
-                .socket_handle
-                .expect("active raw-tail connection must retain its socket handle");
-            // remove_socket() detaches raw-tail before removing/recycling this
-            // index, so this direct O(1) access remains the activated TCP socket.
-            let socket = sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(socket_handle);
-            let commit = socket
-                .commit_lossy_tail(now, &parsed.tcp_repr)
-                .map_err(|_| PrepareError::TcpState)?;
+        let parsed = parse_selected_tcp(&mbuf).ok_or(PrepareError::PacketParse)?;
+        if !conn.tuple.matches_ingress(&parsed.ip_repr, &parsed.tcp_repr) {
+            return Err(PrepareError::TupleMismatch);
+        }
+        let socket_handle = conn
+            .socket_handle
+            .expect("active raw-tail connection must retain its socket handle");
+        // remove_socket() detaches raw-tail before removing/recycling this
+        // index, so this direct O(1) access remains the activated TCP socket.
+        let socket = sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(socket_handle);
+        let commit = socket
+            .commit_lossy_tail(now, &parsed.tcp_repr)
+            .map_err(|_| PrepareError::TcpState)?;
 
-            let tcp_seq = parsed.tcp_repr.seq_number.0 as u32;
-            let connection_closed = commit.closed
-                || matches!(parsed.tcp_repr.control, TcpControl::Fin | TcpControl::Rst);
-            let parser_issue = Self::dispatch_committed_payload(
-                conn,
-                parser,
-                parsed.tcp_repr.payload,
-                tcp_seq,
-                connection_closed,
-            );
-            Ok(ProcessedTail {
-                socket_handle,
-                gateway_mac: parsed.eth_src,
-                parser_issue,
-            })
-        })
+        let tcp_seq = parsed.tcp_repr.seq_number.0 as u32;
+        let connection_closed = commit.closed
+            || matches!(parsed.tcp_repr.control, TcpControl::Fin | TcpControl::Rst);
+        let parser = conn
+            .parser
+            .expect("active raw-tail connection must retain its parser binding");
+        let parser_issue = Self::dispatch_committed_payload(
+            conn,
+            parser,
+            parsed.tcp_repr.payload,
+            tcp_seq,
+            connection_closed,
+        );
+        let processed = ProcessedTail {
+            socket_handle,
+            gateway_mac: parsed.eth_src,
+            parser_issue,
+        };
+        drop(parsed);
+        drop(mbuf);
+        Ok(processed)
     }
 
     fn dispatch_committed_payload(
@@ -850,30 +784,19 @@ impl RawTailTable {
         connection_closed: bool,
     ) -> Option<ParserIssue> {
         let (records, record_count, record_tcp_seq) = match find_tail_aligned_tls_records(payload) {
-            Some(tls_tail) => {
-                let Ok(records_offset) = u32::try_from(tls_tail.offset) else {
-                    return Some(ParserIssue::InvalidInput);
-                };
-                (
-                    &payload[tls_tail.offset..],
-                    tls_tail.record_count,
-                    tcp_seq.wrapping_add(records_offset),
-                )
-            }
+            Some(tls_tail) => (
+                &payload[tls_tail.offset..],
+                tls_tail.record_count,
+                tcp_seq.wrapping_add(tls_tail.offset as u32),
+            ),
             None => (&payload[payload.len()..], 0, tcp_seq),
         };
 
         if records.is_empty() && !connection_closed {
             return (!payload.is_empty()).then_some(ParserIssue::TlsTailNotFound);
         }
-        let Ok(records_len) = u32::try_from(records.len()) else {
-            return Some(ParserIssue::InvalidInput);
-        };
         let input = RawTailInput {
-            handle: conn.handle,
-            rss_hash: conn.rss_hash,
             tcp_seq: record_tcp_seq,
-            tcp_seq_after_record: record_tcp_seq.wrapping_add(records_len),
             records,
             record_count,
             packet_ordinal: conn.packet_ordinal,
@@ -899,21 +822,14 @@ impl RawTailTable {
                 "raw-tail handle does not belong to this runtime and worker",
             )));
         };
-        if !conn.active || conn.parser.is_none() {
+        if conn.parser.is_none() || conn.socket_handle.is_none() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "raw-tail parser is not active",
             )));
         }
-        match conn.receiver_waker.as_ref() {
-            Some(waker) if !waker.will_wake(cx.waker()) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "raw-tail flow already has a different receiver task",
-                )));
-            }
-            Some(_) => {}
-            None => conn.receiver_waker = Some(cx.waker().clone()),
+        if conn.receiver_waker.is_none() {
+            conn.receiver_waker = Some(cx.waker().clone());
         }
         if !conn.publication_ready {
             return Poll::Pending;
@@ -922,87 +838,14 @@ impl RawTailTable {
         Poll::Ready(Ok(()))
     }
 
-    pub(crate) fn error_counters(&self) -> RawTailErrorCounters {
-        self.errors
+    #[inline(always)]
+    pub(crate) fn errors_dirty(&self) -> bool {
+        self.errors_dirty
     }
 
     pub(crate) fn take_error_counters(&mut self) -> RawTailErrorCounters {
+        self.errors_dirty = false;
         std::mem::take(&mut self.errors)
-    }
-
-    fn push_pending_slot(&mut self, slot: usize) {
-        if self.pending_slots.len() >= RAW_TAIL_CONNECTION_CAP {
-            let conn = self.conns[slot]
-                .as_mut()
-                .expect("new raw-tail pending slot must contain a connection");
-            conn.pending_mbuf = None;
-            self.errors.pending_capacity_exceeded = self
-                .errors
-                .pending_capacity_exceeded
-                .saturating_add(1);
-            return;
-        }
-        let position = self.pending_slots.len();
-        let conn = self.conns[slot]
-            .as_mut()
-            .expect("new raw-tail pending slot must contain a connection");
-        assert_eq!(
-            conn.pending_slot_pos,
-            RAW_TAIL_PENDING_NONE,
-            "raw-tail connection can occupy the pending list only once"
-        );
-        conn.pending_slot_pos = position;
-        self.pending_slots.push(slot);
-    }
-
-    fn remove_pending_slot(&mut self, slot: usize) {
-        let Some(position) = self
-            .conns
-            .get(slot)
-            .and_then(|conn| conn.as_ref())
-            .map(|conn| conn.pending_slot_pos)
-        else {
-            return;
-        };
-        if position == RAW_TAIL_PENDING_NONE {
-            return;
-        }
-        assert!(
-            position < self.pending_slots.len() && self.pending_slots[position] == slot,
-            "raw-tail pending reverse index must identify its connection"
-        );
-        self.pending_slots.swap_remove(position);
-        if position < self.pending_slots.len() {
-            let moved_slot = self.pending_slots[position];
-            self.conns[moved_slot]
-                .as_mut()
-                .expect("moved raw-tail pending slot must contain a connection")
-                .pending_slot_pos = position;
-        }
-        if let Some(conn) = self.conns[slot].as_mut() {
-            conn.pending_slot_pos = RAW_TAIL_PENDING_NONE;
-        }
-    }
-
-    fn compact_pending_slots(&mut self) {
-        let mut write = 0usize;
-        for read in 0..self.pending_slots.len() {
-            let slot = self.pending_slots[read];
-            let keep = self.conns[slot]
-                .as_ref()
-                .is_some_and(|conn| conn.pending_mbuf.is_some());
-            if keep {
-                self.pending_slots[write] = slot;
-                self.conns[slot]
-                    .as_mut()
-                    .expect("retained raw-tail pending slot must contain a connection")
-                    .pending_slot_pos = write;
-                write += 1;
-            } else if let Some(conn) = self.conns[slot].as_mut() {
-                conn.pending_slot_pos = RAW_TAIL_PENDING_NONE;
-            }
-        }
-        self.pending_slots.truncate(write);
     }
 
     fn conn_for_handle_mut(&mut self, handle: RawTailHandle) -> Option<&mut TailConn> {
@@ -1014,18 +857,17 @@ impl RawTailTable {
         if handle.owner != self.owner {
             return None;
         }
-        self.id_to_slot.get(&handle.id).copied()
+        let conn = self.conns.get(handle.slot)?.as_ref()?;
+        if conn.handle.id != handle.id {
+            return None;
+        }
+        Some(handle.slot)
     }
 }
 
 #[inline(always)]
 fn replace_latest<T>(slot: &mut Option<T>, latest: T) -> Option<T> {
     std::mem::replace(slot, Some(latest))
-}
-
-#[inline(always)]
-fn with_selected_owner<T, R>(owner: T, use_owner: impl FnOnce(&T) -> R) -> R {
-    use_owner(&owner)
 }
 
 #[inline(always)]
@@ -1203,15 +1045,9 @@ mod tests {
 
     #[derive(Default)]
     struct ParserProbe {
-        invalidations: usize,
         calls: usize,
         input_ptr: usize,
         input_len: usize,
-    }
-
-    unsafe fn invalidate_probe(context: NonNull<()>) {
-        let mut probe = context.cast::<ParserProbe>();
-        unsafe { probe.as_mut() }.invalidations += 1;
     }
 
     unsafe fn parse_probe(
@@ -1227,13 +1063,7 @@ mod tests {
     }
 
     fn parser_binding(probe: &mut ParserProbe) -> RawTailParserBinding {
-        unsafe {
-            RawTailParserBinding::new(
-                NonNull::from(probe).cast(),
-                invalidate_probe,
-                parse_probe,
-            )
-        }
+        unsafe { RawTailParserBinding::new(NonNull::from(probe).cast(), parse_probe) }
     }
 
     struct TestWake;
@@ -1272,16 +1102,16 @@ mod tests {
     }
 
     #[test]
-    fn packet_ordinal_saturates_instead_of_wrapping() {
+    fn packet_ordinal_uses_infallible_wrapping_increment() {
         let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
         let handle = table.register(tuple(443)).expect("reservation must succeed");
         let slot = table.slot_for_handle(handle).unwrap();
         let conn = table.conns[slot].as_mut().unwrap();
         conn.packet_ordinal = u64::MAX - 1;
-        assert!(!conn.advance_packet_ordinal());
+        conn.advance_packet_ordinal();
         assert_eq!(conn.packet_ordinal, u64::MAX);
-        assert!(conn.advance_packet_ordinal());
-        assert_eq!(conn.packet_ordinal, u64::MAX);
+        conn.advance_packet_ordinal();
+        assert_eq!(conn.packet_ordinal, 0);
     }
 
     #[test]
@@ -1292,23 +1122,18 @@ mod tests {
             .register(tuple(443))
             .expect_err("exhausted ids must reject registration");
         assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
-        assert!(table.id_to_slot.is_empty());
         assert_eq!(table.rss_to_slot.len, 0);
         assert!(table.conns.is_empty());
     }
 
     #[test]
-    fn parser_binding_invalidates_without_a_reentry_guard_and_borrows_input() {
+    fn parser_binding_has_no_invalidation_or_reentry_guard_and_borrows_input() {
         let mut probe = ParserProbe::default();
         let binding = parser_binding(&mut probe);
         let bytes = tls_record(b"market");
-        unsafe { binding.invalidate() };
         let disposition = unsafe {
             binding.parse(RawTailInput {
-                handle: RawTailHandle::new(1, test_owner(0)),
-                rss_hash: 9,
                 tcp_seq: 10,
-                tcp_seq_after_record: 20,
                 records: &bytes,
                 record_count: 1,
                 packet_ordinal: 3,
@@ -1316,7 +1141,6 @@ mod tests {
             })
         };
         assert_eq!(disposition, RawTailParseDisposition::Ready);
-        assert_eq!(probe.invalidations, 1);
         assert_eq!(probe.calls, 1);
         assert_eq!(probe.input_ptr, bytes.as_ptr() as usize);
         assert_eq!(probe.input_len, bytes.len());
@@ -1375,8 +1199,6 @@ mod tests {
             events: Rc<RefCell<Vec<&'static str>>>,
         }
 
-        unsafe fn invalidate_order_parser(_context: NonNull<()>) {}
-
         unsafe fn parse_order_parser(
             context: NonNull<()>,
             _input: RawTailInput<'_>,
@@ -1407,7 +1229,6 @@ mod tests {
         let binding = unsafe {
             RawTailParserBinding::new(
                 NonNull::from(&mut parser).cast(),
-                invalidate_order_parser,
                 parse_order_parser,
             )
         };
@@ -1424,9 +1245,9 @@ mod tests {
             payload: tls_record(b"latest"),
             events: events.clone(),
         };
-        let committed_socket = with_selected_owner(selected, |selected| {
+        let committed_socket = {
             let conn = table.conns[slot].as_mut().unwrap();
-            let parser = conn.invalidate_for_selected_tail();
+            let parser = conn.parser.unwrap();
             assert!(RawTailTable::dispatch_committed_payload(
                 conn,
                 parser,
@@ -1437,7 +1258,8 @@ mod tests {
             .is_none());
             assert_eq!(&*events.borrow(), &["parser"]);
             conn.socket_handle.unwrap()
-        });
+        };
+        drop(selected);
         assert_eq!(&*events.borrow(), &["parser", "mbuf_drop"]);
 
         let mut shared_egress = Vec::with_capacity(RAW_TAIL_CONNECTION_CAP);
@@ -1459,7 +1281,7 @@ mod tests {
         let mut probe = ParserProbe::default();
         let binding = parser_binding(&mut probe);
 
-        let foreign = RawTailHandle::new(handle.id(), test_owner(0));
+        let foreign = RawTailHandle::new(handle.id(), handle.slot, test_owner(0));
         assert_eq!(
             table
                 .activate_parser(foreign, tuple(443), SocketHandle::default(), binding)
@@ -1467,12 +1289,14 @@ mod tests {
                 .kind(),
             io::ErrorKind::NotFound
         );
-        assert!(!table.conns[table.slot_for_handle(handle).unwrap()]
+        assert!(table.conns[table.slot_for_handle(handle).unwrap()]
             .as_ref()
             .unwrap()
-            .active);
+            .parser
+            .is_none());
         let foreign_worker = RawTailHandle::new(
             handle.id(),
+            handle.slot,
             WorkerIdentity::new(owner.runtime_id, owner.worker_index + 1),
         );
         assert_eq!(
@@ -1507,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_poll_has_one_receiver_and_no_generation_or_self_wake() {
+    fn publication_poll_keeps_the_first_receiver_waker_without_identity_checks() {
         let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
         let handle = table.register(tuple(443)).expect("reservation must succeed");
         let mut probe = ParserProbe::default();
@@ -1532,31 +1356,73 @@ mod tests {
 
         let other_waker = Waker::from(Arc::new(TestWake));
         let mut other_cx = Context::from_waker(&other_waker);
-        let Poll::Ready(Err(error)) = table.poll_publication_ready(handle, &mut other_cx) else {
-            panic!("different receiver must be rejected");
-        };
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(table.poll_publication_ready(handle, &mut other_cx).is_pending());
+        let stored = table.conns[slot]
+            .as_ref()
+            .unwrap()
+            .receiver_waker
+            .as_ref()
+            .unwrap();
+        assert!(stored.will_wake(&owner_waker));
+        assert!(!stored.will_wake(&other_waker));
     }
 
     #[test]
-    fn a_new_selected_tail_invalidates_an_unconsumed_ordinary_publication() {
+    fn parser_miss_and_empty_result_preserve_an_unconsumed_publication() {
+        #[derive(Default)]
+        struct EmptyProbe {
+            calls: usize,
+        }
+
+        unsafe fn parse_empty(
+            context: NonNull<()>,
+            _input: RawTailInput<'_>,
+        ) -> RawTailParseDisposition {
+            let mut probe = context.cast::<EmptyProbe>();
+            unsafe { probe.as_mut() }.calls += 1;
+            RawTailParseDisposition::Empty
+        }
+
         let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
         let handle = table.register(tuple(443)).expect("reservation must succeed");
-        let mut probe = ParserProbe::default();
+        let mut probe = EmptyProbe::default();
+        let binding = unsafe {
+            RawTailParserBinding::new(NonNull::from(&mut probe).cast(), parse_empty)
+        };
         table
             .activate_parser(
                 handle,
                 tuple(443),
                 SocketHandle::default(),
-                parser_binding(&mut probe),
+                binding,
             )
             .expect("activation must succeed");
         let slot = table.slot_for_handle(handle).unwrap();
+        let wake_count = Arc::new(AtomicUsize::new(0));
         let conn = table.conns[slot].as_mut().unwrap();
         conn.publication_ready = true;
-        conn.invalidate_for_selected_tail();
-        assert!(!conn.publication_ready);
-        assert_eq!(probe.invalidations, 1);
+        conn.receiver_waker = Some(Waker::from(Arc::new(CountWake(wake_count.clone()))));
+
+        assert!(matches!(
+            RawTailTable::dispatch_committed_payload(conn, binding, b"not tls", 10, false),
+            Some(ParserIssue::TlsTailNotFound)
+        ));
+        assert!(conn.publication_ready);
+        assert_eq!(probe.calls, 0);
+        assert_eq!(wake_count.load(Ordering::Relaxed), 0);
+
+        let record = tls_record(b"new but not publishable");
+        assert!(RawTailTable::dispatch_committed_payload(
+            conn,
+            binding,
+            &record,
+            11,
+            false,
+        )
+        .is_none());
+        assert!(conn.publication_ready);
+        assert_eq!(probe.calls, 1);
+        assert_eq!(wake_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1627,6 +1493,7 @@ mod tests {
         let second = table.register(tuple(444)).expect("new reservation must succeed");
         let second_slot = table.slot_for_handle(second).unwrap();
         assert_eq!(first_slot, second_slot);
+        assert!(table.slot_for_handle(first).is_none());
         let conn = table.conns[second_slot].as_ref().unwrap();
         assert!(conn.parser.is_none());
         assert!(conn.receiver_waker.is_none());
@@ -1657,7 +1524,6 @@ mod tests {
 
         assert!(table.detach_socket(socket_handle));
         let conn = table.conns[slot].as_ref().unwrap();
-        assert!(!conn.active);
         assert!(conn.parser.is_none());
         assert!(conn.socket_handle.is_none());
         assert!(!conn.publication_ready);
