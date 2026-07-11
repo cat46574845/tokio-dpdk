@@ -1470,8 +1470,9 @@ impl Context {
         let track_id = crate::runtime::market_trace::dpdk_track(self.worker.index);
 
         self.worker.driver.with_mut(|driver| {
-            // Skip poll if no sockets are registered (optimization)
-            if !driver.has_registered_sockets() {
+            // Gateway ARP and retained RX/TX work remain driver-owned even
+            // when no socket is currently registered.
+            if !driver.has_poll_work() {
                 return;
             }
             // Poll with current time

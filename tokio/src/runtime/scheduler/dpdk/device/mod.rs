@@ -3,7 +3,7 @@
 //! This module provides `DpdkDevice` which implements `smoltcp::phy::Device`,
 //! allowing DPDK to be used as the network backend for smoltcp's TCP/IP stack.
 
-use std::{io, ptr};
+use std::{io, ptr, ptr::NonNull};
 
 use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
@@ -18,11 +18,8 @@ use super::raw_tail::{ParsedTcpPacket, RawTailTable, RAW_TAIL_REQUIRED_RSS_HF};
 /// Default packets requested per rx_burst call.
 const RX_BURST_SIZE_DEFAULT: u16 = 256;
 
-/// Maximum packets per tx_burst call
-const TX_BURST_SIZE: u16 = 32;
-
-/// Default preallocated mbuf pointers retained for one full driver poll.
-const RX_DRAIN_BATCH_CAP_DEFAULT: usize = 262_144;
+/// Strict upper bound for application-owned mbufs awaiting one TX burst.
+const TX_PENDING_CAP: usize = 32;
 
 /// Default MTU (Maximum Transmission Unit)
 const DEFAULT_MTU: usize = 1500;
@@ -43,6 +40,28 @@ pub(crate) struct TxFlushStats {
     pub(crate) total_packets: usize,
     pub(crate) burst_calls: usize,
     pub(crate) zero_retries: usize,
+    pub(crate) sent_packets: usize,
+    pub(crate) remaining_packets: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DeviceErrorCounters {
+    pub(crate) tx_mbuf_exhausted: u64,
+    pub(crate) tx_pending_full: u64,
+    pub(crate) tx_append_failed: u64,
+    pub(crate) tx_burst_invalid: u64,
+    pub(crate) rx_mbuf_invalid: u64,
+}
+
+impl DeviceErrorCounters {
+    #[inline(always)]
+    pub(crate) fn is_empty(self) -> bool {
+        self.tx_mbuf_exhausted == 0
+            && self.tx_pending_full == 0
+            && self.tx_append_failed == 0
+            && self.tx_burst_invalid == 0
+            && self.rx_mbuf_invalid == 0
+    }
 }
 
 impl DrainRxStats {
@@ -66,29 +85,6 @@ fn configured_rx_burst_size() -> u16 {
         panic!("TOKIO_DPDK_RX_BURST_SIZE must be greater than zero");
     }
     parsed
-}
-
-fn configured_rx_drain_batch_cap() -> usize {
-    let Some(value) = std::env::var_os("TOKIO_DPDK_RX_DRAIN_BATCH_CAP") else {
-        return RX_DRAIN_BATCH_CAP_DEFAULT;
-    };
-    let value = value
-        .into_string()
-        .unwrap_or_else(|_| panic!("TOKIO_DPDK_RX_DRAIN_BATCH_CAP is not valid UTF-8"));
-    let parsed = value
-        .parse::<usize>()
-        .unwrap_or_else(|e| panic!("TOKIO_DPDK_RX_DRAIN_BATCH_CAP parse failed value={} error={}", value, e));
-    if parsed == 0 {
-        panic!("TOKIO_DPDK_RX_DRAIN_BATCH_CAP must be greater than zero");
-    }
-    parsed
-}
-
-#[inline(always)]
-fn mbufs_in_arrival_order(
-    batch: &[*mut ffi::rte_mbuf],
-) -> impl Iterator<Item = *mut ffi::rte_mbuf> + '_ {
-    batch.iter().copied()
 }
 
 // =============================================================================
@@ -167,6 +163,13 @@ mod dpdk_wrappers {
         unsafe { ffi::dpdk_wrap_rte_pktmbuf_append(mbuf, len) as *mut u8 }
     }
 
+    /// Return writable bytes remaining in a fresh mbuf segment.
+    #[inline(always)]
+    pub(crate) unsafe fn pktmbuf_tailroom(mbuf: *const ffi::rte_mbuf) -> u16 {
+        // SAFETY: Caller guarantees a valid mbuf pointer.
+        unsafe { ffi::dpdk_wrap_rte_pktmbuf_tailroom(mbuf) }
+    }
+
     pub(crate) unsafe fn rss_hash_conf_get(
         port_id: u16,
         rss_conf: *mut ffi::rte_eth_rss_conf,
@@ -185,10 +188,13 @@ fn load_actual_rss_key(port_id: u16) -> io::Result<Box<[u8]>> {
         ));
     }
     let key_len = dev_info.hash_key_size as usize;
-    if key_len == 0 {
+    if key_len < 16 {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("DPDK port {} reports zero RSS key length", port_id),
+            format!(
+                "DPDK port {} RSS key length {} is shorter than the 16-byte Toeplitz prefix",
+                port_id, key_len
+            ),
         ));
     }
     let mut key = vec![0u8; key_len];
@@ -217,6 +223,85 @@ fn load_actual_rss_key(port_id: u16) -> io::Result<Box<[u8]>> {
     Ok(key.into_boxed_slice())
 }
 
+/// Exclusive application-side ownership of one DPDK mbuf.
+///
+/// The owner is deliberately retained while a smoltcp token closure executes,
+/// so unwinding frees the mbuf instead of leaking it. `into_raw` is used only
+/// when ownership moves to the device TX pending vector.
+struct OwnedMbuf {
+    ptr: NonNull<ffi::rte_mbuf>,
+}
+
+impl OwnedMbuf {
+    #[inline(always)]
+    unsafe fn try_alloc(pool: *mut ffi::rte_mempool) -> Option<Self> {
+        NonNull::new(unsafe { dpdk_wrappers::pktmbuf_alloc(pool) }).map(|ptr| Self { ptr })
+    }
+
+    #[inline(always)]
+    unsafe fn from_received(ptr: *mut ffi::rte_mbuf) -> Option<Self> {
+        NonNull::new(ptr).map(|ptr| Self { ptr })
+    }
+
+    #[inline(always)]
+    fn as_ptr(&self) -> *mut ffi::rte_mbuf {
+        self.ptr.as_ptr()
+    }
+
+    #[inline(always)]
+    fn append(&mut self, len: usize) -> Option<&mut [u8]> {
+        let len = u16::try_from(len).ok()?;
+        let ptr = unsafe { dpdk_wrappers::pktmbuf_append(self.as_ptr(), len) };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) })
+    }
+
+    #[inline(always)]
+    fn into_raw(self) -> *mut ffi::rte_mbuf {
+        let ptr = self.ptr.as_ptr();
+        std::mem::forget(self);
+        ptr
+    }
+}
+
+impl Drop for OwnedMbuf {
+    fn drop(&mut self) {
+        unsafe { dpdk_wrappers::pktmbuf_free(self.ptr.as_ptr()) };
+    }
+}
+
+#[inline(always)]
+fn retain_unsent_suffix<T: Copy>(pending: &mut Vec<T>, sent: usize) {
+    debug_assert!(sent <= pending.len());
+    if sent == 0 {
+        return;
+    }
+    if sent == pending.len() {
+        pending.clear();
+        return;
+    }
+    pending.copy_within(sent.., 0);
+    pending.truncate(pending.len() - sent);
+}
+
+#[inline(always)]
+fn compact_consumed_prefix<T: Copy>(pending: &mut Vec<T>, consumed: &mut usize) {
+    if *consumed >= pending.len() {
+        pending.clear();
+        *consumed = 0;
+        return;
+    }
+    if *consumed == 0 {
+        return;
+    }
+    let remaining = pending.len() - *consumed;
+    pending.copy_within(*consumed.., 0);
+    pending.truncate(remaining);
+    *consumed = 0;
+}
+
 // =============================================================================
 // DPDK Device
 // =============================================================================
@@ -243,8 +328,8 @@ pub(crate) struct DpdkDevice {
     rx_burst_buf: Vec<*mut ffi::rte_mbuf>,
     /// Number of mbuf pointers requested from one rx_burst call.
     rx_burst_size: u16,
-    /// Raw mbufs drained during the current driver poll before reverse dispatch.
-    rx_drain_batch: Vec<*mut ffi::rte_mbuf>,
+    /// Fixed counters consumed by the driver's rate-limited ERROR reporter.
+    error_counters: DeviceErrorCounters,
 }
 
 // DPDK mbufs are thread-safe when used correctly
@@ -265,18 +350,36 @@ impl DpdkDevice {
         let raw_tail_rss_key = load_actual_rss_key(port_id)?;
         let rx_burst_size = configured_rx_burst_size();
         let rx_burst_len = rx_burst_size as usize;
-        let rx_drain_batch_cap = configured_rx_drain_batch_cap();
+
+        let tailroom_probe = unsafe { OwnedMbuf::try_alloc(mempool) }.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "DPDK mempool has no mbuf available for startup tailroom validation",
+            )
+        })?;
+        let tailroom = unsafe { dpdk_wrappers::pktmbuf_tailroom(tailroom_probe.as_ptr()) } as usize;
+        if tailroom < DEFAULT_MTU {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "DPDK fresh mbuf tailroom {} is smaller than device MTU {}",
+                    tailroom, DEFAULT_MTU
+                ),
+            ));
+        }
+        drop(tailroom_probe);
+
         Ok(Self {
             port_id,
             queue_id,
             mempool,
             raw_tail_rss_key,
-            tx_buffer: Vec::with_capacity(TX_BURST_SIZE as usize),
+            tx_buffer: Vec::with_capacity(TX_PENDING_CAP),
             rx_pending: Vec::with_capacity(rx_burst_len),
             rx_index: 0,
             rx_burst_buf: vec![ptr::null_mut(); rx_burst_len],
             rx_burst_size,
-            rx_drain_batch: Vec::with_capacity(rx_drain_batch_cap.max(rx_burst_len)),
+            error_counters: DeviceErrorCounters::default(),
         })
     }
 
@@ -299,12 +402,10 @@ impl DpdkDevice {
 
     /// Try to receive packets from DPDK.
     pub(crate) fn drain_rx(&mut self, raw_tail: &mut RawTailTable) -> DrainRxStats {
-        // Only receive if we've consumed all pending packets
-        if self.rx_index >= self.rx_pending.len() {
-            self.rx_pending.clear();
-            self.rx_index = 0;
-        }
-        self.rx_drain_batch.clear();
+        // Preserve a suffix which could not be consumed because a paired TX
+        // token was unavailable. Compaction is a cold backpressure path and
+        // prevents already-consumed pointer history from growing indefinitely.
+        compact_consumed_prefix(&mut self.rx_pending, &mut self.rx_index);
         let mut stats = DrainRxStats::default();
         #[cfg(feature = "market-trace")]
         let mut trace_start_ns = 0u64;
@@ -325,8 +426,16 @@ impl DpdkDevice {
                     trace_start_ns = crate::runtime::market_trace::now_ns();
                 }
                 stats.received += n as usize;
-                for mbuf in &self.rx_burst_buf[..n as usize] {
-                    self.rx_drain_batch.push(*mbuf);
+                // Classify this NIC burst immediately in its natural order.
+                // In particular, a superseded raw-tail mbuf is freed by
+                // capture_mbuf before the next burst is requested.
+                for &mbuf in &self.rx_burst_buf[..n as usize] {
+                    if !raw_tail.is_empty() && raw_tail.capture_mbuf(mbuf) {
+                        stats.raw_tail_captured += 1;
+                        continue;
+                    }
+                    self.rx_pending.push(mbuf);
+                    stats.smoltcp_pending += 1;
                 }
             }
 
@@ -334,20 +443,11 @@ impl DpdkDevice {
                 break;
             }
         }
-        for mbuf in mbufs_in_arrival_order(&self.rx_drain_batch) {
-            if !raw_tail.is_empty() && raw_tail.capture_mbuf(mbuf) {
-                stats.raw_tail_captured += 1;
-                continue;
-            }
-            self.rx_pending.push(mbuf);
-            stats.smoltcp_pending += 1;
-        }
         #[cfg(feature = "market-trace")]
         if trace_start_ns != 0 {
             stats.trace_start_ns = trace_start_ns;
             stats.trace_dur_ns = crate::runtime::market_trace::now_ns().saturating_sub(trace_start_ns);
         }
-        self.rx_drain_batch.clear();
         stats
     }
 
@@ -355,69 +455,45 @@ impl DpdkDevice {
     ///
     /// This should be called periodically to ensure packets are sent.
     pub(crate) fn flush_tx(&mut self) -> std::io::Result<()> {
-        self.flush_tx_with_stats().map(|_| ())
+        let stats = self.flush_tx_with_stats();
+        if stats.remaining_packets == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
     }
 
-    pub(crate) fn flush_tx_with_stats(&mut self) -> std::io::Result<TxFlushStats> {
+    pub(crate) fn flush_tx_with_stats(&mut self) -> TxFlushStats {
         let mut stats = TxFlushStats::default();
         if self.tx_buffer.is_empty() {
-            return Ok(stats);
+            return stats;
         }
 
-        let mut sent_count = 0usize;
         let total = self.tx_buffer.len();
         stats.total_packets = total;
-        let mut retry_count = 0;
-        const MAX_RETRIES: usize = 10;
-
-        // Try to send all buffered packets with retry
-        while sent_count < total {
-            stats.burst_calls = stats.burst_calls.saturating_add(1);
-            let n = unsafe {
-                dpdk_wrappers::tx_burst(
-                    self.port_id,
-                    self.queue_id,
-                    self.tx_buffer[sent_count..].as_mut_ptr(),
-                    (total - sent_count) as u16,
-                )
-            };
-
-            if n == 0 {
-                retry_count += 1;
-                stats.zero_retries = stats.zero_retries.saturating_add(1);
-                if retry_count >= MAX_RETRIES {
-                    // Failed to send after max retries, log and free remaining mbufs
-                    eprintln!(
-                        "[DPDK TX WARNING] Failed to send {} packets after {} retries, dropping",
-                        total - sent_count,
-                        MAX_RETRIES
-                    );
-                    for mbuf in &self.tx_buffer[sent_count..] {
-                        unsafe {
-                            dpdk_wrappers::pktmbuf_free(*mbuf);
-                        }
-                    }
-                    self.tx_buffer.clear();
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        format!(
-                            "DPDK TX burst failed to send {} packets after {} retries",
-                            total - sent_count,
-                            MAX_RETRIES
-                        ),
-                    ));
-                }
-                // Brief pause before retry (yield CPU)
-                std::hint::spin_loop();
-                continue;
-            }
-
-            sent_count += n as usize;
-            retry_count = 0; // Reset retry count on successful send
+        stats.burst_calls = 1;
+        // TX_PENDING_CAP is strictly below u16::MAX.
+        let sent = unsafe {
+            dpdk_wrappers::tx_burst(
+                self.port_id,
+                self.queue_id,
+                self.tx_buffer.as_mut_ptr(),
+                total as u16,
+            )
+        } as usize;
+        if sent > total {
+            self.error_counters.tx_burst_invalid = self
+                .error_counters
+                .tx_burst_invalid
+                .saturating_add(1);
+            stats.remaining_packets = total;
+            return stats;
         }
-
-        self.tx_buffer.clear();
-        Ok(stats)
+        stats.sent_packets = sent;
+        stats.zero_retries = usize::from(sent == 0);
+        retain_unsent_suffix(&mut self.tx_buffer, sent);
+        stats.remaining_packets = self.tx_buffer.len();
+        stats
     }
 
     #[inline(always)]
@@ -425,16 +501,12 @@ impl DpdkDevice {
         !self.tx_buffer.is_empty()
     }
 
-    pub(crate) fn drop_unprocessed_rx_pending(&mut self) {
-        if self.rx_index < self.rx_pending.len() {
-            for mbuf in &self.rx_pending[self.rx_index..] {
-                unsafe {
-                    dpdk_wrappers::pktmbuf_free(*mbuf);
-                }
-            }
-        }
-        self.rx_pending.clear();
-        self.rx_index = 0;
+    pub(crate) fn error_counters(&self) -> DeviceErrorCounters {
+        self.error_counters
+    }
+
+    pub(crate) fn take_error_counters(&mut self) -> DeviceErrorCounters {
+        std::mem::take(&mut self.error_counters)
     }
 
     #[inline(always)]
@@ -452,54 +524,79 @@ impl DpdkDevice {
         unsafe { dpdk_wrappers::pktmbuf_mtod(mbuf) }
     }
 
+    #[inline(always)]
+    fn try_reserve_tx_mbuf(&mut self) -> Option<OwnedMbuf> {
+        if self.tx_buffer.len() >= TX_PENDING_CAP {
+            self.error_counters.tx_pending_full = self
+                .error_counters
+                .tx_pending_full
+                .saturating_add(1);
+            return None;
+        }
+        let mbuf = unsafe { OwnedMbuf::try_alloc(self.mempool) };
+        if mbuf.is_none() {
+            self.error_counters.tx_mbuf_exhausted = self
+                .error_counters
+                .tx_mbuf_exhausted
+                .saturating_add(1);
+        }
+        mbuf
+    }
+
+    fn try_enqueue_tx_packet(
+        &mut self,
+        len: usize,
+        emit: impl FnOnce(&mut [u8]),
+    ) -> bool {
+        let Some(mut mbuf) = self.try_reserve_tx_mbuf() else {
+            return false;
+        };
+        let Some(data) = mbuf.append(len) else {
+            self.error_counters.tx_append_failed = self
+                .error_counters
+                .tx_append_failed
+                .saturating_add(1);
+            return false;
+        };
+        emit(data);
+        self.tx_buffer.push(mbuf.into_raw());
+        true
+    }
+
     pub(crate) fn send_raw_tcp_ack(&mut self, pkt: &ParsedTcpPacket<'_>, seq: u32, ack: u32) {
         const ACK_PACKET_LEN: usize = 14 + 20 + 20;
-        let mbuf = unsafe { dpdk_wrappers::pktmbuf_alloc(self.mempool) };
-        if mbuf.is_null() {
-            panic!("Failed to allocate mbuf for raw-tail ACK");
-        }
+        let _queued = self.try_enqueue_tx_packet(ACK_PACKET_LEN, |data| {
+            data[..6].copy_from_slice(&pkt.eth_src);
+            data[6..12].copy_from_slice(&pkt.eth_dst);
+            data[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
 
-        let data = unsafe {
-            let ptr = dpdk_wrappers::pktmbuf_append(mbuf, ACK_PACKET_LEN as u16);
-            if ptr.is_null() {
-                dpdk_wrappers::pktmbuf_free(mbuf);
-                panic!("Failed to append raw-tail ACK bytes to mbuf");
-            }
-            std::slice::from_raw_parts_mut(ptr as *mut u8, ACK_PACKET_LEN)
-        };
+            let ip = &mut data[14..34];
+            ip[0] = 0x45;
+            ip[1] = 0;
+            ip[2..4].copy_from_slice(&(40u16).to_be_bytes());
+            ip[4..6].copy_from_slice(&0u16.to_be_bytes());
+            ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+            ip[8] = 64;
+            ip[9] = 6;
+            ip[10..12].copy_from_slice(&0u16.to_be_bytes());
+            ip[12..16].copy_from_slice(&pkt.local_ip.octets());
+            ip[16..20].copy_from_slice(&pkt.remote_ip.octets());
+            let ip_sum = internet_checksum(ip);
+            ip[10..12].copy_from_slice(&ip_sum.to_be_bytes());
 
-        data[..6].copy_from_slice(&pkt.eth_src);
-        data[6..12].copy_from_slice(&pkt.eth_dst);
-        data[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-
-        let ip = &mut data[14..34];
-        ip[0] = 0x45;
-        ip[1] = 0;
-        ip[2..4].copy_from_slice(&(40u16).to_be_bytes());
-        ip[4..6].copy_from_slice(&0u16.to_be_bytes());
-        ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
-        ip[8] = 64;
-        ip[9] = 6;
-        ip[10..12].copy_from_slice(&0u16.to_be_bytes());
-        ip[12..16].copy_from_slice(&pkt.local_ip.octets());
-        ip[16..20].copy_from_slice(&pkt.remote_ip.octets());
-        let ip_sum = internet_checksum(ip);
-        ip[10..12].copy_from_slice(&ip_sum.to_be_bytes());
-
-        let tcp = &mut data[34..54];
-        tcp[0..2].copy_from_slice(&pkt.local_port.to_be_bytes());
-        tcp[2..4].copy_from_slice(&pkt.remote_port.to_be_bytes());
-        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
-        tcp[8..12].copy_from_slice(&ack.to_be_bytes());
-        tcp[12] = 5u8 << 4;
-        tcp[13] = 0x10;
-        tcp[14..16].copy_from_slice(&65535u16.to_be_bytes());
-        tcp[16..18].copy_from_slice(&0u16.to_be_bytes());
-        tcp[18..20].copy_from_slice(&0u16.to_be_bytes());
-        let tcp_sum = tcp_checksum(pkt.local_ip.octets(), pkt.remote_ip.octets(), tcp);
-        tcp[16..18].copy_from_slice(&tcp_sum.to_be_bytes());
-
-        self.tx_buffer.push(mbuf);
+            let tcp = &mut data[34..54];
+            tcp[0..2].copy_from_slice(&pkt.local_port.to_be_bytes());
+            tcp[2..4].copy_from_slice(&pkt.remote_port.to_be_bytes());
+            tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+            tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+            tcp[12] = 5u8 << 4;
+            tcp[13] = 0x10;
+            tcp[14..16].copy_from_slice(&65535u16.to_be_bytes());
+            tcp[16..18].copy_from_slice(&0u16.to_be_bytes());
+            tcp[18..20].copy_from_slice(&0u16.to_be_bytes());
+            let tcp_sum = tcp_checksum(pkt.local_ip.octets(), pkt.remote_ip.octets(), tcp);
+            tcp[16..18].copy_from_slice(&tcp_sum.to_be_bytes());
+        });
     }
 }
 
@@ -531,8 +628,8 @@ fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp: &[u8]) -> u16 {
 
 impl Drop for DpdkDevice {
     fn drop(&mut self) {
-        // Free any pending RX mbufs
-        for mbuf in &self.rx_pending {
+        // The consumed prefix has already been freed by DpdkRxToken.
+        for mbuf in &self.rx_pending[self.rx_index..] {
             unsafe {
                 dpdk_wrappers::pktmbuf_free(*mbuf);
             }
@@ -553,12 +650,13 @@ impl Drop for DpdkDevice {
 
 /// Receive token for smoltcp Device trait.
 pub(crate) struct DpdkRxToken {
-    mbuf: *mut ffi::rte_mbuf,
+    mbuf: OwnedMbuf,
 }
 
 /// Transmit token for smoltcp Device trait.
 pub(crate) struct DpdkTxToken<'a> {
     device: &'a mut DpdkDevice,
+    mbuf: Option<OwnedMbuf>,
 }
 
 impl smoltcp::phy::RxToken for DpdkRxToken {
@@ -568,54 +666,46 @@ impl smoltcp::phy::RxToken for DpdkRxToken {
     {
         // Get mbuf data pointer and length
         let (data_ptr, data_len) = unsafe {
-            let ptr = dpdk_wrappers::pktmbuf_mtod(self.mbuf);
-            let len = dpdk_wrappers::pktmbuf_pkt_len(self.mbuf) as usize;
+            let ptr = dpdk_wrappers::pktmbuf_mtod(self.mbuf.as_ptr());
+            let len = dpdk_wrappers::pktmbuf_pkt_len(self.mbuf.as_ptr()) as usize;
             (ptr, len)
         };
 
         let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
 
-        let result = f(data);
-
-        // Free the mbuf after consumption
-        unsafe {
-            dpdk_wrappers::pktmbuf_free(self.mbuf);
-        }
-
-        result
+        f(data)
     }
 }
 
 impl<'a> smoltcp::phy::TxToken for DpdkTxToken<'a> {
-    fn consume<R, F>(self, len: usize, f: F) -> R
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // Allocate new mbuf
-        let mbuf = unsafe { dpdk_wrappers::pktmbuf_alloc(self.device.mempool) };
-
-        if mbuf.is_null() {
-            panic!("Failed to allocate mbuf for transmission");
-        }
-
-        // Use pktmbuf_append to properly allocate space and set pkt_len/data_len
-        // This is the correct DPDK way to prepare an mbuf for transmission
-        let data = unsafe {
-            let ptr = dpdk_wrappers::pktmbuf_append(mbuf, len as u16);
-            if ptr.is_null() {
-                dpdk_wrappers::pktmbuf_free(mbuf);
-                panic!(
-                    "Failed to append {} bytes to mbuf (insufficient space)",
-                    len
-                );
+        assert!(
+            len <= DEFAULT_MTU,
+            "smoltcp Device capability guarantees TX length does not exceed the validated MTU"
+        );
+        let data = match self.mbuf.as_mut().and_then(|mbuf| mbuf.append(len)) {
+            Some(data) => data,
+            None => {
+                self.device.error_counters.tx_append_failed = self
+                    .device
+                    .error_counters
+                    .tx_append_failed
+                    .saturating_add(1);
+                panic!("validated fresh DPDK mbuf tailroom must accept a legal smoltcp frame");
             }
-            std::slice::from_raw_parts_mut(ptr, len)
         };
 
         let result = f(data);
 
-        // Add to transmit buffer
-        self.device.tx_buffer.push(mbuf);
+        let mbuf = self
+            .mbuf
+            .take()
+            .expect("DPDK TX token owns exactly one mbuf until successful consume");
+        debug_assert!(self.device.tx_buffer.len() < TX_PENDING_CAP);
+        self.device.tx_buffer.push(mbuf.into_raw());
 
         result
     }
@@ -635,18 +725,31 @@ impl Device for DpdkDevice {
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.rx_index < self.rx_pending.len() {
-            let mbuf = self.rx_pending[self.rx_index];
-            self.rx_index += 1;
-
-            Some((DpdkRxToken { mbuf }, DpdkTxToken { device: self }))
-        } else {
-            None
-        }
+        let raw_rx = *self.rx_pending.get(self.rx_index)?;
+        let tx_mbuf = self.try_reserve_tx_mbuf()?;
+        let Some(rx_mbuf) = (unsafe { OwnedMbuf::from_received(raw_rx) }) else {
+            self.error_counters.rx_mbuf_invalid = self
+                .error_counters
+                .rx_mbuf_invalid
+                .saturating_add(1);
+            return None;
+        };
+        self.rx_index += 1;
+        Some((
+            DpdkRxToken { mbuf: rx_mbuf },
+            DpdkTxToken {
+                device: self,
+                mbuf: Some(tx_mbuf),
+            },
+        ))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(DpdkTxToken { device: self })
+        let mbuf = self.try_reserve_tx_mbuf()?;
+        Some(DpdkTxToken {
+            device: self,
+            mbuf: Some(mbuf),
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -674,15 +777,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drained_mbufs_keep_nic_arrival_order() {
-        let batch = [
-            1usize as *mut ffi::rte_mbuf,
-            2usize as *mut ffi::rte_mbuf,
-            3usize as *mut ffi::rte_mbuf,
-        ];
-        let ids = mbufs_in_arrival_order(&batch)
-            .map(|mbuf| mbuf as usize)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec![1, 2, 3]);
+    fn zero_tx_acceptance_preserves_every_pending_pointer() {
+        let mut pending = vec![1usize, 2, 3];
+        retain_unsent_suffix(&mut pending, 0);
+        assert_eq!(pending, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn partial_tx_acceptance_retains_fifo_suffix() {
+        let mut pending = vec![1usize, 2, 3, 4];
+        retain_unsent_suffix(&mut pending, 2);
+        assert_eq!(pending, vec![3, 4]);
+    }
+
+    #[test]
+    fn full_tx_acceptance_forgets_every_nic_owned_pointer() {
+        let mut pending = vec![1usize, 2, 3];
+        retain_unsent_suffix(&mut pending, 3);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn rx_backpressure_compaction_preserves_unconsumed_order() {
+        let mut pending = vec![10usize, 20, 30, 40];
+        let mut consumed = 2;
+        compact_consumed_prefix(&mut pending, &mut consumed);
+        assert_eq!(pending, vec![30, 40]);
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn complete_rx_consumption_clears_pointer_history() {
+        let mut pending = vec![10usize, 20];
+        let mut consumed = 2;
+        compact_consumed_prefix(&mut pending, &mut consumed);
+        assert!(pending.is_empty());
+        assert_eq!(consumed, 0);
     }
 }

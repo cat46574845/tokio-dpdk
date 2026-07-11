@@ -13,16 +13,17 @@ use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::task::Waker;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use smoltcp::iface::{
-    Config as IfaceConfig, Interface, PollEgressHandleResult, PollIngressSingleResult, PollResult,
-    SocketHandle, SocketSet, TcpFlowCacheError,
+    Config as IfaceConfig, GatewayNeighborProbeError, GatewayNeighborProbeResult, Interface,
+    PollEgressHandleResult, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
+    TcpFlowCacheError,
 };
 use smoltcp::socket::tcp::Socket as TcpSocket;
 use smoltcp::socket::Socket as SmolSocket;
 use smoltcp::storage::LinearBuffer;
-use smoltcp::time::Instant as SmolInstant;
+use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
     Ipv6Address,
@@ -46,6 +47,8 @@ const TCP_TX_BUFFER_SIZE: usize = 65536;
 
 /// Default buffer pool size (number of connections)
 const DEFAULT_BUFFER_POOL_SIZE: usize = 2048;
+const GATEWAY_SOFT_STALE_AFTER: SmolDuration = SmolDuration::from_secs(300);
+const INFRA_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const PENDING_EGRESS_NONE: usize = usize::MAX;
 #[cfg(feature = "market-trace")]
 const TRACE_AUX_FIELD_BITS: u64 = 21;
@@ -68,6 +71,50 @@ fn dpdk_iface_config(mac: [u8; 6]) -> IfaceConfig {
     let mut config = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     config.tcp_flow_cache_capacity = DEFAULT_BUFFER_POOL_SIZE;
     config
+}
+
+#[inline(always)]
+fn socket_egress_retry_due(
+    device_exhausted: bool,
+    now: SmolInstant,
+    poll_at: Option<SmolInstant>,
+) -> Option<SmolInstant> {
+    if device_exhausted {
+        Some(now)
+    } else {
+        poll_at
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GatewayProbeErrorCounters {
+    non_ethernet_medium: u64,
+    non_ipv4_gateway: u64,
+    no_source_address: u64,
+    dispatch_failed: u64,
+    gateway_changed: u64,
+}
+
+impl GatewayProbeErrorCounters {
+    fn record(&mut self, error: GatewayNeighborProbeError) {
+        let counter = match error {
+            GatewayNeighborProbeError::NonEthernetMedium => &mut self.non_ethernet_medium,
+            GatewayNeighborProbeError::NonIpv4Gateway => &mut self.non_ipv4_gateway,
+            GatewayNeighborProbeError::NoSourceAddress => &mut self.no_source_address,
+            GatewayNeighborProbeError::DispatchFailed => &mut self.dispatch_failed,
+            GatewayNeighborProbeError::GatewayChanged => &mut self.gateway_changed,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    #[inline(always)]
+    fn is_empty(self) -> bool {
+        self.non_ethernet_medium == 0
+            && self.non_ipv4_gateway == 0
+            && self.no_source_address == 0
+            && self.dispatch_failed == 0
+            && self.gateway_changed == 0
+    }
 }
 // =============================================================================
 // TcpBufferPool - Pre-allocated buffer management
@@ -518,7 +565,7 @@ pub(crate) struct DpdkDriver {
     sockets: SocketSet<'static, LinearBuffer<'static>>,
     /// Start time for timestamp calculation
     start_time: Instant,
-    /// Set of registered socket handles (for has_registered_sockets check)
+    /// Set of registered socket handles (part of has_poll_work)
     registered_sockets: HashSet<SocketHandle>,
     /// Pre-allocated buffer pool for TCP sockets (zero-allocation at runtime)
     buffer_pool: TcpBufferPool,
@@ -534,6 +581,12 @@ pub(crate) struct DpdkDriver {
     ingress_touched: Vec<SocketHandle>,
     /// Dense bitset used to deduplicate ingress touched handles.
     ingress_touched_bits: Vec<u64>,
+    /// True after the configured IPv4 gateway has been registered for LKG probing.
+    gateway_neighbor_configured: bool,
+    /// Fixed counters for typed gateway probe failures.
+    gateway_probe_errors: GatewayProbeErrorCounters,
+    /// Last cold-path aggregated infrastructure ERROR report.
+    last_infra_error_log: Option<Instant>,
 }
 
 impl ConnectResourceOwner for DpdkDriver {
@@ -591,12 +644,26 @@ impl DpdkDriver {
             }
         });
 
-        // Configure IPv4 default gateway
+        // Configure IPv4 default gateway and its last-known-good ARP state.
+        let mut gateway_neighbor_configured = false;
         if let Some(gw) = gateway_v4 {
             iface
                 .routes_mut()
                 .add_default_ipv4_route(gw)
                 .expect("Failed to add IPv4 default route");
+            match iface.configure_gateway_neighbor(
+                now,
+                IpAddress::Ipv4(gw),
+                GATEWAY_SOFT_STALE_AFTER,
+            ) {
+                Ok(()) => gateway_neighbor_configured = true,
+                Err(error) => {
+                    eprintln!(
+                        "[tokio-dpdk] ERROR failed to configure IPv4 gateway neighbor gateway={} error={}",
+                        gw, error
+                    );
+                }
+            }
         }
 
         // Configure IPv6 default gateway
@@ -625,6 +692,9 @@ impl DpdkDriver {
             pending_egress_pos: vec![PENDING_EGRESS_NONE; DEFAULT_BUFFER_POOL_SIZE],
             ingress_touched: Vec::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
             ingress_touched_bits: vec![0; (DEFAULT_BUFFER_POOL_SIZE + 63) / 64],
+            gateway_neighbor_configured,
+            gateway_probe_errors: GatewayProbeErrorCounters::default(),
+            last_infra_error_log: None,
         }
     }
 
@@ -651,13 +721,7 @@ impl DpdkDriver {
         };
         #[cfg(feature = "market-trace")]
         let flush_tx_before_stats = if trace_flush_tx_before {
-            match self.device.flush_tx_with_stats() {
-                Ok(stats) => stats,
-                Err(error) => {
-                    eprintln!("[tokio-dpdk] flush_tx_before failed during trace: {error}");
-                    Default::default()
-                }
-            }
+            self.device.flush_tx_with_stats()
         } else {
             let _ = self.device.flush_tx();
             Default::default()
@@ -845,6 +909,29 @@ impl DpdkDriver {
         } else {
             0
         };
+
+        // Ingress is complete before probing so an ARP reply or trusted LKG
+        // update received in this same poll suppresses an unnecessary request.
+        // DeviceExhausted remains due and is retried only by a later poll.
+        let gateway_probe_due = self.gateway_neighbor_configured
+            && self.iface.gateway_neighbor_probe_due(smol_now).is_some();
+        let gateway_probe_sent = if gateway_probe_due {
+            match self
+                .iface
+                .poll_gateway_neighbor_probe(smol_now, &mut self.device)
+            {
+                Ok(GatewayNeighborProbeResult::Sent) => true,
+                Ok(GatewayNeighborProbeResult::NotDue)
+                | Ok(GatewayNeighborProbeResult::DeviceExhausted) => false,
+                Err(error) => {
+                    self.gateway_probe_errors.record(error);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
         #[cfg(feature = "market-trace")]
         let smoltcp_egress_pending_start = self.pending_egress_heap.len();
         let (egress_result, smoltcp_egress_processed) = self.poll_pending_egress(smol_now);
@@ -867,8 +954,6 @@ impl DpdkDriver {
         } else {
             0
         };
-        self.device.drop_unprocessed_rx_pending();
-
         // Flush any new TX packets (e.g., ACKs, SYN-ACK)
         #[cfg(feature = "market-trace")]
         let trace_flush_tx_after = trace_poll && self.device.has_pending_tx();
@@ -880,13 +965,7 @@ impl DpdkDriver {
         };
         #[cfg(feature = "market-trace")]
         let flush_tx_after_stats = if trace_flush_tx_after {
-            match self.device.flush_tx_with_stats() {
-                Ok(stats) => stats,
-                Err(error) => {
-                    eprintln!("[tokio-dpdk] flush_tx_after failed during trace: {error}");
-                    Default::default()
-                }
-            }
+            self.device.flush_tx_with_stats()
         } else {
             let _ = self.device.flush_tx();
             Default::default()
@@ -903,7 +982,12 @@ impl DpdkDriver {
         // Note: dispatch_wakers() is no longer needed!
         // smoltcp's native waker mechanism handles wakeups internally.
 
-        let active = received_rx || matches!(result, smoltcp::iface::PollResult::SocketStateChanged);
+        let active = received_rx
+            || gateway_probe_sent
+            || self.device.has_pending_tx()
+            || self.device.has_unprocessed_rx_pending()
+            || matches!(result, smoltcp::iface::PollResult::SocketStateChanged);
+        self.report_infra_errors(now);
         #[cfg(feature = "market-trace")]
         if trace_poll {
             let poll_dur_ns = crate::runtime::market_trace::now_ns().saturating_sub(poll_start_ns);
@@ -1144,7 +1228,7 @@ impl DpdkDriver {
 
     /// Register a connect socket for tracking.
     ///
-    /// This adds the socket handle to the registered set so has_registered_sockets() works.
+    /// This adds the socket handle to the registered set so has_poll_work() stays active.
     /// Waker management is now handled by smoltcp's native mechanism.
     pub(crate) fn register_socket(&mut self, handle: SocketHandle) {
         self.registered_sockets.insert(handle);
@@ -1152,7 +1236,7 @@ impl DpdkDriver {
 
     /// Register a listen socket for tracking.
     ///
-    /// This adds the socket handle to the registered set so has_registered_sockets() works.
+    /// This adds the socket handle to the registered set so has_poll_work() stays active.
     /// Waker management is now handled by smoltcp's native mechanism.
     pub(crate) fn register_listen_socket(&mut self, handle: SocketHandle) {
         self.registered_sockets.insert(handle);
@@ -1243,10 +1327,15 @@ impl DpdkDriver {
         self.buffer_pool.available()
     }
 
-    /// Check if there are any registered sockets.
-    /// Used to skip polling when no sockets need service.
-    pub(crate) fn has_registered_sockets(&self) -> bool {
+    /// Keep the driver live for gateway resolution and retained device work,
+    /// even before the first socket is registered or after the last is removed.
+    pub(crate) fn has_poll_work(&self) -> bool {
         !self.registered_sockets.is_empty()
+            || self.gateway_neighbor_configured
+            || self.device.has_pending_tx()
+            || self.device.has_unprocessed_rx_pending()
+            || !self.device.error_counters().is_empty()
+            || !self.gateway_probe_errors.is_empty()
     }
 
     #[inline(always)]
@@ -1257,30 +1346,71 @@ impl DpdkDriver {
     pub(crate) fn flush_socket_egress(&mut self, handle: SocketHandle) -> std::io::Result<()> {
         let now = self.smol_instant(Instant::now());
         self.clear_socket_egress_pending(handle);
+        let mut device_exhausted = false;
         loop {
             match self
                 .iface
                 .poll_egress_handle(now, &mut self.device, &mut self.sockets, handle)
             {
-                PollEgressHandleResult::SocketStateChanged => {
-                    self.device.flush_tx()?;
-                }
-                PollEgressHandleResult::None => {
-                    self.device.flush_tx()?;
-                    if let Some(next_due) = self.iface.poll_at_handle(now, &self.sockets, handle) {
-                        self.queue_egress_at(handle, next_due);
-                    }
-                    return Ok(());
-                }
+                PollEgressHandleResult::SocketStateChanged => {}
+                PollEgressHandleResult::None => break,
                 PollEgressHandleResult::DeviceExhausted => {
-                    let _ = self.device.flush_tx();
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        "DPDK TX device exhausted during best-effort socket egress flush",
-                    ));
+                    device_exhausted = true;
+                    break;
                 }
             }
         }
+
+        // Restore the handle's schedule before the only TX burst below can
+        // return WouldBlock. A globally exhausted device never closes a flow.
+        let poll_at = if device_exhausted {
+            None
+        } else {
+            self.iface.poll_at_handle(now, &self.sockets, handle)
+        };
+        if let Some(next_due) = socket_egress_retry_due(device_exhausted, now, poll_at) {
+            self.queue_egress_at(handle, next_due);
+        }
+
+        let flush_result = self.device.flush_tx();
+        if device_exhausted || flush_result.is_err() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "DPDK TX device has retained pending socket egress",
+            ));
+        }
+        Ok(())
+    }
+
+    fn report_infra_errors(&mut self, now: Instant) {
+        let device = self.device.error_counters();
+        if device.is_empty() && self.gateway_probe_errors.is_empty() {
+            return;
+        }
+        if self
+            .last_infra_error_log
+            .is_some_and(|last| now.saturating_duration_since(last) < INFRA_ERROR_LOG_INTERVAL)
+        {
+            return;
+        }
+
+        let device = self.device.take_error_counters();
+        let gateway = std::mem::take(&mut self.gateway_probe_errors);
+        self.last_infra_error_log = Some(now);
+        eprintln!(
+            "[tokio-dpdk] ERROR bounded infrastructure failures worker={} tx_mbuf_exhausted={} tx_pending_full={} tx_append_failed={} tx_burst_invalid={} rx_mbuf_invalid={} gateway_non_ethernet={} gateway_non_ipv4={} gateway_no_source={} gateway_dispatch_failed={} gateway_changed={}",
+            self.worker_index,
+            device.tx_mbuf_exhausted,
+            device.tx_pending_full,
+            device.tx_append_failed,
+            device.tx_burst_invalid,
+            device.rx_mbuf_invalid,
+            gateway.non_ethernet_medium,
+            gateway.non_ipv4_gateway,
+            gateway.no_source_address,
+            gateway.dispatch_failed,
+            gateway.gateway_changed,
+        );
     }
 
     fn poll_pending_egress(&mut self, now: SmolInstant) -> (PollResult, usize) {
@@ -1853,6 +1983,38 @@ mod tests {
     fn iface_flow_cache_matches_fixed_tcp_socket_capacity() {
         let config = dpdk_iface_config([0x02, 0, 0, 0, 0, 1]);
         assert_eq!(config.tcp_flow_cache_capacity, DEFAULT_BUFFER_POOL_SIZE);
+    }
+
+    #[test]
+    fn device_exhaustion_forces_immediate_socket_egress_retry() {
+        let now = SmolInstant::from_millis(100);
+        let later = SmolInstant::from_millis(500);
+        assert_eq!(
+            socket_egress_retry_due(true, now, Some(later)),
+            Some(now)
+        );
+        assert_eq!(
+            socket_egress_retry_due(false, now, Some(later)),
+            Some(later)
+        );
+        assert_eq!(socket_egress_retry_due(false, now, None), None);
+    }
+
+    #[test]
+    fn gateway_probe_failures_keep_typed_fixed_counters() {
+        let mut counters = GatewayProbeErrorCounters::default();
+        counters.record(GatewayNeighborProbeError::NonEthernetMedium);
+        counters.record(GatewayNeighborProbeError::NonIpv4Gateway);
+        counters.record(GatewayNeighborProbeError::NoSourceAddress);
+        counters.record(GatewayNeighborProbeError::DispatchFailed);
+        counters.record(GatewayNeighborProbeError::GatewayChanged);
+        counters.record(GatewayNeighborProbeError::GatewayChanged);
+
+        assert_eq!(counters.non_ethernet_medium, 1);
+        assert_eq!(counters.non_ipv4_gateway, 1);
+        assert_eq!(counters.no_source_address, 1);
+        assert_eq!(counters.dispatch_failed, 1);
+        assert_eq!(counters.gateway_changed, 2);
     }
 
     #[test]
