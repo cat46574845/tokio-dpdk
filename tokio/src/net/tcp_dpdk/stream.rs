@@ -87,18 +87,16 @@ impl Drop for PeekGuard<'_> {
 // The *const () is inherently !Send + !Sync
 // =============================================================================
 
-struct OutboundConnectGuard<C: FnOnce(SocketHandle, u16, usize)> {
+struct OutboundConnectGuard<C: FnOnce(SocketHandle, usize)> {
     handle: SocketHandle,
-    local_port: u16,
     core_id: usize,
     cleanup: Option<C>,
 }
 
-impl<C: FnOnce(SocketHandle, u16, usize)> OutboundConnectGuard<C> {
-    fn new(handle: SocketHandle, local_port: u16, core_id: usize, cleanup: C) -> Self {
+impl<C: FnOnce(SocketHandle, usize)> OutboundConnectGuard<C> {
+    fn new(handle: SocketHandle, core_id: usize, cleanup: C) -> Self {
         Self {
             handle,
-            local_port,
             core_id,
             cleanup: Some(cleanup),
         }
@@ -108,29 +106,25 @@ impl<C: FnOnce(SocketHandle, u16, usize)> OutboundConnectGuard<C> {
         self.handle
     }
 
-    fn disarm(mut self) -> (SocketHandle, u16) {
+    fn disarm(mut self) -> SocketHandle {
         self.cleanup = None;
-        (self.handle, self.local_port)
+        self.handle
     }
 }
 
-impl<C: FnOnce(SocketHandle, u16, usize)> Drop for OutboundConnectGuard<C> {
+impl<C: FnOnce(SocketHandle, usize)> Drop for OutboundConnectGuard<C> {
     fn drop(&mut self) {
         if let Some(cleanup) = self.cleanup.take() {
-            cleanup(self.handle, self.local_port, self.core_id);
+            cleanup(self.handle, self.core_id);
         }
     }
 }
 
-fn cleanup_outbound_connect(handle: SocketHandle, local_port: u16, core_id: usize) {
-    cleanup_socket_on_owner(handle, Some(local_port), core_id);
+fn cleanup_outbound_connect(handle: SocketHandle, core_id: usize) {
+    cleanup_socket_on_owner(handle, core_id);
 }
 
-fn cleanup_socket_on_owner(
-    handle: SocketHandle,
-    outbound_local_port: Option<u16>,
-    core_id: usize,
-) {
+fn cleanup_socket_on_owner(handle: SocketHandle, core_id: usize) {
     match current_worker_index() {
         Some(current) if current == core_id => {}
         Some(current) => {
@@ -149,13 +143,7 @@ fn cleanup_socket_on_owner(
         }
     }
 
-    match with_current_driver(|driver| {
-        let remove_result = driver.remove_socket(handle);
-        if let Some(port) = outbound_local_port {
-            driver.release_port(port);
-        }
-        remove_result
-    }) {
+    match with_current_driver(|driver| driver.remove_socket(handle)) {
         Some(Ok(())) => {}
         Some(Err(error)) => eprintln!(
             "[tokio-dpdk] ERROR socket cleanup failed handle={:?} error={}",
@@ -203,8 +191,6 @@ pub struct TcpDpdkStream {
     local_addr: Option<SocketAddr>,
     /// Peer address (cached)
     peer_addr: Option<SocketAddr>,
-    /// Local port owned by an outbound connect; accepted streams leave this empty.
-    outbound_local_port: Option<u16>,
     /// Read shutdown flag (smoltcp doesn't support half-close on read side)
     read_shutdown: Cell<bool>,
     /// Write shutdown flag — tracks whether we initiated close (FIN sent)
@@ -238,7 +224,6 @@ impl TcpDpdkStream {
             core_id,
             local_addr,
             peer_addr,
-            outbound_local_port: None,
             read_shutdown: Cell::new(false),
             write_shutdown: Cell::new(false),
             last_error: Cell::new(None),
@@ -294,7 +279,6 @@ impl TcpDpdkStream {
                 (
                     OutboundConnectGuard::new(
                         started.handle,
-                        started.local_addr.port(),
                         core_id,
                         cleanup_outbound_connect,
                     ),
@@ -379,14 +363,13 @@ impl TcpDpdkStream {
             crate::task::yield_now().await;
         }
 
-        let (handle, outbound_local_port) = connect_guard.disarm();
+        let handle = connect_guard.disarm();
 
         Ok(Self {
             handle,
             core_id,
             local_addr: Some(local_addr),
             peer_addr: Some(addr),
-            outbound_local_port: Some(outbound_local_port),
             read_shutdown: Cell::new(false),
             write_shutdown: Cell::new(false),
             last_error: Cell::new(None),
@@ -415,7 +398,6 @@ impl TcpDpdkStream {
                     (
                         OutboundConnectGuard::new(
                             started.handle,
-                            started.local_addr.port(),
                             core_id,
                             cleanup_outbound_connect,
                         ),
@@ -475,14 +457,13 @@ impl TcpDpdkStream {
             crate::task::yield_now().await;
         }
 
-        let (handle, outbound_local_port) = connect_guard.disarm();
+        let handle = connect_guard.disarm();
 
         Ok(Self {
             handle,
             core_id,
             local_addr: Some(result_local_addr),
             peer_addr: Some(remote_addr),
-            outbound_local_port: Some(outbound_local_port),
             read_shutdown: Cell::new(false),
             write_shutdown: Cell::new(false),
             last_error: Cell::new(None),
@@ -1551,11 +1532,7 @@ impl AsyncWrite for TcpDpdkStream {
 
 impl Drop for TcpDpdkStream {
     fn drop(&mut self) {
-        cleanup_socket_on_owner(
-            self.handle,
-            self.outbound_local_port.take(),
-            self.core_id,
-        );
+        cleanup_socket_on_owner(self.handle, self.core_id);
     }
 }
 
@@ -1566,7 +1543,6 @@ impl std::fmt::Debug for TcpDpdkStream {
             .field("core_id", &self.core_id)
             .field("local_addr", &self.local_addr)
             .field("peer_addr", &self.peer_addr)
-            .field("outbound_local_port", &self.outbound_local_port)
             .finish()
     }
 }
@@ -1593,7 +1569,7 @@ mod lifecycle_tests {
         fn assert_send<T: Send>() {}
         fn assert_send_sync<T: Send + Sync>() {}
 
-        assert_send_sync::<OutboundConnectGuard<fn(SocketHandle, u16, usize)>>();
+        assert_send_sync::<OutboundConnectGuard<fn(SocketHandle, usize)>>();
         assert_send_sync::<TcpDpdkStream>();
         assert_send_sync::<crate::net::tcp_dpdk::ReadHalf<'static>>();
         assert_send_sync::<crate::net::tcp_dpdk::WriteHalf<'static>>();
@@ -1632,22 +1608,21 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn pending_connect_guard_cleans_handle_and_port_on_drop() {
+    fn pending_connect_guard_returns_socket_ownership_on_drop() {
         let cleaned = Rc::new(RefCell::new(Vec::new()));
         let cleaned_by_drop = cleaned.clone();
         {
             let _guard = OutboundConnectGuard::new(
                 SocketHandle::default(),
-                50_000,
                 3,
-                move |handle, port, core| {
-                    cleaned_by_drop.borrow_mut().push((handle, port, core));
+                move |handle, core| {
+                    cleaned_by_drop.borrow_mut().push((handle, core));
                 },
             );
         }
         assert_eq!(
             cleaned.borrow().as_slice(),
-            &[(SocketHandle::default(), 50_000, 3)]
+            &[(SocketHandle::default(), 3)]
         );
     }
 
@@ -1657,24 +1632,11 @@ mod lifecycle_tests {
         let cleaned_by_drop = cleaned.clone();
         let guard = OutboundConnectGuard::new(
             SocketHandle::default(),
-            50_001,
             4,
-            move |_, _, _| *cleaned_by_drop.borrow_mut() = true,
+            move |_, _| *cleaned_by_drop.borrow_mut() = true,
         );
-        let (handle, port) = guard.disarm();
+        let handle = guard.disarm();
         assert_eq!(handle, SocketHandle::default());
-        assert_eq!(port, 50_001);
         assert!(!*cleaned.borrow());
-    }
-
-    #[test]
-    fn accepted_stream_does_not_own_listener_port() {
-        let stream = ManuallyDrop::new(TcpDpdkStream::from_handle(
-            SocketHandle::default(),
-            0,
-            None,
-            None,
-        ));
-        assert!(stream.outbound_local_port.is_none());
     }
 }

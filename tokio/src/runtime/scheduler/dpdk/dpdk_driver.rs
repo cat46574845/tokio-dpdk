@@ -48,6 +48,8 @@ const TCP_RX_BUFFER_SIZE: usize = 524288;
 
 /// Default TCP TX buffer size
 const TCP_TX_BUFFER_SIZE: usize = 65536;
+const TCP_EPHEMERAL_PORT_START: u16 = 49152;
+const TCP_EPHEMERAL_PORT_COUNT: u16 = 16384;
 
 const GATEWAY_SOFT_STALE_AFTER: SmolDuration = SmolDuration::from_secs(300);
 const INFRA_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -585,21 +587,25 @@ pub(crate) struct StartedTcpConnect {
     pub(crate) local_addr: SocketAddr,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ConnectResources {
-    handle: SocketHandle,
-    local_port: u16,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TcpFlowBinding {
+    local: IpEndpoint,
+    remote: IpEndpoint,
+}
+
+impl TcpFlowBinding {
+    fn new(local: IpEndpoint, remote: IpEndpoint) -> Self {
+        Self { local, remote }
+    }
 }
 
 trait ConnectResourceOwner {
     fn cleanup_connect_socket(&mut self, handle: SocketHandle) -> io::Result<()>;
-    fn cleanup_connect_port(&mut self, port: u16);
 }
 
 struct ConnectSetupGuard<'a, O: ConnectResourceOwner> {
     owner: &'a mut O,
     handle: SocketHandle,
-    local_port: Option<u16>,
     armed: bool,
 }
 
@@ -633,7 +639,6 @@ impl<'a, O: ConnectResourceOwner> ConnectSetupGuard<'a, O> {
         Self {
             owner,
             handle,
-            local_port: None,
             armed: true,
         }
     }
@@ -642,22 +647,9 @@ impl<'a, O: ConnectResourceOwner> ConnectSetupGuard<'a, O> {
         self.owner
     }
 
-    fn set_local_port(&mut self, port: u16) {
-        self.local_port = Some(port);
-    }
-
-    fn disarm(mut self) -> io::Result<ConnectResources> {
-        let Some(local_port) = self.local_port else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "TCP connect setup completed without owning a local port",
-            ));
-        };
+    fn disarm(mut self) -> SocketHandle {
         self.armed = false;
-        Ok(ConnectResources {
-            handle: self.handle,
-            local_port,
-        })
+        self.handle
     }
 }
 
@@ -671,9 +663,6 @@ impl<O: ConnectResourceOwner> Drop for ConnectSetupGuard<'_, O> {
                 "[tokio-dpdk] ERROR TCP connect setup failed to remove socket handle={:?} error={}",
                 self.handle, error
             );
-        }
-        if let Some(port) = self.local_port.take() {
-            self.owner.cleanup_connect_port(port);
         }
     }
 }
@@ -715,8 +704,12 @@ pub(crate) struct DpdkDriver {
     registered_sockets: HashSet<SocketHandle>,
     /// Pre-allocated buffer pool for TCP sockets (zero-allocation at runtime)
     buffer_pool: TcpBufferPool,
-    /// Set of bound ports to track address-in-use (since smoltcp doesn't expose this)
-    bound_ports: HashSet<u16>,
+    /// Exact TCP flows owned by live outbound and accepted sockets.
+    active_tcp_flows: HashSet<TcpFlowBinding>,
+    /// Socket-handle owner for each active TCP flow.
+    tcp_flow_by_handle: Box<[Option<TcpFlowBinding>]>,
+    /// Listener endpoints reserved by live listener pools.
+    bound_listeners: HashSet<IpListenEndpoint>,
     /// RSS-hash based lossy tail receiver for market-data flows.
     raw_tail: RawTailTable,
     /// Startup-allocated handoff from committed raw tails to shared egress.
@@ -740,10 +733,6 @@ pub(crate) struct DpdkDriver {
 impl ConnectResourceOwner for DpdkDriver {
     fn cleanup_connect_socket(&mut self, handle: SocketHandle) -> io::Result<()> {
         self.remove_socket(handle)
-    }
-
-    fn cleanup_connect_port(&mut self, port: u16) {
-        self.release_port(port);
     }
 }
 
@@ -834,7 +823,9 @@ impl DpdkDriver {
             start_time,
             registered_sockets: HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
             buffer_pool: TcpBufferPool::with_defaults(),
-            bound_ports: HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
+            active_tcp_flows: HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
+            tcp_flow_by_handle: vec![None; SOCKET_LIFECYCLE_CAPACITY].into_boxed_slice(),
+            bound_listeners: HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
             raw_tail: RawTailTable::new(worker_index, &raw_tail_rss_key),
             raw_tail_egress_handles: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
             pending_egress: PendingEgress::new(),
@@ -1478,17 +1469,17 @@ impl DpdkDriver {
         let mut setup = ConnectSetupGuard::new(self, handle);
         setup.owner_mut().register_socket(handle);
 
-        let local_port = setup.owner_mut().reserve_local_port(requested_port)?;
-        setup.set_local_port(local_port);
-        let local_endpoint = IpEndpoint::new(local_ip, local_port);
+        let binding = setup
+            .owner_mut()
+            .reserve_outbound_binding(handle, local_ip, requested_port, remote_endpoint)?;
         setup
             .owner_mut()
-            .tcp_connect(handle, remote_endpoint, local_endpoint)?;
-        let resources = setup.disarm()?;
+            .tcp_connect(handle, binding.remote, binding.local)?;
+        let handle = setup.disarm();
 
         Ok(StartedTcpConnect {
-            handle: resources.handle,
-            local_addr: SocketAddr::new(local_std_ip, resources.local_port),
+            handle,
+            local_addr: SocketAddr::new(local_std_ip, binding.local.port),
         })
     }
 
@@ -1534,6 +1525,11 @@ impl DpdkDriver {
         // SocketSet is exclusively borrowed and was validated immediately
         // above, so its panic-only invalid-handle branch is unreachable here.
         let socket = self.sockets.remove(handle);
+        release_tcp_flow_binding(
+            &mut self.active_tcp_flows,
+            &mut self.tcp_flow_by_handle,
+            handle,
+        );
         recycle_removed_socket(&mut self.buffer_pool, socket).map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -1836,88 +1832,192 @@ impl DpdkDriver {
         }
     }
 
-    /// Check if a port is already in use.
-    ///
-    /// This uses the internal bound_ports set since smoltcp doesn't reliably expose
-    /// listening port information.
-    pub(crate) fn is_port_in_use(&self, port: u16) -> bool {
-        self.bound_ports.contains(&port)
+    pub(crate) fn reserve_listener_binding(
+        &mut self,
+        endpoint: IpListenEndpoint,
+    ) -> io::Result<()> {
+        reserve_listener_binding(&mut self.bound_listeners, endpoint)
     }
 
-    /// Mark a port as bound (in use).
-    /// Should be called when a socket binds to a port.
-    pub(crate) fn bind_port(&mut self, port: u16) {
-        assert!(
-            self.bound_ports.contains(&port)
-                || self.bound_ports.len() < SOCKET_LIFECYCLE_CAPACITY,
-            "bound TCP ports cannot exceed the fixed DPDK lifecycle capacity"
-        );
-        self.bound_ports.insert(port);
+    pub(crate) fn release_listener_binding(&mut self, endpoint: IpListenEndpoint) {
+        self.bound_listeners.remove(&endpoint);
     }
 
-    /// Release a port (mark as no longer in use).
-    /// Should be called when a socket is closed.
-    pub(crate) fn release_port(&mut self, port: u16) {
-        self.bound_ports.remove(&port);
-    }
-
-    fn reserve_local_port(&mut self, requested_port: u16) -> io::Result<u16> {
+    fn reserve_outbound_binding(
+        &mut self,
+        handle: SocketHandle,
+        local_addr: IpAddress,
+        requested_port: u16,
+        remote: IpEndpoint,
+    ) -> io::Result<TcpFlowBinding> {
         if requested_port == 0 {
-            return self.allocate_ephemeral_port().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "No available ephemeral ports",
-                )
-            });
+            return self
+                .allocate_ephemeral_binding(handle, local_addr, remote)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "No available ephemeral TCP flow binding",
+                    )
+                });
         }
-        if !self.bound_ports.contains(&requested_port)
-            && self.bound_ports.len() >= SOCKET_LIFECYCLE_CAPACITY
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "fixed DPDK TCP port capacity exhausted",
-            ));
-        }
-        reserve_explicit_port(&mut self.bound_ports, requested_port)
+        let local = IpEndpoint::new(local_addr, requested_port);
+        reserve_exact_tcp_flow(
+            &mut self.active_tcp_flows,
+            &mut self.tcp_flow_by_handle,
+            handle,
+            TcpFlowBinding::new(local, remote),
+        )
     }
 
-    /// Allocate an ephemeral port that is not currently in use.
+    pub(crate) fn claim_established_tcp_flow(
+        &mut self,
+        handle: SocketHandle,
+    ) -> io::Result<()> {
+        let (local, remote) = {
+            let socket = self.get_tcp_socket_mut(handle);
+            let local = socket.local_endpoint().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "established TCP socket has no local endpoint",
+                )
+            })?;
+            let remote = socket.remote_endpoint().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "established TCP socket has no remote endpoint",
+                )
+            })?;
+            (local, remote)
+        };
+        reserve_exact_tcp_flow(
+            &mut self.active_tcp_flows,
+            &mut self.tcp_flow_by_handle,
+            handle,
+            TcpFlowBinding::new(local, remote),
+        )?;
+        Ok(())
+    }
+
+    /// Allocate an ephemeral port that does not duplicate the requested TCP flow.
     ///
     /// Uses time-based randomization with collision avoidance.
-    /// Returns None if no port is available after max attempts.
-    fn allocate_ephemeral_port(&mut self) -> Option<u16> {
+    /// Returns None if the complete ephemeral range has no available flow.
+    fn allocate_ephemeral_binding(
+        &mut self,
+        handle: SocketHandle,
+        local_addr: IpAddress,
+        remote: IpEndpoint,
+    ) -> Option<TcpFlowBinding> {
         use std::time::{SystemTime, UNIX_EPOCH};
-
-        // Ephemeral port range: 49152-65535 (16384 ports)
-        const EPHEMERAL_START: u16 = 49152;
-        const EPHEMERAL_RANGE: u16 = 16384;
-        const MAX_ATTEMPTS: u16 = 100;
 
         let base = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u16)
             .unwrap_or(12345);
-
-        for i in 0..MAX_ATTEMPTS {
-            let port = EPHEMERAL_START + ((base.wrapping_add(i)) % EPHEMERAL_RANGE);
-            if !self.is_port_in_use(port) {
-                self.bind_port(port); // Mark it as used immediately
-                return Some(port);
-            }
-        }
-
-        None
+        allocate_ephemeral_tcp_flow(
+            &mut self.active_tcp_flows,
+            &mut self.tcp_flow_by_handle,
+            handle,
+            local_addr,
+            remote,
+            base,
+        )
     }
 }
 
-fn reserve_explicit_port(bound_ports: &mut HashSet<u16>, port: u16) -> io::Result<u16> {
-    if !bound_ports.insert(port) {
+fn allocate_ephemeral_tcp_flow(
+    active_tcp_flows: &mut HashSet<TcpFlowBinding>,
+    tcp_flow_by_handle: &mut [Option<TcpFlowBinding>],
+    handle: SocketHandle,
+    local_addr: IpAddress,
+    remote: IpEndpoint,
+    start: u16,
+) -> Option<TcpFlowBinding> {
+    for offset in 0..TCP_EPHEMERAL_PORT_COUNT {
+        let port = TCP_EPHEMERAL_PORT_START
+            + (start.wrapping_add(offset) % TCP_EPHEMERAL_PORT_COUNT);
+        let binding = TcpFlowBinding::new(IpEndpoint::new(local_addr, port), remote);
+        if active_tcp_flows.contains(&binding) {
+            continue;
+        }
+        if active_tcp_flows.len() >= SOCKET_LIFECYCLE_CAPACITY {
+            return None;
+        }
+        active_tcp_flows.insert(binding);
+        tcp_flow_by_handle[handle.index()] = Some(binding);
+        return Some(binding);
+    }
+    None
+}
+
+fn reserve_exact_tcp_flow(
+    active_tcp_flows: &mut HashSet<TcpFlowBinding>,
+    tcp_flow_by_handle: &mut [Option<TcpFlowBinding>],
+    handle: SocketHandle,
+    binding: TcpFlowBinding,
+) -> io::Result<TcpFlowBinding> {
+    if active_tcp_flows.contains(&binding) {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
-            format!("local TCP port {} is already in use", port),
+            format!(
+                "TCP flow {} -> {} is already in use",
+                binding.local, binding.remote
+            ),
         ));
     }
-    Ok(port)
+    if active_tcp_flows.len() >= SOCKET_LIFECYCLE_CAPACITY {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "fixed DPDK TCP flow binding capacity exhausted",
+        ));
+    }
+    active_tcp_flows.insert(binding);
+    tcp_flow_by_handle[handle.index()] = Some(binding);
+    Ok(binding)
+}
+
+fn release_tcp_flow_binding(
+    active_tcp_flows: &mut HashSet<TcpFlowBinding>,
+    tcp_flow_by_handle: &mut [Option<TcpFlowBinding>],
+    handle: SocketHandle,
+) {
+    if let Some(binding) = tcp_flow_by_handle[handle.index()].take() {
+        active_tcp_flows.remove(&binding);
+    }
+}
+
+fn reserve_listener_binding(
+    bound_listeners: &mut HashSet<IpListenEndpoint>,
+    endpoint: IpListenEndpoint,
+) -> io::Result<()> {
+    if bound_listeners
+        .iter()
+        .copied()
+        .any(|bound| listener_bindings_conflict(bound, endpoint))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("TCP listener endpoint {} is already in use", endpoint),
+        ));
+    }
+    if bound_listeners.len() >= SOCKET_LIFECYCLE_CAPACITY {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "fixed DPDK TCP listener binding capacity exhausted",
+        ));
+    }
+    bound_listeners.insert(endpoint);
+    Ok(())
+}
+
+fn listener_bindings_conflict(left: IpListenEndpoint, right: IpListenEndpoint) -> bool {
+    if left.port != right.port {
+        return false;
+    }
+    match (left.addr, right.addr) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 #[inline(always)]
@@ -2114,17 +2214,12 @@ mod tests {
     #[derive(Default)]
     struct FakeConnectOwner {
         removed: Vec<SocketHandle>,
-        released: Vec<u16>,
     }
 
     impl ConnectResourceOwner for FakeConnectOwner {
         fn cleanup_connect_socket(&mut self, handle: SocketHandle) -> io::Result<()> {
             self.removed.push(handle);
             Ok(())
-        }
-
-        fn cleanup_connect_port(&mut self, port: u16) {
-            self.released.push(port);
         }
     }
 
@@ -2268,13 +2363,246 @@ mod tests {
     }
 
     #[test]
-    fn explicit_local_port_check_and_mark_is_atomic() {
-        let mut ports = HashSet::with_capacity(1);
-        assert_eq!(reserve_explicit_port(&mut ports, 50_000).unwrap(), 50_000);
-        let error = reserve_explicit_port(&mut ports, 50_000)
-            .expect_err("the second owner must not acquire the same port");
+    fn tcp_flow_identity_uses_both_endpoints() {
+        let handles = test_socket_handles(4);
+        let mut flows = HashSet::with_capacity(4);
+        let mut by_handle = vec![None; 4];
+        let local_a = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 1).into(), 50_000);
+        let local_b = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 2).into(), 50_000);
+        let remote_a = IpEndpoint::new(Ipv4Address::new(10, 0, 1, 1).into(), 443);
+        let remote_b = IpEndpoint::new(Ipv4Address::new(10, 0, 1, 2).into(), 443);
+        let first = TcpFlowBinding::new(local_a, remote_a);
+        let different_local_ip = TcpFlowBinding::new(local_b, remote_a);
+        let different_remote = TcpFlowBinding::new(local_a, remote_b);
+
+        reserve_exact_tcp_flow(&mut flows, &mut by_handle, handles[0], first)
+            .expect("first flow must reserve");
+        reserve_exact_tcp_flow(
+            &mut flows,
+            &mut by_handle,
+            handles[1],
+            different_local_ip,
+        )
+        .expect("same source port on a different local IP must reserve");
+        reserve_exact_tcp_flow(
+            &mut flows,
+            &mut by_handle,
+            handles[2],
+            different_remote,
+        )
+        .expect("same local endpoint to a different remote must reserve");
+
+        let error = reserve_exact_tcp_flow(
+            &mut flows,
+            &mut by_handle,
+            handles[3],
+            first,
+        )
+        .expect_err("an exact duplicate TCP flow must not replace its owner");
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
-        assert_eq!(ports.len(), 1);
+        assert_eq!(flows.len(), 3);
+        assert_eq!(by_handle[handles[3].index()], None);
+    }
+
+    #[test]
+    fn releasing_one_shared_port_flow_preserves_the_other() {
+        let handles = test_socket_handles(3);
+        let mut flows = HashSet::with_capacity(3);
+        let mut by_handle = vec![None; 3];
+        let local = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 1).into(), 50_000);
+        let first = TcpFlowBinding::new(
+            local,
+            IpEndpoint::new(Ipv4Address::new(10, 0, 1, 1).into(), 443),
+        );
+        let second = TcpFlowBinding::new(
+            local,
+            IpEndpoint::new(Ipv4Address::new(10, 0, 1, 2).into(), 443),
+        );
+
+        reserve_exact_tcp_flow(&mut flows, &mut by_handle, handles[0], first)
+            .expect("first flow must reserve");
+        reserve_exact_tcp_flow(&mut flows, &mut by_handle, handles[1], second)
+            .expect("second flow sharing the source port must reserve");
+        release_tcp_flow_binding(&mut flows, &mut by_handle, handles[0]);
+
+        assert!(!flows.contains(&first));
+        assert!(flows.contains(&second));
+        reserve_exact_tcp_flow(&mut flows, &mut by_handle, handles[2], first)
+            .expect("only the released exact flow must be reusable");
+        let error = reserve_exact_tcp_flow(
+            &mut flows,
+            &mut by_handle,
+            handles[0],
+            second,
+        )
+        .expect_err("the untouched flow must retain its owner");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn recycled_socket_handle_releases_each_exact_flow_owner() {
+        let handle = test_socket_handles(1)[0];
+        let mut flows = HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY);
+        let mut by_handle = vec![None; 1];
+        let local = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 1).into(), 50_000);
+        let first = TcpFlowBinding::new(
+            local,
+            IpEndpoint::new(Ipv4Address::new(10, 0, 1, 1).into(), 443),
+        );
+        let second = TcpFlowBinding::new(
+            local,
+            IpEndpoint::new(Ipv4Address::new(10, 0, 1, 2).into(), 443),
+        );
+
+        reserve_exact_tcp_flow(&mut flows, &mut by_handle, handle, first)
+            .expect("first handle lifetime must reserve");
+        release_tcp_flow_binding(&mut flows, &mut by_handle, handle);
+        reserve_exact_tcp_flow(&mut flows, &mut by_handle, handle, second)
+            .expect("recycled handle must reserve its new exact flow");
+        release_tcp_flow_binding(&mut flows, &mut by_handle, handle);
+
+        assert!(flows.is_empty());
+        assert_eq!(by_handle[handle.index()], None);
+    }
+
+    #[test]
+    fn tcp_flow_registry_stops_at_fixed_socket_capacity() {
+        let handles = test_socket_handles(SOCKET_LIFECYCLE_CAPACITY + 1);
+        let mut flows = HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY);
+        let mut by_handle = vec![None; SOCKET_LIFECYCLE_CAPACITY];
+        let local = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 1).into(), 50_000);
+        let remote_addr = Ipv4Address::new(10, 0, 1, 1);
+        for index in 0..SOCKET_LIFECYCLE_CAPACITY {
+            let binding = TcpFlowBinding::new(
+                local,
+                IpEndpoint::new(remote_addr.into(), 10_000 + index as u16),
+            );
+            reserve_exact_tcp_flow(
+                &mut flows,
+                &mut by_handle,
+                handles[index],
+                binding,
+            )
+            .expect("every fixed lifecycle slot must accept one distinct flow");
+        }
+        let overflow = TcpFlowBinding::new(
+            local,
+            IpEndpoint::new(remote_addr.into(), 20_000),
+        );
+        let error = reserve_exact_tcp_flow(
+            &mut flows,
+            &mut by_handle,
+            handles[SOCKET_LIFECYCLE_CAPACITY],
+            overflow,
+        )
+        .expect_err("the flow registry must not grow beyond socket capacity");
+        assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+        assert_eq!(flows.len(), SOCKET_LIFECYCLE_CAPACITY);
+        assert_eq!(by_handle.len(), SOCKET_LIFECYCLE_CAPACITY);
+    }
+
+    #[test]
+    fn ephemeral_allocator_scans_past_first_hundred_collisions() {
+        let handles = test_socket_handles(101);
+        let mut flows = HashSet::with_capacity(101);
+        let mut by_handle = vec![None; 101];
+        let local_addr = IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1));
+        let remote = IpEndpoint::new(Ipv4Address::new(10, 0, 1, 1).into(), 443);
+        for offset in 0..100u16 {
+            let binding = TcpFlowBinding::new(
+                IpEndpoint::new(local_addr, TCP_EPHEMERAL_PORT_START + offset),
+                remote,
+            );
+            reserve_exact_tcp_flow(
+                &mut flows,
+                &mut by_handle,
+                handles[offset as usize],
+                binding,
+            )
+            .expect("test collision window must reserve");
+        }
+
+        let selected = allocate_ephemeral_tcp_flow(
+            &mut flows,
+            &mut by_handle,
+            handles[100],
+            local_addr,
+            remote,
+            0,
+        )
+        .expect("allocator must continue beyond the old 100-attempt cutoff");
+        assert_eq!(selected.local.port, TCP_EPHEMERAL_PORT_START + 100);
+    }
+
+    #[test]
+    fn listener_bindings_use_local_ip_and_wildcard_overlap() {
+        let port = 50_000;
+        let specific_a = IpListenEndpoint {
+            addr: Some(Ipv4Address::new(10, 0, 0, 1).into()),
+            port,
+        };
+        let specific_b = IpListenEndpoint {
+            addr: Some(Ipv4Address::new(10, 0, 0, 2).into()),
+            port,
+        };
+        let specific_v6 = IpListenEndpoint {
+            addr: Some(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into()),
+            port,
+        };
+        let wildcard = IpListenEndpoint { addr: None, port };
+        let mut listeners = HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY);
+
+        reserve_listener_binding(&mut listeners, specific_a)
+            .expect("first specific listener must reserve");
+        reserve_listener_binding(&mut listeners, specific_b)
+            .expect("same port on a different local IP must reserve");
+        reserve_listener_binding(&mut listeners, specific_v6)
+            .expect("same port on a specific IPv6 address must reserve independently");
+        let duplicate = reserve_listener_binding(&mut listeners, specific_a)
+            .expect_err("an exact listener duplicate must fail");
+        assert_eq!(duplicate.kind(), io::ErrorKind::AddrInUse);
+        let wildcard_error = reserve_listener_binding(&mut listeners, wildcard)
+            .expect_err("wildcard listener must overlap every specific local IP");
+        assert_eq!(wildcard_error.kind(), io::ErrorKind::AddrInUse);
+
+        listeners.clear();
+        reserve_listener_binding(&mut listeners, wildcard)
+            .expect("wildcard listener must reserve on an empty port");
+        let specific_error = reserve_listener_binding(&mut listeners, specific_a)
+            .expect_err("specific listener must overlap an existing wildcard");
+        assert_eq!(specific_error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn listener_rebind_is_independent_from_established_flow_lifetime() {
+        let handle = test_socket_handles(1)[0];
+        let mut listeners = HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY);
+        let mut flows = HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY);
+        let mut by_handle = vec![None; 1];
+        let local = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 1).into(), 50_000);
+        let endpoint = IpListenEndpoint {
+            addr: Some(local.addr),
+            port: local.port,
+        };
+        let accepted = TcpFlowBinding::new(
+            local,
+            IpEndpoint::new(Ipv4Address::new(10, 0, 1, 1).into(), 443),
+        );
+
+        reserve_listener_binding(&mut listeners, endpoint)
+            .expect("initial listener must reserve");
+        reserve_exact_tcp_flow(&mut flows, &mut by_handle, handle, accepted)
+            .expect("accepted flow must coexist with its listener");
+        listeners.remove(&endpoint);
+        reserve_listener_binding(&mut listeners, endpoint)
+            .expect("listener must rebind while the accepted flow remains alive");
+        release_tcp_flow_binding(&mut flows, &mut by_handle, handle);
+
+        assert!(!flows.contains(&accepted));
+        assert!(listeners.contains(&endpoint));
+        let duplicate = reserve_listener_binding(&mut listeners, endpoint)
+            .expect_err("accepted flow release must not release the rebound listener");
+        assert_eq!(duplicate.kind(), io::ErrorKind::AddrInUse);
     }
 
     #[test]
@@ -2428,34 +2756,56 @@ mod tests {
     }
 
     #[test]
-    fn connect_setup_guard_releases_every_acquired_resource() {
+    fn smoltcp_accepts_shared_local_endpoint_for_distinct_remotes() {
+        let mut device = Loopback::new(Medium::Ethernet);
+        let config = dpdk_iface_config([0x02, 0, 0, 0, 0, 1]);
+        let mut iface = Interface::new(config, &mut device, SmolInstant::ZERO);
+        let mut sockets = SocketSet::new(Vec::with_capacity(2));
+        let first = sockets.add(TcpSocket::new(
+            LinearBuffer::with_reserve(vec![0; 64], 8),
+            LinearBuffer::with_reserve(vec![0; 64], 8),
+        ));
+        let second = sockets.add(TcpSocket::new(
+            LinearBuffer::with_reserve(vec![0; 64], 8),
+            LinearBuffer::with_reserve(vec![0; 64], 8),
+        ));
+        let local = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 1).into(), 50_000);
+        let remote_a = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 2).into(), 443);
+        let remote_b = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 3).into(), 443);
+
+        connect_socket_and_register_flow(&mut iface, &mut sockets, first, remote_a, local)
+            .expect("first remote must register");
+        connect_socket_and_register_flow(&mut iface, &mut sockets, second, remote_b, local)
+            .expect("second remote sharing the local endpoint must register");
+        assert_eq!(
+            sockets
+                .get::<TcpSocket<'_, LinearBuffer<'_>>>(first)
+                .state(),
+            smoltcp::socket::tcp::State::SynSent
+        );
+        assert_eq!(
+            sockets
+                .get::<TcpSocket<'_, LinearBuffer<'_>>>(second)
+                .state(),
+            smoltcp::socket::tcp::State::SynSent
+        );
+        assert!(iface.unregister_tcp_flow(first));
+        assert!(iface.unregister_tcp_flow(second));
+    }
+
+    #[test]
+    fn connect_setup_guard_transfers_socket_removal_ownership() {
         let handle = SocketHandle::default();
         let mut owner = FakeConnectOwner::default();
         {
             let _guard = ConnectSetupGuard::new(&mut owner, handle);
         }
         assert_eq!(owner.removed, vec![handle]);
-        assert!(owner.released.is_empty());
 
         owner.removed.clear();
-        {
-            let mut guard = ConnectSetupGuard::new(&mut owner, handle);
-            guard.set_local_port(50_001);
-        }
-        assert_eq!(owner.removed, vec![handle]);
-        assert_eq!(owner.released, vec![50_001]);
-
-        owner.removed.clear();
-        owner.released.clear();
-        let resources = {
-            let mut guard = ConnectSetupGuard::new(&mut owner, handle);
-            guard.set_local_port(50_002);
-            guard.disarm().expect("complete setup must transfer ownership")
-        };
-        assert_eq!(resources.handle, handle);
-        assert_eq!(resources.local_port, 50_002);
+        let transferred = ConnectSetupGuard::new(&mut owner, handle).disarm();
+        assert_eq!(transferred, handle);
         assert!(owner.removed.is_empty());
-        assert!(owner.released.is_empty());
     }
 
     #[test]

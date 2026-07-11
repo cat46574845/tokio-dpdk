@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::task::{Context, Poll};
 
 use smoltcp::iface::SocketHandle;
+use smoltcp::wire::IpListenEndpoint;
 
 use super::stream::TcpDpdkStream;
 use crate::net::{to_socket_addrs, ToSocketAddrs};
@@ -38,16 +39,20 @@ struct ListenerInner {
 
 struct ListenerBindGuard {
     listen_pool: VecDeque<ListenSocket>,
-    port: u16,
+    endpoint: IpListenEndpoint,
     core_id: usize,
     armed: bool,
 }
 
 impl ListenerBindGuard {
-    fn new(listen_pool: VecDeque<ListenSocket>, port: u16, core_id: usize) -> Self {
+    fn new(
+        listen_pool: VecDeque<ListenSocket>,
+        endpoint: IpListenEndpoint,
+        core_id: usize,
+    ) -> Self {
         Self {
             listen_pool,
-            port,
+            endpoint,
             core_id,
             armed: true,
         }
@@ -72,7 +77,7 @@ impl Drop for ListenerBindGuard {
             );
             return;
         }
-        let port = self.port;
+        let endpoint = self.endpoint;
         let listen_pool = &mut self.listen_pool;
         if with_current_driver(|driver| {
             for listen_socket in listen_pool.drain(..) {
@@ -83,7 +88,7 @@ impl Drop for ListenerBindGuard {
                     );
                 }
             }
-            driver.release_port(port);
+            driver.release_listener_binding(endpoint);
         })
         .is_none()
         {
@@ -194,7 +199,7 @@ impl TcpDpdkListener {
         })?;
 
         // Allocate listener-owned metadata before acquiring the worker-local
-        // port so an allocation failure cannot strand that port.
+        // endpoint so an allocation failure cannot strand that binding.
         let mut listen_pool = VecDeque::new();
         listen_pool.try_reserve_exact(backlog).map_err(|error| {
             io::Error::new(
@@ -206,24 +211,15 @@ impl TcpDpdkListener {
             )
         })?;
 
-        // Check if port is already in use
-        let port = addr.port();
+        let endpoint = Self::listen_endpoint(addr);
         with_current_driver(|driver| {
-            if driver.is_port_in_use(port) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!("Address {}:{} already in use", addr.ip(), port),
-                ));
-            }
-            // Mark port as bound
-            driver.bind_port(port);
-            Ok(())
+            driver.reserve_listener_binding(endpoint)
         })
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to access DPDK driver"))??;
 
         // From this point every early return removes all sockets and releases
-        // the bound port on this same worker.
-        let mut setup = ListenerBindGuard::new(listen_pool, port, core_id);
+        // the listener endpoint on this same worker.
+        let mut setup = ListenerBindGuard::new(listen_pool, endpoint, core_id);
 
         // Create at least one listen socket, up to backlog size
         let initial_count = backlog.min(8); // Start with 8, grow on demand
@@ -464,6 +460,15 @@ impl TcpDpdkListener {
             })
             .flatten()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "No remote endpoint"))?;
+            with_current_driver(|driver| {
+                driver.claim_established_tcp_flow(connected_handle)
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "Failed to access DPDK driver while claiming accepted TCP flow",
+                )
+            })??;
 
             // No fallible operation remains before ownership transfers to the
             // stream, so removing the pool entry cannot leak the handle.
@@ -563,7 +568,7 @@ impl Drop for TcpDpdkListener {
             return;
         }
 
-        let port = self.local_addr.port();
+        let endpoint = Self::listen_endpoint(self.local_addr);
         let mut inner = self.inner.borrow_mut();
         if with_current_driver(|driver| {
             if let Some(waiter) = inner.buffer_waiter.take() {
@@ -582,7 +587,7 @@ impl Drop for TcpDpdkListener {
                     );
                 }
             }
-            driver.release_port(port);
+            driver.release_listener_binding(endpoint);
         })
         .is_none()
         {
