@@ -37,7 +37,6 @@ pub(crate) const SPAN_DPDK_SMOLTCP_INGRESS: u16 = 123;
 pub(crate) const SPAN_DPDK_SMOLTCP_EGRESS: u16 = 124;
 pub(crate) const SPAN_DPDK_SMOLTCP_POLL_AT_HANDLE: u16 = 125;
 pub(crate) const SPAN_DPDK_SMOLTCP_TCP_LOOKUP: u16 = 126;
-pub(crate) const SPAN_DPDK_RAW_TAIL_RECORD_DETAIL: u16 = 127;
 pub(crate) const COUNTER_DPDK_QUEUE_TOTAL_DEPTH: u16 = 130;
 pub(crate) const COUNTER_DPDK_RUN_QUEUE_DEPTH: u16 = 131;
 pub(crate) const COUNTER_DPDK_OVERFLOW_DEPTH: u16 = 132;

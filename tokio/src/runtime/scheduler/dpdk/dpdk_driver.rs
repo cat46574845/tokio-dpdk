@@ -30,7 +30,10 @@ use smoltcp::wire::{
 };
 
 use super::device::DpdkDevice;
-use super::raw_tail::{RawTailHandle, RawTailRecord, RawTailTable, RawTailTuple};
+use super::raw_tail::{
+    RawTailHandle, RawTailParserBinding, RawTailTable, RawTailTuple,
+    RAW_TAIL_CONNECTION_CAP,
+};
 use super::{DpdkRuntimeId, WorkerIdentity};
 
 // =============================================================================
@@ -585,6 +588,8 @@ pub(crate) struct DpdkDriver {
     bound_ports: HashSet<u16>,
     /// RSS-hash based lossy tail receiver for market-data flows.
     raw_tail: RawTailTable,
+    /// Startup-allocated handoff for raw-tail ACKs that hit DeviceExhausted.
+    raw_tail_exhausted_handles: Vec<SocketHandle>,
     /// Min-heap of socket handles with pending smoltcp egress work and their due time.
     pending_egress_heap: Vec<(SmolInstant, SocketHandle)>,
     /// Dense handle-index to pending_egress_heap slot map. PENDING_EGRESS_NONE means absent.
@@ -704,6 +709,7 @@ impl DpdkDriver {
                 WorkerIdentity::new(runtime_id, worker_index),
                 &raw_tail_rss_key,
             ),
+            raw_tail_exhausted_handles: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
             pending_egress_heap: Vec::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
             pending_egress_pos: vec![PENDING_EGRESS_NONE; DEFAULT_BUFFER_POOL_SIZE],
             ingress_touched: Vec::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
@@ -774,7 +780,18 @@ impl DpdkDriver {
         } else {
             0
         };
-        self.raw_tail.finish_drain(&mut self.device);
+        self.raw_tail.finish_drain(
+            smol_now,
+            &mut self.iface,
+            &mut self.sockets,
+            &mut self.device,
+            self.gateway_neighbor_configured,
+            &mut self.raw_tail_exhausted_handles,
+        );
+        for index in 0..self.raw_tail_exhausted_handles.len() {
+            let handle = self.raw_tail_exhausted_handles[index];
+            self.queue_egress_at(handle, smol_now);
+        }
         #[cfg(feature = "market-trace")]
         let flush_acks_dur_ns = if trace_poll {
             crate::runtime::market_trace::now_ns().saturating_sub(flush_acks_start_ns)
@@ -987,13 +1004,25 @@ impl DpdkDriver {
             Default::default()
         };
         #[cfg(not(feature = "market-trace"))]
-        let _ = self.device.flush_tx();
+        let flush_tx_after_complete = self.device.flush_tx().is_ok();
+        #[cfg(feature = "market-trace")]
+        let flush_tx_after_complete = !self.device.has_pending_tx();
         #[cfg(feature = "market-trace")]
         let flush_tx_after_dur_ns = if trace_flush_tx_after {
             crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_after_start_ns)
         } else {
             0
         };
+
+        self.raw_tail_exhausted_handles.clear();
+        self.raw_tail.complete_egress_flush(
+            flush_tx_after_complete,
+            &mut self.raw_tail_exhausted_handles,
+        );
+        for index in 0..self.raw_tail_exhausted_handles.len() {
+            let handle = self.raw_tail_exhausted_handles[index];
+            self.queue_egress_at(handle, smol_now);
+        }
 
         // Note: dispatch_wakers() is no longer needed!
         // smoltcp's native waker mechanism handles wakeups internally.
@@ -1135,25 +1164,6 @@ impl DpdkDriver {
         self.buffer_pool.reclaim_listener_waiters();
     }
 
-    pub(crate) fn activate_raw_tail_for_socket(
-        &mut self,
-        handle: SocketHandle,
-    ) -> std::io::Result<RawTailHandle> {
-        let socket = self.get_tcp_socket_mut(handle);
-        let local = socket.local_endpoint().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotConnected, "socket has no local endpoint")
-        })?;
-        let remote = socket.remote_endpoint().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotConnected, "socket has no remote endpoint")
-        })?;
-        let local_addr = endpoint_to_socket_addr(local)?;
-        let remote_addr = endpoint_to_socket_addr(remote)?;
-        let tuple = RawTailTuple::from_addrs(local_addr, remote_addr)?;
-        let raw_tail = self.raw_tail.register(tuple)?;
-        self.raw_tail.activate(raw_tail)?;
-        Ok(raw_tail)
-    }
-
     pub(crate) fn reserve_raw_tail(
         &mut self,
         local_addr: std::net::SocketAddr,
@@ -1163,21 +1173,73 @@ impl DpdkDriver {
         self.raw_tail.register(tuple)
     }
 
-    pub(crate) fn activate_raw_tail(&mut self, handle: RawTailHandle) -> std::io::Result<()> {
-        self.raw_tail.activate(handle)
+    pub(crate) fn activate_raw_tail_parser(
+        &mut self,
+        raw_tail: RawTailHandle,
+        socket_handle: SocketHandle,
+        parser: RawTailParserBinding,
+    ) -> std::io::Result<()> {
+        if raw_tail.owner() != self.raw_tail.owner() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "raw-tail handle does not belong to this driver runtime and worker",
+            ));
+        }
+        validate_socket_for_removal(&self.sockets, &self.registered_sockets, socket_handle)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("raw-tail socket validation failed: {}", error),
+                )
+            })?;
+        let socket = self
+            .sockets
+            .iter()
+            .find_map(|(candidate, socket)| {
+                if candidate != socket_handle {
+                    return None;
+                }
+                match socket {
+                    SmolSocket::Tcp(socket) => Some(socket),
+                    _ => None,
+                }
+            })
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "raw-tail activation socket is not a live TCP socket",
+                )
+            })?;
+        let local = socket.local_endpoint().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "TcpDpdkStream socket has no local endpoint",
+            )
+        })?;
+        let remote = socket.remote_endpoint().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "TcpDpdkStream socket has no remote endpoint",
+            )
+        })?;
+        let actual_tuple = RawTailTuple::from_addrs(
+            endpoint_to_socket_addr(local)?,
+            endpoint_to_socket_addr(remote)?,
+        )?;
+        self.raw_tail
+            .activate_parser(raw_tail, actual_tuple, socket_handle, parser)
     }
 
     pub(crate) fn unregister_raw_tail(&mut self, handle: RawTailHandle) -> std::io::Result<()> {
         self.raw_tail.unregister(handle)
     }
 
-    pub(crate) fn poll_raw_tail_record<R>(
+    pub(crate) fn poll_raw_tail_publication_ready(
         &mut self,
         handle: RawTailHandle,
         cx: &mut std::task::Context<'_>,
-        consume: impl for<'record> FnOnce(RawTailRecord<'record>) -> R,
-    ) -> std::task::Poll<std::io::Result<R>> {
-        self.raw_tail.poll_record(handle, cx, consume)
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.raw_tail.poll_publication_ready(handle, cx)
     }
 
     /// Create a new TCP socket using pre-allocated buffers from the pool.
@@ -1347,6 +1409,10 @@ impl DpdkDriver {
     pub(crate) fn remove_socket(&mut self, handle: SocketHandle) -> io::Result<()> {
         validate_socket_for_removal(&self.sockets, &self.registered_sockets, handle)?;
 
+        // Invalidate any non-owning raw-tail parser/socket capabilities before
+        // SocketSet can recycle this numeric handle for another connection.
+        self.raw_tail.detach_socket(handle);
+
         if !self.registered_sockets.remove(&handle) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1380,6 +1446,7 @@ impl DpdkDriver {
             || self.device.has_pending_tx()
             || self.device.has_unprocessed_rx_pending()
             || !self.device.error_counters().is_empty()
+            || !self.raw_tail.error_counters().is_empty()
             || !self.gateway_probe_errors.is_empty()
     }
 
@@ -1397,7 +1464,9 @@ impl DpdkDriver {
                 .iface
                 .poll_egress_handle(now, &mut self.device, &mut self.sockets, handle)
             {
-                PollEgressHandleResult::SocketStateChanged => {}
+                PollEgressHandleResult::SocketStateChanged => {
+                    self.raw_tail.mark_socket_egress_queued(handle);
+                }
                 PollEgressHandleResult::None => break,
                 PollEgressHandleResult::DeviceExhausted => {
                     device_exhausted = true;
@@ -1429,7 +1498,8 @@ impl DpdkDriver {
 
     fn report_infra_errors(&mut self, now: Instant) {
         let device = self.device.error_counters();
-        if device.is_empty() && self.gateway_probe_errors.is_empty() {
+        let raw_tail = self.raw_tail.error_counters();
+        if device.is_empty() && raw_tail.is_empty() && self.gateway_probe_errors.is_empty() {
             return;
         }
         if self
@@ -1440,16 +1510,24 @@ impl DpdkDriver {
         }
 
         let device = self.device.take_error_counters();
+        let raw_tail = self.raw_tail.take_error_counters();
         let gateway = std::mem::take(&mut self.gateway_probe_errors);
         self.last_infra_error_log = Some(now);
         eprintln!(
-            "[tokio-dpdk] ERROR bounded infrastructure failures worker={} tx_mbuf_exhausted={} tx_pending_full={} tx_append_failed={} tx_burst_invalid={} rx_mbuf_invalid={} gateway_non_ethernet={} gateway_non_ipv4={} gateway_no_source={} gateway_dispatch_failed={} gateway_changed={}",
+            "[tokio-dpdk] ERROR bounded infrastructure failures worker={} tx_mbuf_exhausted={} tx_pending_full={} tx_append_failed={} tx_burst_invalid={} rx_mbuf_invalid={} raw_tail_ordinal_overflow={} raw_tail_pending_full={} raw_tail_packet_parse={} raw_tail_tuple_mismatch={} raw_tail_tcp_state={} raw_tail_tls_tail_missing={} raw_tail_parser_input={} gateway_non_ethernet={} gateway_non_ipv4={} gateway_no_source={} gateway_dispatch_failed={} gateway_changed={}",
             self.worker_index,
             device.tx_mbuf_exhausted,
             device.tx_pending_full,
             device.tx_append_failed,
             device.tx_burst_invalid,
             device.rx_mbuf_invalid,
+            raw_tail.packet_ordinal_overflow,
+            raw_tail.pending_capacity_exceeded,
+            raw_tail.packet_parse_failed,
+            raw_tail.tuple_mismatch,
+            raw_tail.tcp_state_rejected,
+            raw_tail.tls_tail_not_found,
+            raw_tail.parser_input_invalid,
             gateway.non_ethernet_medium,
             gateway.non_ipv4_gateway,
             gateway.no_source_address,
@@ -1477,6 +1555,7 @@ impl DpdkDriver {
                 .poll_egress_handle(now, &mut self.device, &mut self.sockets, handle)
             {
                 PollEgressHandleResult::SocketStateChanged => {
+                    self.raw_tail.mark_socket_egress_queued(handle);
                     result = PollResult::SocketStateChanged;
                 }
                 PollEgressHandleResult::None => {}

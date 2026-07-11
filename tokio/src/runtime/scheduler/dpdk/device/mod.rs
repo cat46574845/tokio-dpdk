@@ -9,7 +9,7 @@ use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, M
 use smoltcp::time::Instant as SmolInstant;
 
 use super::ffi;
-use super::raw_tail::{ParsedTcpPacket, RawTailTable, RAW_TAIL_REQUIRED_RSS_HF};
+use super::raw_tail::{RawTailTable, RAW_TAIL_REQUIRED_RSS_HF};
 
 // =============================================================================
 // Configuration constants
@@ -23,6 +23,9 @@ const TX_PENDING_CAP: usize = 32;
 
 /// Default MTU (Maximum Transmission Unit)
 const DEFAULT_MTU: usize = 1500;
+
+// DPDK rte_mbuf_core.h: hash.rss is valid only with this RX offload flag.
+const RTE_MBUF_F_RX_RSS_HASH: u64 = 1u64 << 1;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DrainRxStats {
@@ -228,7 +231,7 @@ fn load_actual_rss_key(port_id: u16) -> io::Result<Box<[u8]>> {
 /// The owner is deliberately retained while a smoltcp token closure executes,
 /// so unwinding frees the mbuf instead of leaking it. `into_raw` is used only
 /// when ownership moves to the device TX pending vector.
-struct OwnedMbuf {
+pub(crate) struct OwnedMbuf {
     ptr: NonNull<ffi::rte_mbuf>,
 }
 
@@ -239,13 +242,40 @@ impl OwnedMbuf {
     }
 
     #[inline(always)]
-    unsafe fn from_received(ptr: *mut ffi::rte_mbuf) -> Option<Self> {
+    pub(crate) unsafe fn from_received(ptr: *mut ffi::rte_mbuf) -> Option<Self> {
         NonNull::new(ptr).map(|ptr| Self { ptr })
     }
 
     #[inline(always)]
-    fn as_ptr(&self) -> *mut ffi::rte_mbuf {
+    pub(crate) fn as_ptr(&self) -> *mut ffi::rte_mbuf {
         self.ptr.as_ptr()
+    }
+
+    /// Read only the NIC-provided RSS metadata. The raw-tail drain uses this
+    /// before deciding whether this is the one retained packet for a flow.
+    #[inline(always)]
+    pub(crate) fn rss_hash(&self) -> Option<u32> {
+        let mbuf = self.ptr.as_ptr();
+        if !rss_hash_metadata_is_valid(unsafe { (*mbuf).ol_flags }) {
+            return None;
+        }
+        Some(unsafe { (*mbuf).__bindgen_anon_2.hash.rss })
+    }
+
+    /// Borrow one contiguous received frame for the selected-tail parser.
+    /// Superseded mbufs are dropped without calling this method.
+    #[inline(always)]
+    pub(crate) fn data(&self) -> Option<&[u8]> {
+        let mbuf = self.ptr.as_ptr();
+        if unsafe { (*mbuf).nb_segs } != 1 {
+            return None;
+        }
+        let ptr = unsafe { dpdk_wrappers::pktmbuf_mtod(mbuf) };
+        let len = unsafe { (*mbuf).data_len as usize };
+        if ptr.is_null() || len == 0 {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
     }
 
     #[inline(always)]
@@ -259,11 +289,16 @@ impl OwnedMbuf {
     }
 
     #[inline(always)]
-    fn into_raw(self) -> *mut ffi::rte_mbuf {
+    pub(crate) fn into_raw(self) -> *mut ffi::rte_mbuf {
         let ptr = self.ptr.as_ptr();
         std::mem::forget(self);
         ptr
     }
+}
+
+#[inline(always)]
+fn rss_hash_metadata_is_valid(ol_flags: u64) -> bool {
+    ol_flags & RTE_MBUF_F_RX_RSS_HASH != 0
 }
 
 impl Drop for OwnedMbuf {
@@ -429,12 +464,26 @@ impl DpdkDevice {
                 // Classify this NIC burst immediately in its natural order.
                 // In particular, a superseded raw-tail mbuf is freed by
                 // capture_mbuf before the next burst is requested.
-                for &mbuf in &self.rx_burst_buf[..n as usize] {
-                    if !raw_tail.is_empty() && raw_tail.capture_mbuf(mbuf) {
-                        stats.raw_tail_captured += 1;
+                for &raw_mbuf in &self.rx_burst_buf[..n as usize] {
+                    let Some(mbuf) = (unsafe { OwnedMbuf::from_received(raw_mbuf) }) else {
+                        self.error_counters.rx_mbuf_invalid = self
+                            .error_counters
+                            .rx_mbuf_invalid
+                            .saturating_add(1);
                         continue;
-                    }
-                    self.rx_pending.push(mbuf);
+                    };
+                    let mbuf = if raw_tail.is_empty() {
+                        mbuf
+                    } else {
+                        match raw_tail.capture_mbuf(mbuf) {
+                            Ok(()) => {
+                                stats.raw_tail_captured += 1;
+                                continue;
+                            }
+                            Err(mbuf) => mbuf,
+                        }
+                    };
+                    self.rx_pending.push(mbuf.into_raw());
                     stats.smoltcp_pending += 1;
                 }
             }
@@ -515,16 +564,6 @@ impl DpdkDevice {
     }
 
     #[inline(always)]
-    pub(crate) unsafe fn free_mbuf(mbuf: *mut ffi::rte_mbuf) {
-        unsafe { dpdk_wrappers::pktmbuf_free(mbuf) }
-    }
-
-    #[inline(always)]
-    pub(crate) unsafe fn mbuf_data_ptr(mbuf: *mut ffi::rte_mbuf) -> *mut u8 {
-        unsafe { dpdk_wrappers::pktmbuf_mtod(mbuf) }
-    }
-
-    #[inline(always)]
     fn try_reserve_tx_mbuf(&mut self) -> Option<OwnedMbuf> {
         if self.tx_buffer.len() >= TX_PENDING_CAP {
             self.error_counters.tx_pending_full = self
@@ -543,87 +582,6 @@ impl DpdkDevice {
         mbuf
     }
 
-    fn try_enqueue_tx_packet(
-        &mut self,
-        len: usize,
-        emit: impl FnOnce(&mut [u8]),
-    ) -> bool {
-        let Some(mut mbuf) = self.try_reserve_tx_mbuf() else {
-            return false;
-        };
-        let Some(data) = mbuf.append(len) else {
-            self.error_counters.tx_append_failed = self
-                .error_counters
-                .tx_append_failed
-                .saturating_add(1);
-            return false;
-        };
-        emit(data);
-        self.tx_buffer.push(mbuf.into_raw());
-        true
-    }
-
-    pub(crate) fn send_raw_tcp_ack(&mut self, pkt: &ParsedTcpPacket<'_>, seq: u32, ack: u32) {
-        const ACK_PACKET_LEN: usize = 14 + 20 + 20;
-        let _queued = self.try_enqueue_tx_packet(ACK_PACKET_LEN, |data| {
-            data[..6].copy_from_slice(&pkt.eth_src);
-            data[6..12].copy_from_slice(&pkt.eth_dst);
-            data[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-
-            let ip = &mut data[14..34];
-            ip[0] = 0x45;
-            ip[1] = 0;
-            ip[2..4].copy_from_slice(&(40u16).to_be_bytes());
-            ip[4..6].copy_from_slice(&0u16.to_be_bytes());
-            ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
-            ip[8] = 64;
-            ip[9] = 6;
-            ip[10..12].copy_from_slice(&0u16.to_be_bytes());
-            ip[12..16].copy_from_slice(&pkt.local_ip.octets());
-            ip[16..20].copy_from_slice(&pkt.remote_ip.octets());
-            let ip_sum = internet_checksum(ip);
-            ip[10..12].copy_from_slice(&ip_sum.to_be_bytes());
-
-            let tcp = &mut data[34..54];
-            tcp[0..2].copy_from_slice(&pkt.local_port.to_be_bytes());
-            tcp[2..4].copy_from_slice(&pkt.remote_port.to_be_bytes());
-            tcp[4..8].copy_from_slice(&seq.to_be_bytes());
-            tcp[8..12].copy_from_slice(&ack.to_be_bytes());
-            tcp[12] = 5u8 << 4;
-            tcp[13] = 0x10;
-            tcp[14..16].copy_from_slice(&65535u16.to_be_bytes());
-            tcp[16..18].copy_from_slice(&0u16.to_be_bytes());
-            tcp[18..20].copy_from_slice(&0u16.to_be_bytes());
-            let tcp_sum = tcp_checksum(pkt.local_ip.octets(), pkt.remote_ip.octets(), tcp);
-            tcp[16..18].copy_from_slice(&tcp_sum.to_be_bytes());
-        });
-    }
-}
-
-fn internet_checksum(data: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
-    }
-    if let Some(&byte) = chunks.remainder().first() {
-        sum = sum.wrapping_add((byte as u32) << 8);
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp: &[u8]) -> u16 {
-    let mut pseudo = [0u8; 12 + 20];
-    pseudo[..4].copy_from_slice(&src_ip);
-    pseudo[4..8].copy_from_slice(&dst_ip);
-    pseudo[8] = 0;
-    pseudo[9] = 6;
-    pseudo[10..12].copy_from_slice(&(tcp.len() as u16).to_be_bytes());
-    pseudo[12..].copy_from_slice(tcp);
-    internet_checksum(&pseudo)
 }
 
 impl Drop for DpdkDevice {
@@ -813,5 +771,11 @@ mod tests {
         compact_consumed_prefix(&mut pending, &mut consumed);
         assert!(pending.is_empty());
         assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn stale_rss_union_is_ignored_without_the_dpdk_validity_flag() {
+        assert!(!rss_hash_metadata_is_valid(0));
+        assert!(rss_hash_metadata_is_valid(RTE_MBUF_F_RX_RSS_HASH));
     }
 }

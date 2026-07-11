@@ -41,7 +41,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::io;
 
 pub use crate::runtime::scheduler::dpdk::{
-    RawTailHandle, RawTailRecord, RawTailUnregisterStatus,
+    RawTailHandle, RawTailInput, RawTailParseDisposition, RawTailParserBinding,
+    RawTailUnregisterStatus,
 };
 use crate::runtime::scheduler::dpdk::DpdkRuntimeId;
 
@@ -132,13 +133,41 @@ pub fn reserve_raw_tail(local: SocketAddr, remote: SocketAddr) -> io::Result<Raw
     .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DPDK driver unavailable"))?
 }
 
-/// Start capturing packets for a previously reserved raw-tail handle.
+/// Install a pinned synchronous parser and start capturing a reserved flow.
+///
+/// # Safety
+///
+/// The parser binding's context must remain pinned and valid until
+/// [`unregister_raw_tail`] succeeds or returns
+/// [`RawTailUnregisterStatus::OwnerReclaimed`]. Its callbacks must return
+/// synchronously, and the caller must statically exclude DPDK driver re-entry.
+/// `stream` and its registered smoltcp socket must also remain alive until that
+/// same unregister boundary; dropping it earlier could recycle its index for a
+/// different socket while the non-owning parser binding is still active.
 #[track_caller]
-pub fn activate_raw_tail(handle: RawTailHandle) -> io::Result<()> {
+pub unsafe fn activate_reserved_raw_tail_parser(
+    stream: &crate::net::TcpDpdkStream,
+    handle: RawTailHandle,
+    parser: RawTailParserBinding,
+) -> io::Result<()> {
+    unsafe { stream.activate_reserved_raw_tail_parser(handle, parser) }
+}
+
+/// Poll the unique receiver for the current driver-side parser publication.
+#[track_caller]
+pub fn poll_raw_tail_publication_ready(
+    handle: RawTailHandle,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<io::Result<()>> {
     crate::runtime::scheduler::dpdk::worker::with_current_driver(|driver| {
-        driver.activate_raw_tail(handle)
+        driver.poll_raw_tail_publication_ready(handle, cx)
     })
-    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DPDK driver unavailable"))?
+    .unwrap_or_else(|| {
+        std::task::Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::Other,
+            "DPDK driver unavailable",
+        )))
+    })
 }
 
 /// Returns a list of all worker IDs in the current DPDK runtime.

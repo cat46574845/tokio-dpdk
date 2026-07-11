@@ -22,7 +22,7 @@ use crate::runtime::scheduler::dpdk::{
     current_driver_cleanup, current_worker_identity, with_current_driver, DriverCleanup,
     WorkerIdentity,
 };
-use crate::runtime::scheduler::dpdk::{RawTailHandle, RawTailRecord};
+use crate::runtime::scheduler::dpdk::{RawTailHandle, RawTailParserBinding};
 
 use std::marker::PhantomData;
 
@@ -900,41 +900,36 @@ impl TcpDpdkStream {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))
     }
 
-    /// Divert this connected TCP flow into the DPDK raw-tail market-data path.
-    ///
-    /// After activation, inbound packets for this flow are captured by RSS hash
-    /// before smoltcp receives them. The driver keeps only the latest packet and
-    /// publishes one overwriteable TLS-record slot to the receiver task.
-    pub fn activate_raw_tail(&self) -> io::Result<RawTailHandle> {
-        self.assert_on_correct_worker();
-        let handle = self.handle;
-        with_current_driver(|driver| driver.activate_raw_tail_for_socket(handle))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))?
-    }
-
-    /// Start capturing packets for a raw-tail flow reserved before connect.
-    pub fn activate_reserved_raw_tail(&self, handle: RawTailHandle) -> io::Result<()> {
-        self.assert_on_correct_worker();
-        with_current_driver(|driver| driver.activate_raw_tail(handle))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))?
-    }
-
-    /// Poll and synchronously consume the latest raw-tail TLS records.
-    ///
-    /// A flow is permanently bound to the first task waker that polls it. The
-    /// callback borrows the driver's single-slot buffer and must not await or
-    /// re-enter this DPDK driver.
-    pub fn poll_raw_tail_record<R>(
+    pub(crate) unsafe fn activate_reserved_raw_tail_parser(
         &self,
         handle: RawTailHandle,
-        cx: &mut Context<'_>,
-        consume: impl for<'record> FnOnce(RawTailRecord<'record>) -> R,
-    ) -> Poll<io::Result<R>> {
-        self.assert_on_correct_worker();
-        match with_current_driver(|driver| driver.poll_raw_tail_record(handle, cx, consume)) {
-            Some(result) => result,
-            None => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "driver unavailable"))),
+        parser: RawTailParserBinding,
+    ) -> io::Result<()> {
+        // The public unsafe wrapper requires this stream/socket to outlive the
+        // raw-tail binding, preventing SocketHandle index reuse before parser
+        // removal.
+        let current = current_worker_identity().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "raw-tail parser activation requires its DPDK worker thread",
+            )
+        })?;
+        if current != self.owner {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "TcpDpdkStream belongs to a different DPDK runtime or worker",
+            ));
         }
+        if handle.owner() != self.owner {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "raw-tail reservation belongs to a different DPDK runtime or worker",
+            ));
+        }
+        with_current_driver(|driver| {
+            driver.activate_raw_tail_parser(handle, self.handle, parser)
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DPDK driver unavailable"))?
     }
 
     /// Tries to read data from the stream into the provided buffer.

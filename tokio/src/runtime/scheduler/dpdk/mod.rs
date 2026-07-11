@@ -39,7 +39,10 @@ pub(crate) use worker::{
 };
 pub(crate) use identity::{DpdkRuntimeId, WorkerIdentity};
 
-pub use raw_tail::{RawTailHandle, RawTailRecord, RawTailUnregisterStatus};
+pub use raw_tail::{
+    RawTailHandle, RawTailInput, RawTailParseDisposition, RawTailParserBinding,
+    RawTailUnregisterStatus,
+};
 
 // Re-export debug APIs
 pub use worker::{current_tick, current_exec_count, current_scheduler_stats, DpdkSchedulerStats};
