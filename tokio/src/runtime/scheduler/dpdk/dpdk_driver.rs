@@ -780,7 +780,7 @@ impl DpdkDriver {
         } else {
             0
         };
-        self.raw_tail.finish_drain(
+        let raw_tail_observed_gateway = self.raw_tail.finish_drain(
             smol_now,
             &mut self.iface,
             &mut self.sockets,
@@ -847,21 +847,37 @@ impl DpdkDriver {
             ingress_touched.clear();
             ingress_touched_bits.fill(0);
             loop {
-                match self
-                    .iface
-                    .poll_ingress_single_touched(
+                let observe_gateway = should_observe_gateway_on_normal_ingress(
+                    self.gateway_neighbor_configured,
+                    raw_tail_observed_gateway,
+                    || self.device.is_last_unprocessed_rx_pending(),
+                );
+                let mut on_touched = |handle| {
+                    Self::push_handle_dedup(
+                        &mut ingress_touched,
+                        &mut ingress_touched_bits,
+                        handle,
+                    );
+                };
+                let ingress_result = if observe_gateway {
+                    self.iface
+                        .poll_ingress_single_touched_with_gateway_observation(
+                            smol_now,
+                            &mut self.device,
+                            &mut self.sockets,
+                            true,
+                            &mut on_touched,
+                        )
+                        .poll_result
+                } else {
+                    self.iface.poll_ingress_single_touched(
                         smol_now,
                         &mut self.device,
                         &mut self.sockets,
-                        |handle| {
-                            Self::push_handle_dedup(
-                                &mut ingress_touched,
-                                &mut ingress_touched_bits,
-                                handle,
-                            );
-                        },
+                        &mut on_touched,
                     )
-                {
+                };
+                match ingress_result {
                     PollIngressSingleResult::None => break,
                     PollIngressSingleResult::PacketProcessed => {
                         #[cfg(feature = "market-trace")]
@@ -1888,6 +1904,15 @@ fn reserve_explicit_port(bound_ports: &mut HashSet<u16>, port: u16) -> io::Resul
     Ok(port)
 }
 
+#[inline(always)]
+fn should_observe_gateway_on_normal_ingress(
+    gateway_configured: bool,
+    raw_tail_observed_gateway: bool,
+    is_last_normal_ingress: impl FnOnce() -> bool,
+) -> bool {
+    gateway_configured && !raw_tail_observed_gateway && is_last_normal_ingress()
+}
+
 fn socket_addr_to_endpoint(addr: SocketAddr) -> IpEndpoint {
     match addr {
         SocketAddr::V4(addr) => IpEndpoint::new(
@@ -2123,6 +2148,27 @@ mod tests {
         assert_eq!(counters.no_source_address, 1);
         assert_eq!(counters.dispatch_failed, 1);
         assert_eq!(counters.gateway_changed, 2);
+    }
+
+    #[test]
+    fn raw_tail_gateway_observation_has_priority_over_normal_ingress() {
+        assert!(!should_observe_gateway_on_normal_ingress(true, true, || {
+            panic!("raw-tail observation must short-circuit the normal RX index read")
+        }));
+        assert!(!should_observe_gateway_on_normal_ingress(
+            false,
+            false,
+            || panic!("disabled gateway observation must not read the normal RX index")
+        ));
+    }
+
+    #[test]
+    fn only_the_last_normal_ingress_observes_gateway_once_per_drain() {
+        let decisions = [false, false, true].map(|last_normal| {
+            should_observe_gateway_on_normal_ingress(true, false, || last_normal)
+        });
+        assert_eq!(decisions, [false, false, true]);
+        assert_eq!(decisions.into_iter().filter(|observe| *observe).count(), 1);
     }
 
     #[test]

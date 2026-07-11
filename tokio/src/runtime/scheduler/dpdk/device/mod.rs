@@ -564,6 +564,11 @@ impl DpdkDevice {
     }
 
     #[inline(always)]
+    pub(crate) fn is_last_unprocessed_rx_pending(&self) -> bool {
+        is_last_unprocessed_index(self.rx_index, self.rx_pending.len())
+    }
+
+    #[inline(always)]
     fn try_reserve_tx_mbuf(&mut self) -> Option<OwnedMbuf> {
         if self.tx_buffer.len() >= TX_PENDING_CAP {
             self.error_counters.tx_pending_full = self
@@ -582,6 +587,11 @@ impl DpdkDevice {
         mbuf
     }
 
+}
+
+#[inline(always)]
+fn is_last_unprocessed_index(rx_index: usize, pending_len: usize) -> bool {
+    rx_index < pending_len && rx_index + 1 == pending_len
 }
 
 impl Drop for DpdkDevice {
@@ -777,5 +787,14 @@ mod tests {
     fn stale_rss_union_is_ignored_without_the_dpdk_validity_flag() {
         assert!(!rss_hash_metadata_is_valid(0));
         assert!(rss_hash_metadata_is_valid(RTE_MBUF_F_RX_RSS_HASH));
+    }
+
+    #[test]
+    fn last_unprocessed_rx_is_an_o1_index_check() {
+        assert!(!is_last_unprocessed_index(0, 0));
+        assert!(is_last_unprocessed_index(0, 1));
+        assert!(!is_last_unprocessed_index(0, 2));
+        assert!(is_last_unprocessed_index(1, 2));
+        assert!(!is_last_unprocessed_index(2, 2));
     }
 }

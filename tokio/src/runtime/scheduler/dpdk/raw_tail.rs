@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ptr::NonNull;
 use std::task::{Context, Poll, Waker};
 
-use smoltcp::iface::{Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{GatewayNeighborUpdate, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::tcp::Socket as TcpSocket;
 use smoltcp::storage::LinearBuffer;
@@ -736,7 +736,7 @@ impl RawTailTable {
         sockets: &mut SocketSet<'static, LinearBuffer<'static>>,
         gateway_neighbor_configured: bool,
         egress_handles: &mut Vec<SocketHandle>,
-    ) {
+    ) -> bool {
         egress_handles.clear();
         let mut observed_gateway = None;
         for pending_index in 0..self.pending_slots.len() {
@@ -784,15 +784,19 @@ impl RawTailTable {
             }
         }
 
-        if gateway_neighbor_configured {
+        let gateway_observed = if gateway_neighbor_configured {
             if let Some(gateway_mac) = observed_gateway {
-                let _ = iface.observe_gateway_hardware_addr(
-                    now,
-                    HardwareAddress::Ethernet(gateway_mac),
-                );
+                gateway_update_was_observed(iface.observe_gateway_hardware_addr(
+                    now, HardwareAddress::Ethernet(gateway_mac),
+                ))
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
         self.compact_pending_slots();
+        gateway_observed
     }
 
     fn process_selected_tail(
@@ -1022,6 +1026,16 @@ fn replace_latest<T>(slot: &mut Option<T>, latest: T) -> Option<T> {
 #[inline(always)]
 fn with_selected_owner<T, R>(owner: T, use_owner: impl FnOnce(&T) -> R) -> R {
     use_owner(&owner)
+}
+
+#[inline(always)]
+fn gateway_update_was_observed(update: GatewayNeighborUpdate) -> bool {
+    matches!(
+        update,
+        GatewayNeighborUpdate::Changed
+            | GatewayNeighborUpdate::Resolved
+            | GatewayNeighborUpdate::Unchanged
+    )
 }
 
 #[inline(always)]
@@ -1328,6 +1342,14 @@ mod tests {
         let second_packet = [4, 5, 6, 7, 8];
         assert!(find_tail_aligned_tls_records(&first_packet).is_none());
         assert!(find_tail_aligned_tls_records(&second_packet).is_none());
+    }
+
+    #[test]
+    fn accepted_gateway_updates_count_as_this_drains_observation() {
+        assert!(gateway_update_was_observed(GatewayNeighborUpdate::Changed));
+        assert!(gateway_update_was_observed(GatewayNeighborUpdate::Resolved));
+        assert!(gateway_update_was_observed(GatewayNeighborUpdate::Unchanged));
+        assert!(!gateway_update_was_observed(GatewayNeighborUpdate::Ignored));
     }
 
     #[test]
