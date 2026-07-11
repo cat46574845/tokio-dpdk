@@ -235,6 +235,33 @@ pub(crate) struct OwnedMbuf {
     ptr: NonNull<ffi::rte_mbuf>,
 }
 
+struct PreparedTxMbuf {
+    mbuf: OwnedMbuf,
+    data: NonNull<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TxPrepareFailure {
+    Allocation,
+    Append,
+}
+
+#[inline(always)]
+fn prepare_tx_resource<T>(
+    resource: Option<T>,
+    append: impl FnOnce(&mut T) -> Option<NonNull<u8>>,
+) -> Result<(T, NonNull<u8>), TxPrepareFailure> {
+    let mut resource = resource.ok_or(TxPrepareFailure::Allocation)?;
+    let data = append(&mut resource).ok_or(TxPrepareFailure::Append)?;
+    Ok((resource, data))
+}
+
+#[inline(always)]
+fn set_single_segment_len_fields(data_len: &mut u16, pkt_len: &mut u32, len: usize) {
+    *data_len = len as u16;
+    *pkt_len = len as u32;
+}
+
 impl OwnedMbuf {
     #[inline(always)]
     unsafe fn try_alloc(pool: *mut ffi::rte_mempool) -> Option<Self> {
@@ -286,6 +313,24 @@ impl OwnedMbuf {
             return None;
         }
         Some(unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) })
+    }
+
+    /// The token owns a fresh one-segment mbuf pre-appended to DEFAULT_MTU.
+    /// Updating these two fields is the single-segment `rte_pktmbuf_trim`
+    /// operation without adding another C FFI call to every transmitted frame.
+    #[inline(always)]
+    fn shrink_preappended_tx_len(&mut self, len: usize) {
+        let mbuf = self.as_ptr();
+        debug_assert_eq!(unsafe { (*mbuf).nb_segs }, 1);
+        debug_assert_eq!(unsafe { (*mbuf).data_len as usize }, DEFAULT_MTU);
+        debug_assert_eq!(unsafe { (*mbuf).pkt_len as usize }, DEFAULT_MTU);
+        unsafe {
+            set_single_segment_len_fields(
+                &mut (*mbuf).data_len,
+                &mut (*mbuf).pkt_len,
+                len,
+            );
+        }
     }
 
     #[inline(always)]
@@ -569,7 +614,7 @@ impl DpdkDevice {
     }
 
     #[inline(always)]
-    fn try_reserve_tx_mbuf(&mut self) -> Option<OwnedMbuf> {
+    fn try_reserve_tx_mbuf(&mut self) -> Option<PreparedTxMbuf> {
         if self.tx_buffer.len() >= TX_PENDING_CAP {
             self.error_counters.tx_pending_full = self
                 .error_counters
@@ -577,14 +622,30 @@ impl DpdkDevice {
                 .saturating_add(1);
             return None;
         }
-        let mbuf = unsafe { OwnedMbuf::try_alloc(self.mempool) };
-        if mbuf.is_none() {
-            self.error_counters.tx_mbuf_exhausted = self
-                .error_counters
-                .tx_mbuf_exhausted
-                .saturating_add(1);
+        let prepared = prepare_tx_resource(
+            unsafe { OwnedMbuf::try_alloc(self.mempool) },
+            |mbuf| {
+                mbuf.append(DEFAULT_MTU)
+                    .and_then(|data| NonNull::new(data.as_mut_ptr()))
+            },
+        );
+        match prepared {
+            Ok((mbuf, data)) => Some(PreparedTxMbuf { mbuf, data }),
+            Err(TxPrepareFailure::Allocation) => {
+                self.error_counters.tx_mbuf_exhausted = self
+                    .error_counters
+                    .tx_mbuf_exhausted
+                    .saturating_add(1);
+                None
+            }
+            Err(TxPrepareFailure::Append) => {
+                self.error_counters.tx_append_failed = self
+                    .error_counters
+                    .tx_append_failed
+                    .saturating_add(1);
+                None
+            }
         }
-        mbuf
     }
 
 }
@@ -624,7 +685,7 @@ pub(crate) struct DpdkRxToken {
 /// Transmit token for smoltcp Device trait.
 pub(crate) struct DpdkTxToken<'a> {
     device: &'a mut DpdkDevice,
-    mbuf: Option<OwnedMbuf>,
+    prepared: PreparedTxMbuf,
 }
 
 impl smoltcp::phy::RxToken for DpdkRxToken {
@@ -646,7 +707,7 @@ impl smoltcp::phy::RxToken for DpdkRxToken {
 }
 
 impl<'a> smoltcp::phy::TxToken for DpdkTxToken<'a> {
-    fn consume<R, F>(mut self, len: usize, f: F) -> R
+    fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
@@ -654,26 +715,17 @@ impl<'a> smoltcp::phy::TxToken for DpdkTxToken<'a> {
             len <= DEFAULT_MTU,
             "smoltcp Device capability guarantees TX length does not exceed the validated MTU"
         );
-        let data = match self.mbuf.as_mut().and_then(|mbuf| mbuf.append(len)) {
-            Some(data) => data,
-            None => {
-                self.device.error_counters.tx_append_failed = self
-                    .device
-                    .error_counters
-                    .tx_append_failed
-                    .saturating_add(1);
-                panic!("validated fresh DPDK mbuf tailroom must accept a legal smoltcp frame");
-            }
-        };
+        let DpdkTxToken {
+            device,
+            mut prepared,
+        } = self;
+        prepared.mbuf.shrink_preappended_tx_len(len);
+        let data = unsafe { std::slice::from_raw_parts_mut(prepared.data.as_ptr(), len) };
 
         let result = f(data);
 
-        let mbuf = self
-            .mbuf
-            .take()
-            .expect("DPDK TX token owns exactly one mbuf until successful consume");
-        debug_assert!(self.device.tx_buffer.len() < TX_PENDING_CAP);
-        self.device.tx_buffer.push(mbuf.into_raw());
+        debug_assert!(device.tx_buffer.len() < TX_PENDING_CAP);
+        device.tx_buffer.push(prepared.mbuf.into_raw());
 
         result
     }
@@ -694,7 +746,7 @@ impl Device for DpdkDevice {
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let raw_rx = *self.rx_pending.get(self.rx_index)?;
-        let tx_mbuf = self.try_reserve_tx_mbuf()?;
+        let prepared = self.try_reserve_tx_mbuf()?;
         let Some(rx_mbuf) = (unsafe { OwnedMbuf::from_received(raw_rx) }) else {
             self.error_counters.rx_mbuf_invalid = self
                 .error_counters
@@ -707,16 +759,16 @@ impl Device for DpdkDevice {
             DpdkRxToken { mbuf: rx_mbuf },
             DpdkTxToken {
                 device: self,
-                mbuf: Some(tx_mbuf),
+                prepared,
             },
         ))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        let mbuf = self.try_reserve_tx_mbuf()?;
+        let prepared = self.try_reserve_tx_mbuf()?;
         Some(DpdkTxToken {
             device: self,
-            mbuf: Some(mbuf),
+            prepared,
         })
     }
 
@@ -743,6 +795,15 @@ impl Device for DpdkDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct DropProbe<'a>(&'a Cell<usize>);
+
+    impl Drop for DropProbe<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
 
     #[test]
     fn zero_tx_acceptance_preserves_every_pending_pointer() {
@@ -796,5 +857,47 @@ mod tests {
         assert!(!is_last_unprocessed_index(0, 2));
         assert!(is_last_unprocessed_index(1, 2));
         assert!(!is_last_unprocessed_index(2, 2));
+    }
+
+    #[test]
+    fn tx_allocation_failure_produces_no_prepared_token() {
+        let mut append_called = false;
+        let prepared = prepare_tx_resource::<usize>(None, |_| {
+            append_called = true;
+            Some(NonNull::dangling())
+        });
+        assert_eq!(prepared, Err(TxPrepareFailure::Allocation));
+        assert!(!append_called);
+        assert!(prepared.ok().is_none());
+    }
+
+    #[test]
+    fn tx_append_failure_produces_no_token_and_releases_allocation() {
+        let drops = Cell::new(0);
+        let prepared = prepare_tx_resource(Some(DropProbe(&drops)), |_| None);
+        assert!(matches!(prepared, Err(TxPrepareFailure::Append)));
+        assert_eq!(drops.get(), 1);
+        assert!(prepared.ok().is_none());
+    }
+
+    #[test]
+    fn preappended_tx_length_is_shrunk_to_the_smoltcp_frame() {
+        let mut data_len = DEFAULT_MTU as u16;
+        let mut pkt_len = DEFAULT_MTU as u32;
+        set_single_segment_len_fields(&mut data_len, &mut pkt_len, 73);
+        assert_eq!(data_len, 73);
+        assert_eq!(pkt_len, 73);
+
+        set_single_segment_len_fields(&mut data_len, &mut pkt_len, 0);
+        assert_eq!(data_len, 0);
+        assert_eq!(pkt_len, 0);
+
+        set_single_segment_len_fields(
+            &mut data_len,
+            &mut pkt_len,
+            DEFAULT_MTU,
+        );
+        assert_eq!(data_len, DEFAULT_MTU as u16);
+        assert_eq!(pkt_len, DEFAULT_MTU as u32);
     }
 }
