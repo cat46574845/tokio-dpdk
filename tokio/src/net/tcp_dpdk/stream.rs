@@ -2,6 +2,7 @@
 //!
 //! A DPDK-backed TCP stream using smoltcp for protocol processing.
 
+use std::cell::Cell;
 use std::future::poll_fn;
 use std::io;
 use std::io::IoSlice;
@@ -239,13 +240,25 @@ pub struct TcpDpdkStream {
     /// Local port owned by an outbound connect; accepted streams leave this empty.
     outbound_local_port: Option<u16>,
     /// Read shutdown flag (smoltcp doesn't support half-close on read side)
-    read_shutdown: std::sync::atomic::AtomicBool,
+    read_shutdown: Cell<bool>,
     /// Write shutdown flag — tracks whether we initiated close (FIN sent)
     /// Used by take_error() to distinguish RST from clean close.
-    write_shutdown: std::sync::atomic::AtomicBool,
+    write_shutdown: Cell<bool>,
     /// Last error encountered (stored as ErrorKind since io::Error doesn't impl Clone)
-    last_error: std::sync::Mutex<Option<io::ErrorKind>>,
+    last_error: Cell<Option<io::ErrorKind>>,
 }
+
+// SAFETY: The three `Cell` fields are worker-local state. Every production
+// operation that reads or writes them first validates `owner` against the DPDK
+// worker identity, and one WorkerIdentity is permanently bound to one OS thread.
+// That worker polls tasks serially, so validated operations cannot execute the
+// cell accesses concurrently. Owned split halves may move through `Arc`, but
+// their I/O paths perform the same validation before reaching this state. Drop
+// may run on another thread after the runtime is reclaimed, but it never reads
+// these cells and uses only DriverCleanup. Sync is retained solely for the
+// public stream/owned-half type contract; it does not authorize state access
+// away from the owning worker.
+unsafe impl Sync for TcpDpdkStream {}
 
 impl TcpDpdkStream {
     /// Create a TcpDpdkStream from an existing socket handle.
@@ -265,9 +278,9 @@ impl TcpDpdkStream {
             local_addr,
             peer_addr,
             outbound_local_port: None,
-            read_shutdown: std::sync::atomic::AtomicBool::new(false),
-            write_shutdown: std::sync::atomic::AtomicBool::new(false),
-            last_error: std::sync::Mutex::new(None),
+            read_shutdown: Cell::new(false),
+            write_shutdown: Cell::new(false),
+            last_error: Cell::new(None),
         }
     }
 
@@ -420,9 +433,9 @@ impl TcpDpdkStream {
             local_addr: Some(local_addr),
             peer_addr: Some(addr),
             outbound_local_port: Some(outbound_local_port),
-            read_shutdown: std::sync::atomic::AtomicBool::new(false),
-            write_shutdown: std::sync::atomic::AtomicBool::new(false),
-            last_error: std::sync::Mutex::new(None),
+            read_shutdown: Cell::new(false),
+            write_shutdown: Cell::new(false),
+            last_error: Cell::new(None),
         })
     }
 
@@ -523,9 +536,9 @@ impl TcpDpdkStream {
             local_addr: Some(result_local_addr),
             peer_addr: Some(remote_addr),
             outbound_local_port: Some(outbound_local_port),
-            read_shutdown: std::sync::atomic::AtomicBool::new(false),
-            write_shutdown: std::sync::atomic::AtomicBool::new(false),
-            last_error: std::sync::Mutex::new(None),
+            read_shutdown: Cell::new(false),
+            write_shutdown: Cell::new(false),
+            last_error: Cell::new(None),
         })
     }
 
@@ -555,7 +568,12 @@ impl TcpDpdkStream {
     /// Panics if called from a different worker than where the stream was created.
     #[inline]
     fn assert_on_correct_worker(&self) {
-        if let Err(error) = ensure_current_worker_owner(self.owner, "TcpDpdkStream") {
+        self.assert_on_worker_identity(current_worker_identity());
+    }
+
+    #[inline]
+    fn assert_on_worker_identity(&self, current: Option<WorkerIdentity>) {
+        if let Err(error) = validate_worker_owner(self.owner, current, "TcpDpdkStream") {
             panic!("{}", error);
         }
     }
@@ -800,7 +818,7 @@ impl TcpDpdkStream {
     pub fn try_peek_zero_copy(&self) -> io::Result<PeekGuard<'_>> {
         self.assert_on_correct_worker();
 
-        if self.read_shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        if self.read_shutdown.get() {
             return Ok(PeekGuard {
                 stream: self,
                 data: std::ptr::null(),
@@ -962,10 +980,7 @@ impl TcpDpdkStream {
         self.assert_on_correct_worker();
 
         // Check read shutdown flag
-        if self
-            .read_shutdown
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.read_shutdown.get() {
             return Ok(0); // EOF
         }
 
@@ -1078,10 +1093,7 @@ impl TcpDpdkStream {
         self.assert_on_correct_worker();
 
         // Check read shutdown
-        if self
-            .read_shutdown
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.read_shutdown.get() {
             return Ok(0);
         }
 
@@ -1142,10 +1154,7 @@ impl TcpDpdkStream {
     fn try_peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.assert_on_correct_worker();
 
-        if self
-            .read_shutdown
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.read_shutdown.get() {
             return Ok(0);
         }
 
@@ -1190,10 +1199,7 @@ impl TcpDpdkStream {
     ) -> Poll<io::Result<usize>> {
         self.assert_on_correct_worker();
 
-        if self
-            .read_shutdown
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.read_shutdown.get() {
             return Poll::Ready(Ok(0));
         }
 
@@ -1332,22 +1338,14 @@ impl TcpDpdkStream {
         self.assert_on_correct_worker();
 
         // 1. Check stored error first (take semantics)
-        {
-            let mut guard = self
-                .last_error
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "lock poisoned"))?;
-            if let Some(kind) = guard.take() {
-                return Ok(Some(io::Error::from(kind)));
-            }
+        if let Some(kind) = self.last_error.take() {
+            return Ok(Some(io::Error::from(kind)));
         }
 
         // 2. Actively probe socket state for async errors (RST received, etc.)
         //    If socket is Closed and we never initiated write shutdown,
         //    the peer sent RST → ConnectionReset.
-        let we_closed = self
-            .write_shutdown
-            .load(std::sync::atomic::Ordering::Acquire);
+        let we_closed = self.write_shutdown.get();
 
         if we_closed {
             // We initiated close — Closed state is expected, not an error
@@ -1372,9 +1370,8 @@ impl TcpDpdkStream {
 
     /// Store an error kind for later retrieval via `take_error()`.
     fn store_error(&self, kind: io::ErrorKind) {
-        if let Ok(mut guard) = self.last_error.lock() {
-            *guard = Some(kind);
-        }
+        self.assert_on_correct_worker();
+        self.last_error.set(Some(kind));
     }
 
     /// Shuts down the read, write, or both halves of this connection.
@@ -1391,12 +1388,10 @@ impl TcpDpdkStream {
 
         match how {
             Shutdown::Read => {
-                self.read_shutdown
-                    .store(true, std::sync::atomic::Ordering::Release);
+                self.read_shutdown.set(true);
             }
             Shutdown::Write => {
-                self.write_shutdown
-                    .store(true, std::sync::atomic::Ordering::Release);
+                self.write_shutdown.set(true);
                 let handle = self.handle;
                 with_current_driver(|driver| {
                     let socket = driver.get_tcp_socket_mut(handle);
@@ -1405,10 +1400,8 @@ impl TcpDpdkStream {
                 });
             }
             Shutdown::Both => {
-                self.read_shutdown
-                    .store(true, std::sync::atomic::Ordering::Release);
-                self.write_shutdown
-                    .store(true, std::sync::atomic::Ordering::Release);
+                self.read_shutdown.set(true);
+                self.write_shutdown.set(true);
                 let handle = self.handle;
                 with_current_driver(|driver| {
                     let socket = driver.get_tcp_socket_mut(handle);
@@ -1712,6 +1705,9 @@ mod lifecycle_tests {
         ));
         let wait = stream.wait_recv();
         assert_send(&wait);
+        assert_send(&stream.readable());
+        assert_send(&stream.writable());
+        assert_send(&stream.ready(Interest::READABLE | Interest::WRITABLE));
     }
 
     #[test]
@@ -1732,6 +1728,47 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn owner_rejection_precedes_worker_local_cell_access() {
+        let owner = test_owner(10);
+        let stream = ManuallyDrop::new(TcpDpdkStream::from_handle(
+            SocketHandle::default(),
+            owner,
+            DriverCleanup::dead_for_test(owner),
+            None,
+            None,
+        ));
+        stream.last_error.set(Some(io::ErrorKind::BrokenPipe));
+
+        let other_worker = WorkerIdentity::new(owner.runtime_id, owner.worker_index + 1);
+        let wrong_worker = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stream.assert_on_worker_identity(Some(other_worker));
+        }));
+        assert!(wrong_worker.is_err(), "wrong worker must be rejected");
+        assert_eq!(
+            stream.last_error.get(),
+            Some(io::ErrorKind::BrokenPipe),
+            "wrong-worker rejection must precede worker-local state access"
+        );
+
+        let take_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = stream.take_error();
+        }));
+        assert!(take_error.is_err(), "outside-owner take_error must fail first");
+        assert_eq!(
+            stream.last_error.get(),
+            Some(io::ErrorKind::BrokenPipe),
+            "owner rejection must leave the worker-local error cell untouched"
+        );
+
+        let shutdown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = stream.shutdown_std(Shutdown::Both);
+        }));
+        assert!(shutdown.is_err(), "outside-owner shutdown must fail first");
+        assert!(!stream.read_shutdown.get());
+        assert!(!stream.write_shutdown.get());
+    }
+
+    #[test]
     fn reclaimed_owner_stream_can_move_and_drop_on_another_thread() {
         let owner = test_owner(9);
         let stream = TcpDpdkStream::from_handle(
@@ -1745,6 +1782,28 @@ mod lifecycle_tests {
         std::thread::spawn(move || drop(stream))
             .join()
             .expect("late stream Drop after owner reclamation must remain safe");
+    }
+
+    #[test]
+    fn reclaimed_owner_split_halves_can_move_and_drop_on_other_threads() {
+        let owner = test_owner(11);
+        let stream = TcpDpdkStream::from_handle(
+            SocketHandle::default(),
+            owner,
+            DriverCleanup::dead_for_test(owner),
+            None,
+            None,
+        );
+        let (read_half, write_half) = stream.into_split();
+
+        let read_drop = std::thread::spawn(move || drop(read_half));
+        let write_drop = std::thread::spawn(move || drop(write_half));
+        read_drop
+            .join()
+            .expect("owned read half must remain movable after owner reclamation");
+        write_drop
+            .join()
+            .expect("owned write half must remain movable after owner reclamation");
     }
 
     #[test]
