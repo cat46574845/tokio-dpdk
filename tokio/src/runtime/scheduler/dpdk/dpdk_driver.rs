@@ -34,7 +34,7 @@ use super::raw_tail::{
     RawTailHandle, RawTailParserBinding, RawTailTable, RawTailTuple,
     RAW_TAIL_CONNECTION_CAP,
 };
-use super::{DpdkRuntimeId, WorkerIdentity};
+use super::{DpdkRuntimeId, WorkerIdentity, SOCKET_LIFECYCLE_CAPACITY};
 
 // =============================================================================
 // Constants
@@ -49,8 +49,6 @@ const TCP_RX_BUFFER_SIZE: usize = 524288;
 /// Default TCP TX buffer size
 const TCP_TX_BUFFER_SIZE: usize = 65536;
 
-/// Default buffer pool size (number of connections)
-const DEFAULT_BUFFER_POOL_SIZE: usize = 2048;
 const GATEWAY_SOFT_STALE_AFTER: SmolDuration = SmolDuration::from_secs(300);
 const INFRA_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const PENDING_EGRESS_NONE: usize = usize::MAX;
@@ -73,7 +71,7 @@ fn pack_trace_aux3(a: usize, b: usize, c: usize) -> u64 {
 
 fn dpdk_iface_config(mac: [u8; 6]) -> IfaceConfig {
     let mut config = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-    config.tcp_flow_cache_capacity = DEFAULT_BUFFER_POOL_SIZE;
+    config.tcp_flow_cache_capacity = SOCKET_LIFECYCLE_CAPACITY;
     config
 }
 
@@ -90,6 +88,157 @@ fn socket_egress_retry_due(
     }
 }
 
+/// Fixed-capacity shared smoltcp egress schedule.
+///
+/// `position[handle.index()]` is the sole reverse index for a socket. A
+/// present socket therefore has exactly one heap entry. All backing storage is
+/// allocated at driver startup and no operation can grow the reverse index.
+struct PendingEgress {
+    heap: Vec<(SmolInstant, SocketHandle)>,
+    position: Box<[usize]>,
+}
+
+impl PendingEgress {
+    fn new() -> Self {
+        Self {
+            heap: Vec::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
+            position: vec![PENDING_EGRESS_NONE; SOCKET_LIFECYCLE_CAPACITY]
+                .into_boxed_slice(),
+        }
+    }
+
+    fn clear_all(&mut self) {
+        self.heap.clear();
+        self.position.fill(PENDING_EGRESS_NONE);
+    }
+
+    fn clear_socket(&mut self, handle: SocketHandle) {
+        let index = handle.index();
+        let position = *self.position.get(index).unwrap_or_else(|| {
+            panic!(
+                "smoltcp socket handle index {} exceeds fixed DPDK lifecycle capacity {}",
+                index, SOCKET_LIFECYCLE_CAPACITY
+            )
+        });
+        if position == PENDING_EGRESS_NONE {
+            return;
+        }
+        assert!(
+            position < self.heap.len() && self.heap[position].1 == handle,
+            "pending egress reverse index must identify its unique heap entry handle={:?} position={}",
+            handle,
+            position
+        );
+        self.remove_at(position);
+    }
+
+    fn queue_at(&mut self, handle: SocketHandle, due: SmolInstant) {
+        let index = handle.index();
+        let position = *self.position.get(index).unwrap_or_else(|| {
+            panic!(
+                "smoltcp socket handle index {} exceeds fixed DPDK lifecycle capacity {}",
+                index, SOCKET_LIFECYCLE_CAPACITY
+            )
+        });
+        if position == PENDING_EGRESS_NONE {
+            assert!(
+                self.heap.len() < SOCKET_LIFECYCLE_CAPACITY,
+                "unique pending egress heap cannot exceed fixed socket capacity"
+            );
+            let position = self.heap.len();
+            self.position[index] = position;
+            self.heap.push((due, handle));
+            self.sift_up(position);
+            return;
+        }
+        assert!(
+            position < self.heap.len() && self.heap[position].1 == handle,
+            "pending egress reverse index must identify its unique heap entry handle={:?} position={}",
+            handle,
+            position
+        );
+        if due < self.heap[position].0 {
+            self.heap[position].0 = due;
+            self.sift_up(position);
+        }
+    }
+
+    fn pop_min(&mut self) -> Option<(SmolInstant, SocketHandle)> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        Some(self.remove_at(0))
+    }
+
+    fn remove_at(&mut self, position: usize) -> (SmolInstant, SocketHandle) {
+        assert!(
+            position < self.heap.len(),
+            "pending egress removal position must reference a live heap entry"
+        );
+        let last = self.heap.len() - 1;
+        self.swap(position, last);
+        let removed = self
+            .heap
+            .pop()
+            .expect("pending egress heap must remain nonempty through checked removal");
+        self.position[removed.1.index()] = PENDING_EGRESS_NONE;
+        if position < self.heap.len() {
+            if position > 0 && self.less(position, (position - 1) / 2) {
+                self.sift_up(position);
+            } else {
+                self.sift_down(position);
+            }
+        }
+        removed
+    }
+
+    fn sift_up(&mut self, mut position: usize) {
+        while position > 0 {
+            let parent = (position - 1) / 2;
+            if !self.less(position, parent) {
+                break;
+            }
+            self.swap(position, parent);
+            position = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut position: usize) {
+        loop {
+            let left = position * 2 + 1;
+            let right = left + 1;
+            let mut smallest = position;
+            if left < self.heap.len() && self.less(left, smallest) {
+                smallest = left;
+            }
+            if right < self.heap.len() && self.less(right, smallest) {
+                smallest = right;
+            }
+            if smallest == position {
+                break;
+            }
+            self.swap(position, smallest);
+            position = smallest;
+        }
+    }
+
+    #[inline(always)]
+    fn less(&self, lhs: usize, rhs: usize) -> bool {
+        let (lhs_due, lhs_handle) = self.heap[lhs];
+        let (rhs_due, rhs_handle) = self.heap[rhs];
+        lhs_due < rhs_due
+            || (lhs_due == rhs_due && lhs_handle.index() < rhs_handle.index())
+    }
+
+    fn swap(&mut self, lhs: usize, rhs: usize) {
+        self.heap.swap(lhs, rhs);
+        let lhs_handle = self.heap[lhs].1;
+        let rhs_handle = self.heap[rhs].1;
+        self.position[lhs_handle.index()] = lhs;
+        self.position[rhs_handle.index()] = rhs;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct GatewayProbeErrorCounters {
     non_ethernet_medium: u64,
@@ -97,6 +246,7 @@ struct GatewayProbeErrorCounters {
     no_source_address: u64,
     dispatch_failed: u64,
     gateway_changed: u64,
+    dirty: bool,
 }
 
 impl GatewayProbeErrorCounters {
@@ -109,15 +259,12 @@ impl GatewayProbeErrorCounters {
             GatewayNeighborProbeError::GatewayChanged => &mut self.gateway_changed,
         };
         *counter = counter.saturating_add(1);
+        self.dirty = true;
     }
 
     #[inline(always)]
-    fn is_empty(self) -> bool {
-        self.non_ethernet_medium == 0
-            && self.non_ipv4_gateway == 0
-            && self.no_source_address == 0
-            && self.dispatch_failed == 0
-            && self.gateway_changed == 0
+    fn is_dirty(&self) -> bool {
+        self.dirty
     }
 }
 // =============================================================================
@@ -144,7 +291,7 @@ pub(crate) struct TcpBufferPool {
     /// Free waiter-slot indices, also fully allocated at driver startup.
     waiter_free: Vec<usize>,
     /// Dense fixed bitset of waiter slots which currently contain a waker.
-    waiter_registered_bits: Vec<u64>,
+    waiter_registered_bits: Box<[u64]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,14 +398,14 @@ impl TcpBufferPool {
             tx_buffer_size: tx_size,
             waiter_slots,
             waiter_free,
-            waiter_registered_bits: vec![0; (capacity + 63) / 64],
+            waiter_registered_bits: vec![0; (capacity + 63) / 64].into_boxed_slice(),
         }
     }
 
     /// Create with default settings.
     pub(crate) fn with_defaults() -> Self {
         Self::new(
-            DEFAULT_BUFFER_POOL_SIZE,
+            SOCKET_LIFECYCLE_CAPACITY,
             TCP_RX_BUFFER_SIZE,
             TCP_TX_BUFFER_SIZE,
         )
@@ -590,18 +737,18 @@ pub(crate) struct DpdkDriver {
     raw_tail: RawTailTable,
     /// Startup-allocated handoff from committed raw tails to shared egress.
     raw_tail_egress_handles: Vec<SocketHandle>,
-    /// Min-heap of socket handles with pending smoltcp egress work and their due time.
-    pending_egress_heap: Vec<(SmolInstant, SocketHandle)>,
-    /// Dense handle-index to pending_egress_heap slot map. PENDING_EGRESS_NONE means absent.
-    pending_egress_pos: Vec<usize>,
+    /// Fixed shared min-heap and dense reverse index for pending smoltcp egress.
+    pending_egress: PendingEgress,
     /// Socket handles touched by the current smoltcp ingress drain.
     ingress_touched: Vec<SocketHandle>,
     /// Dense bitset used to deduplicate ingress touched handles.
-    ingress_touched_bits: Vec<u64>,
+    ingress_touched_bits: Box<[u64]>,
     /// True after the configured IPv4 gateway has been registered for LKG probing.
     gateway_neighbor_configured: bool,
     /// Fixed counters for typed gateway probe failures.
     gateway_probe_errors: GatewayProbeErrorCounters,
+    /// Single worker-local gate for the cold aggregated ERROR counter read.
+    infra_errors_dirty: bool,
     /// Last cold-path aggregated infrastructure ERROR report.
     last_infra_error_log: Option<Instant>,
 }
@@ -693,7 +840,7 @@ impl DpdkDriver {
         }
 
         // Pre-allocate every TCP-lifecycle index at the same fixed socket cap.
-        let sockets = SocketSet::new(Vec::with_capacity(DEFAULT_BUFFER_POOL_SIZE));
+        let sockets = SocketSet::new(Vec::with_capacity(SOCKET_LIFECYCLE_CAPACITY));
         let raw_tail_rss_key = device.raw_tail_rss_key().to_vec();
 
         Self {
@@ -702,20 +849,21 @@ impl DpdkDriver {
             iface,
             sockets,
             start_time,
-            registered_sockets: HashSet::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
+            registered_sockets: HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
             buffer_pool: TcpBufferPool::with_defaults(),
-            bound_ports: HashSet::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
+            bound_ports: HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
             raw_tail: RawTailTable::new(
                 WorkerIdentity::new(runtime_id, worker_index),
                 &raw_tail_rss_key,
             ),
             raw_tail_egress_handles: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
-            pending_egress_heap: Vec::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
-            pending_egress_pos: vec![PENDING_EGRESS_NONE; DEFAULT_BUFFER_POOL_SIZE],
-            ingress_touched: Vec::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
-            ingress_touched_bits: vec![0; (DEFAULT_BUFFER_POOL_SIZE + 63) / 64],
+            pending_egress: PendingEgress::new(),
+            ingress_touched: Vec::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
+            ingress_touched_bits: vec![0; (SOCKET_LIFECYCLE_CAPACITY + 63) / 64]
+                .into_boxed_slice(),
             gateway_neighbor_configured,
             gateway_probe_errors: GatewayProbeErrorCounters::default(),
+            infra_errors_dirty: false,
             last_infra_error_log: None,
         }
     }
@@ -981,7 +1129,7 @@ impl DpdkDriver {
         };
 
         #[cfg(feature = "market-trace")]
-        let smoltcp_egress_pending_start = self.pending_egress_heap.len();
+        let smoltcp_egress_pending_start = self.pending_egress.heap.len();
         let (egress_result, smoltcp_egress_processed) = self.poll_pending_egress(smol_now);
         #[cfg(not(feature = "market-trace"))]
         let _ = smoltcp_egress_processed;
@@ -989,7 +1137,7 @@ impl DpdkDriver {
             result = PollResult::SocketStateChanged;
         }
         #[cfg(feature = "market-trace")]
-        let smoltcp_egress_pending_end = self.pending_egress_heap.len();
+        let smoltcp_egress_pending_end = self.pending_egress.heap.len();
         #[cfg(feature = "market-trace")]
         let smoltcp_egress_dur_ns = if trace_poll {
             crate::runtime::market_trace::now_ns().saturating_sub(smoltcp_egress_start_ns)
@@ -1035,7 +1183,12 @@ impl DpdkDriver {
             || self.device.has_pending_tx()
             || self.device.has_unprocessed_rx_pending()
             || matches!(result, smoltcp::iface::PollResult::SocketStateChanged);
-        self.report_infra_errors(now);
+        self.infra_errors_dirty |= self.device.errors_dirty()
+            || self.raw_tail.errors_dirty()
+            || self.gateway_probe_errors.is_dirty();
+        if self.infra_errors_dirty {
+            self.report_infra_errors(now);
+        }
         #[cfg(feature = "market-trace")]
         if trace_poll {
             let poll_dur_ns = crate::runtime::market_trace::now_ns().saturating_sub(poll_start_ns);
@@ -1161,8 +1314,7 @@ impl DpdkDriver {
                 self.clear_socket_egress_pending(handle);
             }
         }
-        self.pending_egress_heap.clear();
-        self.pending_egress_pos.fill(PENDING_EGRESS_NONE);
+        self.pending_egress.clear_all();
         self.bound_ports.clear();
         self.buffer_pool.reclaim_listener_waiters();
     }
@@ -1341,6 +1493,15 @@ impl DpdkDriver {
     /// This adds the socket handle to the registered set so has_poll_work() stays active.
     /// Waker management is now handled by smoltcp's native mechanism.
     pub(crate) fn register_socket(&mut self, handle: SocketHandle) {
+        assert!(
+            handle.index() < SOCKET_LIFECYCLE_CAPACITY,
+            "registered TCP socket handle must fit the fixed DPDK lifecycle capacity"
+        );
+        assert!(
+            self.registered_sockets.contains(&handle)
+                || self.registered_sockets.len() < SOCKET_LIFECYCLE_CAPACITY,
+            "registered TCP socket set cannot exceed the fixed DPDK lifecycle capacity"
+        );
         self.registered_sockets.insert(handle);
     }
 
@@ -1349,7 +1510,7 @@ impl DpdkDriver {
     /// This adds the socket handle to the registered set so has_poll_work() stays active.
     /// Waker management is now handled by smoltcp's native mechanism.
     pub(crate) fn register_listen_socket(&mut self, handle: SocketHandle) {
-        self.registered_sockets.insert(handle);
+        self.register_socket(handle);
     }
 
     /// Create, bind and initiate an outbound TCP connection as one guarded setup.
@@ -1448,9 +1609,10 @@ impl DpdkDriver {
             || self.gateway_neighbor_configured
             || self.device.has_pending_tx()
             || self.device.has_unprocessed_rx_pending()
-            || !self.device.error_counters().is_empty()
-            || !self.raw_tail.error_counters().is_empty()
-            || !self.gateway_probe_errors.is_empty()
+            || self.infra_errors_dirty
+            || self.device.errors_dirty()
+            || self.raw_tail.errors_dirty()
+            || self.gateway_probe_errors.is_dirty()
     }
 
     #[inline(always)]
@@ -1498,11 +1660,7 @@ impl DpdkDriver {
     }
 
     fn report_infra_errors(&mut self, now: Instant) {
-        let device = self.device.error_counters();
-        let raw_tail = self.raw_tail.error_counters();
-        if device.is_empty() && raw_tail.is_empty() && self.gateway_probe_errors.is_empty() {
-            return;
-        }
+        debug_assert!(self.infra_errors_dirty);
         if self
             .last_infra_error_log
             .is_some_and(|last| now.saturating_duration_since(last) < INFRA_ERROR_LOG_INTERVAL)
@@ -1513,22 +1671,20 @@ impl DpdkDriver {
         let device = self.device.take_error_counters();
         let raw_tail = self.raw_tail.take_error_counters();
         let gateway = std::mem::take(&mut self.gateway_probe_errors);
+        self.infra_errors_dirty = false;
         self.last_infra_error_log = Some(now);
         eprintln!(
-            "[tokio-dpdk] ERROR bounded infrastructure failures worker={} tx_mbuf_exhausted={} tx_pending_full={} tx_append_failed={} tx_burst_invalid={} rx_mbuf_invalid={} raw_tail_ordinal_overflow={} raw_tail_pending_full={} raw_tail_packet_parse={} raw_tail_tuple_mismatch={} raw_tail_tcp_state={} raw_tail_tls_tail_missing={} raw_tail_parser_input={} gateway_non_ethernet={} gateway_non_ipv4={} gateway_no_source={} gateway_dispatch_failed={} gateway_changed={}",
+            "[tokio-dpdk] ERROR bounded infrastructure failures worker={} tx_mbuf_exhausted={} tx_pending_full={} tx_append_failed={} tx_burst_invalid={} rx_mbuf_invalid={} raw_tail_packet_parse={} raw_tail_tuple_mismatch={} raw_tail_tcp_state={} raw_tail_tls_tail_missing={} gateway_non_ethernet={} gateway_non_ipv4={} gateway_no_source={} gateway_dispatch_failed={} gateway_changed={}",
             self.worker_index,
             device.tx_mbuf_exhausted,
             device.tx_pending_full,
             device.tx_append_failed,
             device.tx_burst_invalid,
             device.rx_mbuf_invalid,
-            raw_tail.packet_ordinal_overflow,
-            raw_tail.pending_capacity_exceeded,
             raw_tail.packet_parse_failed,
             raw_tail.tuple_mismatch,
             raw_tail.tcp_state_rejected,
             raw_tail.tls_tail_not_found,
-            raw_tail.parser_input_invalid,
             gateway.non_ethernet_medium,
             gateway.non_ipv4_gateway,
             gateway.no_source_address,
@@ -1541,13 +1697,13 @@ impl DpdkDriver {
         let mut result = PollResult::None;
         let mut processed = 0usize;
         loop {
-            let Some((due, _)) = self.pending_egress_heap.first().copied() else {
+            let Some((due, _)) = self.pending_egress.heap.first().copied() else {
                 break;
             };
             if due > now {
                 break;
             }
-            let Some((_, handle)) = self.pop_pending_egress_min() else {
+            let Some((_, handle)) = self.pending_egress.pop_min() else {
                 break;
             };
             processed += 1;
@@ -1572,134 +1728,35 @@ impl DpdkDriver {
     }
 
     fn clear_socket_egress_pending(&mut self, handle: SocketHandle) {
-        let index = handle.index();
-        let Some(pos) = self.pending_egress_pos.get(index).copied() else {
-            return;
-        };
-        if pos == PENDING_EGRESS_NONE {
-            return;
-        }
-        if pos >= self.pending_egress_heap.len() || self.pending_egress_heap[pos].1 != handle {
-            return;
-        }
-        self.remove_pending_egress_at(pos);
+        self.pending_egress.clear_socket(handle);
     }
 
     fn queue_egress_at(&mut self, handle: SocketHandle, due: SmolInstant) {
-        let index = handle.index();
-        if self.pending_egress_pos.len() <= index {
-            self.pending_egress_pos.resize(index + 1, PENDING_EGRESS_NONE);
-        }
-        let pos = self.pending_egress_pos[index];
-        if pos == PENDING_EGRESS_NONE {
-            let pos = self.pending_egress_heap.len();
-            self.pending_egress_pos[index] = pos;
-            self.pending_egress_heap.push((due, handle));
-            self.sift_pending_egress_up(pos);
-            return;
-        }
-        if pos < self.pending_egress_heap.len() && self.pending_egress_heap[pos].1 == handle {
-            if due < self.pending_egress_heap[pos].0 {
-                self.pending_egress_heap[pos].0 = due;
-                self.sift_pending_egress_up(pos);
-            }
-            return;
-        }
-        let pos = self.pending_egress_heap.len();
-        self.pending_egress_pos[index] = pos;
-        self.pending_egress_heap.push((due, handle));
-        self.sift_pending_egress_up(pos);
-    }
-
-    fn pop_pending_egress_min(&mut self) -> Option<(SmolInstant, SocketHandle)> {
-        if self.pending_egress_heap.is_empty() {
-            return None;
-        }
-        Some(self.remove_pending_egress_at(0))
-    }
-
-    fn remove_pending_egress_at(&mut self, pos: usize) -> (SmolInstant, SocketHandle) {
-        let last = self.pending_egress_heap.len() - 1;
-        self.swap_pending_egress(pos, last);
-        let removed = self
-            .pending_egress_heap
-            .pop()
-            .expect("pending egress heap cannot be empty after checked remove");
-        self.pending_egress_pos[removed.1.index()] = PENDING_EGRESS_NONE;
-        if pos < self.pending_egress_heap.len() {
-            if pos > 0 && self.pending_egress_less(pos, (pos - 1) / 2) {
-                self.sift_pending_egress_up(pos);
-            } else {
-                self.sift_pending_egress_down(pos);
-            }
-        }
-        removed
-    }
-
-    fn sift_pending_egress_up(&mut self, mut pos: usize) {
-        while pos > 0 {
-            let parent = (pos - 1) / 2;
-            if !self.pending_egress_less(pos, parent) {
-                break;
-            }
-            self.swap_pending_egress(pos, parent);
-            pos = parent;
-        }
-    }
-
-    fn sift_pending_egress_down(&mut self, mut pos: usize) {
-        loop {
-            let left = pos * 2 + 1;
-            let right = left + 1;
-            let mut smallest = pos;
-            if left < self.pending_egress_heap.len()
-                && self.pending_egress_less(left, smallest)
-            {
-                smallest = left;
-            }
-            if right < self.pending_egress_heap.len()
-                && self.pending_egress_less(right, smallest)
-            {
-                smallest = right;
-            }
-            if smallest == pos {
-                break;
-            }
-            self.swap_pending_egress(pos, smallest);
-            pos = smallest;
-        }
-    }
-
-    fn pending_egress_less(&self, lhs: usize, rhs: usize) -> bool {
-        let (lhs_due, lhs_handle) = self.pending_egress_heap[lhs];
-        let (rhs_due, rhs_handle) = self.pending_egress_heap[rhs];
-        lhs_due < rhs_due
-            || (lhs_due == rhs_due && lhs_handle.index() < rhs_handle.index())
-    }
-
-    fn swap_pending_egress(&mut self, lhs: usize, rhs: usize) {
-        self.pending_egress_heap.swap(lhs, rhs);
-        let lhs_handle = self.pending_egress_heap[lhs].1;
-        let rhs_handle = self.pending_egress_heap[rhs].1;
-        self.pending_egress_pos[lhs_handle.index()] = lhs;
-        self.pending_egress_pos[rhs_handle.index()] = rhs;
+        self.pending_egress.queue_at(handle, due);
     }
 
     fn push_handle_dedup(
         handles: &mut Vec<SocketHandle>,
-        bits: &mut Vec<u64>,
+        bits: &mut [u64],
         handle: SocketHandle,
     ) {
         let index = handle.index();
         let word = index / 64;
         let bit = 1u64 << (index % 64);
-        if bits.len() <= word {
-            bits.resize(word + 1, 0);
-        }
-        if bits[word] & bit != 0 {
+        let bits_word = bits.get_mut(word).unwrap_or_else(|| {
+            panic!(
+                "smoltcp ingress handle index {} exceeds fixed DPDK lifecycle capacity {}",
+                index, SOCKET_LIFECYCLE_CAPACITY
+            )
+        });
+        if *bits_word & bit != 0 {
             return;
         }
-        bits[word] |= bit;
+        *bits_word |= bit;
+        assert!(
+            handles.len() < SOCKET_LIFECYCLE_CAPACITY,
+            "deduplicated ingress touched handles cannot exceed fixed socket capacity"
+        );
         handles.push(handle);
     }
 
@@ -1844,6 +1901,11 @@ impl DpdkDriver {
     /// Mark a port as bound (in use).
     /// Should be called when a socket binds to a port.
     pub(crate) fn bind_port(&mut self, port: u16) {
+        assert!(
+            self.bound_ports.contains(&port)
+                || self.bound_ports.len() < SOCKET_LIFECYCLE_CAPACITY,
+            "bound TCP ports cannot exceed the fixed DPDK lifecycle capacity"
+        );
         self.bound_ports.insert(port);
     }
 
@@ -1861,6 +1923,14 @@ impl DpdkDriver {
                     "No available ephemeral ports",
                 )
             });
+        }
+        if !self.bound_ports.contains(&requested_port)
+            && self.bound_ports.len() >= SOCKET_LIFECYCLE_CAPACITY
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "fixed DPDK TCP port capacity exhausted",
+            ));
         }
         reserve_explicit_port(&mut self.bound_ports, requested_port)
     }
@@ -2112,10 +2182,88 @@ mod tests {
         }
     }
 
+    fn test_socket_handles(count: usize) -> Vec<SocketHandle> {
+        let mut sockets: SocketSet<'static, LinearBuffer<'static>> =
+            SocketSet::new(Vec::with_capacity(count));
+        let mut handles = Vec::with_capacity(count);
+        for _ in 0..count {
+            let socket = TcpSocket::new(
+                LinearBuffer::with_reserve(vec![0; 64], 8),
+                LinearBuffer::with_reserve(vec![0; 64], 8),
+            );
+            handles.push(sockets.add(socket));
+        }
+        handles
+    }
+
     #[test]
     fn iface_flow_cache_matches_fixed_tcp_socket_capacity() {
         let config = dpdk_iface_config([0x02, 0, 0, 0, 0, 1]);
-        assert_eq!(config.tcp_flow_cache_capacity, DEFAULT_BUFFER_POOL_SIZE);
+        assert_eq!(SOCKET_LIFECYCLE_CAPACITY, 8192);
+        assert_eq!(config.tcp_flow_cache_capacity, SOCKET_LIFECYCLE_CAPACITY);
+        assert_eq!(RAW_TAIL_CONNECTION_CAP, SOCKET_LIFECYCLE_CAPACITY);
+    }
+
+    #[test]
+    fn shared_egress_keeps_one_heap_entry_per_socket() {
+        let handles = test_socket_handles(2);
+        let first = handles[0];
+        let second = handles[1];
+        let mut pending = PendingEgress::new();
+
+        pending.queue_at(first, SmolInstant::from_millis(300));
+        pending.queue_at(second, SmolInstant::from_millis(200));
+        pending.queue_at(first, SmolInstant::from_millis(100));
+        pending.queue_at(first, SmolInstant::from_millis(400));
+
+        assert_eq!(pending.heap.len(), 2);
+        assert_eq!(pending.pop_min(), Some((SmolInstant::from_millis(100), first)));
+        assert_eq!(pending.pop_min(), Some((SmolInstant::from_millis(200), second)));
+        assert_eq!(pending.pop_min(), None);
+        assert!(pending.position.iter().all(|position| *position == PENDING_EGRESS_NONE));
+    }
+
+    #[test]
+    fn shared_egress_clear_uses_fixed_reverse_index() {
+        let handle = test_socket_handles(1)[0];
+        let mut pending = PendingEgress::new();
+        assert_eq!(pending.position.len(), SOCKET_LIFECYCLE_CAPACITY);
+        assert!(pending.heap.capacity() >= SOCKET_LIFECYCLE_CAPACITY);
+
+        pending.queue_at(handle, SmolInstant::from_millis(50));
+        pending.clear_socket(handle);
+        pending.clear_socket(handle);
+
+        assert_eq!(pending.heap.len(), 0);
+        assert_eq!(pending.position[handle.index()], PENDING_EGRESS_NONE);
+    }
+
+    #[test]
+    fn shared_egress_reverse_index_mismatch_is_never_silently_duplicated() {
+        let handle = test_socket_handles(1)[0];
+        let mut pending = PendingEgress::new();
+        pending.queue_at(handle, SmolInstant::from_millis(50));
+        pending.position[handle.index()] = SOCKET_LIFECYCLE_CAPACITY;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pending.queue_at(handle, SmolInstant::from_millis(10));
+        }));
+        assert!(result.is_err());
+        assert_eq!(pending.heap.len(), 1);
+    }
+
+    #[test]
+    fn ingress_touched_dedup_uses_fixed_bitset_without_growth() {
+        let handle = test_socket_handles(1)[0];
+        let mut handles = Vec::with_capacity(SOCKET_LIFECYCLE_CAPACITY);
+        let mut bits = vec![0u64; (SOCKET_LIFECYCLE_CAPACITY + 63) / 64]
+            .into_boxed_slice();
+
+        DpdkDriver::push_handle_dedup(&mut handles, &mut bits, handle);
+        DpdkDriver::push_handle_dedup(&mut handles, &mut bits, handle);
+
+        assert_eq!(handles, vec![handle]);
+        assert_eq!(bits.len(), SOCKET_LIFECYCLE_CAPACITY / 64);
     }
 
     #[test]
@@ -2136,6 +2284,7 @@ mod tests {
     #[test]
     fn gateway_probe_failures_keep_typed_fixed_counters() {
         let mut counters = GatewayProbeErrorCounters::default();
+        assert!(!counters.is_dirty());
         counters.record(GatewayNeighborProbeError::NonEthernetMedium);
         counters.record(GatewayNeighborProbeError::NonIpv4Gateway);
         counters.record(GatewayNeighborProbeError::NoSourceAddress);
@@ -2148,6 +2297,7 @@ mod tests {
         assert_eq!(counters.no_source_address, 1);
         assert_eq!(counters.dispatch_failed, 1);
         assert_eq!(counters.gateway_changed, 2);
+        assert!(counters.is_dirty());
     }
 
     #[test]

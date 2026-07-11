@@ -54,16 +54,43 @@ pub(crate) struct DeviceErrorCounters {
     pub(crate) tx_append_failed: u64,
     pub(crate) tx_burst_invalid: u64,
     pub(crate) rx_mbuf_invalid: u64,
+    dirty: bool,
 }
 
 impl DeviceErrorCounters {
     #[inline(always)]
-    pub(crate) fn is_empty(self) -> bool {
-        self.tx_mbuf_exhausted == 0
-            && self.tx_pending_full == 0
-            && self.tx_append_failed == 0
-            && self.tx_burst_invalid == 0
-            && self.rx_mbuf_invalid == 0
+    fn record_tx_mbuf_exhausted(&mut self) {
+        self.tx_mbuf_exhausted = self.tx_mbuf_exhausted.saturating_add(1);
+        self.dirty = true;
+    }
+
+    #[inline(always)]
+    fn record_tx_pending_full(&mut self) {
+        self.tx_pending_full = self.tx_pending_full.saturating_add(1);
+        self.dirty = true;
+    }
+
+    #[inline(always)]
+    fn record_tx_append_failed(&mut self) {
+        self.tx_append_failed = self.tx_append_failed.saturating_add(1);
+        self.dirty = true;
+    }
+
+    #[inline(always)]
+    fn record_tx_burst_invalid(&mut self) {
+        self.tx_burst_invalid = self.tx_burst_invalid.saturating_add(1);
+        self.dirty = true;
+    }
+
+    #[inline(always)]
+    fn record_rx_mbuf_invalid(&mut self) {
+        self.rx_mbuf_invalid = self.rx_mbuf_invalid.saturating_add(1);
+        self.dirty = true;
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty
     }
 }
 
@@ -511,10 +538,7 @@ impl DpdkDevice {
                 // capture_mbuf before the next burst is requested.
                 for &raw_mbuf in &self.rx_burst_buf[..n as usize] {
                     let Some(mbuf) = (unsafe { OwnedMbuf::from_received(raw_mbuf) }) else {
-                        self.error_counters.rx_mbuf_invalid = self
-                            .error_counters
-                            .rx_mbuf_invalid
-                            .saturating_add(1);
+                        self.error_counters.record_rx_mbuf_invalid();
                         continue;
                     };
                     let mbuf = if raw_tail.is_empty() {
@@ -576,10 +600,7 @@ impl DpdkDevice {
             )
         } as usize;
         if sent > total {
-            self.error_counters.tx_burst_invalid = self
-                .error_counters
-                .tx_burst_invalid
-                .saturating_add(1);
+            self.error_counters.record_tx_burst_invalid();
             stats.remaining_packets = total;
             return stats;
         }
@@ -595,8 +616,9 @@ impl DpdkDevice {
         !self.tx_buffer.is_empty()
     }
 
-    pub(crate) fn error_counters(&self) -> DeviceErrorCounters {
-        self.error_counters
+    #[inline(always)]
+    pub(crate) fn errors_dirty(&self) -> bool {
+        self.error_counters.is_dirty()
     }
 
     pub(crate) fn take_error_counters(&mut self) -> DeviceErrorCounters {
@@ -616,10 +638,7 @@ impl DpdkDevice {
     #[inline(always)]
     fn try_reserve_tx_mbuf(&mut self) -> Option<PreparedTxMbuf> {
         if self.tx_buffer.len() >= TX_PENDING_CAP {
-            self.error_counters.tx_pending_full = self
-                .error_counters
-                .tx_pending_full
-                .saturating_add(1);
+            self.error_counters.record_tx_pending_full();
             return None;
         }
         let prepared = prepare_tx_resource(
@@ -632,17 +651,11 @@ impl DpdkDevice {
         match prepared {
             Ok((mbuf, data)) => Some(PreparedTxMbuf { mbuf, data }),
             Err(TxPrepareFailure::Allocation) => {
-                self.error_counters.tx_mbuf_exhausted = self
-                    .error_counters
-                    .tx_mbuf_exhausted
-                    .saturating_add(1);
+                self.error_counters.record_tx_mbuf_exhausted();
                 None
             }
             Err(TxPrepareFailure::Append) => {
-                self.error_counters.tx_append_failed = self
-                    .error_counters
-                    .tx_append_failed
-                    .saturating_add(1);
+                self.error_counters.record_tx_append_failed();
                 None
             }
         }
@@ -748,10 +761,7 @@ impl Device for DpdkDevice {
         let raw_rx = *self.rx_pending.get(self.rx_index)?;
         let prepared = self.try_reserve_tx_mbuf()?;
         let Some(rx_mbuf) = (unsafe { OwnedMbuf::from_received(raw_rx) }) else {
-            self.error_counters.rx_mbuf_invalid = self
-                .error_counters
-                .rx_mbuf_invalid
-                .saturating_add(1);
+            self.error_counters.record_rx_mbuf_invalid();
             return None;
         };
         self.rx_index += 1;
@@ -803,6 +813,26 @@ mod tests {
         fn drop(&mut self) {
             self.0.set(self.0.get() + 1);
         }
+    }
+
+    #[test]
+    fn device_error_counter_dirty_flag_tracks_any_typed_error() {
+        let mut counters = DeviceErrorCounters::default();
+        assert!(!counters.is_dirty());
+
+        counters.record_tx_mbuf_exhausted();
+        counters.record_tx_pending_full();
+        counters.record_tx_append_failed();
+        counters.record_tx_burst_invalid();
+        counters.record_rx_mbuf_invalid();
+
+        assert!(counters.is_dirty());
+        assert_eq!(counters.tx_mbuf_exhausted, 1);
+        assert_eq!(counters.tx_pending_full, 1);
+        assert_eq!(counters.tx_append_failed, 1);
+        assert_eq!(counters.tx_burst_invalid, 1);
+        assert_eq!(counters.rx_mbuf_invalid, 1);
+        assert!(!DeviceErrorCounters::default().is_dirty());
     }
 
     #[test]
