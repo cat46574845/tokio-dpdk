@@ -3,6 +3,7 @@
 //! Provides borrowed and owned split halves for concurrent read/write.
 
 use std::io;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -203,11 +204,16 @@ impl AsyncWrite for WriteHalf<'_> {
 #[derive(Debug)]
 pub struct OwnedReadHalf {
     stream: Arc<TcpDpdkStream>,
+    /// Keeps the owned half on the worker which owns the numeric socket handle.
+    _worker_affinity: PhantomData<*const ()>,
 }
 
 impl OwnedReadHalf {
     pub(super) fn new(stream: Arc<TcpDpdkStream>) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            _worker_affinity: PhantomData,
+        }
     }
 
     /// Returns the local address of this stream.
@@ -288,11 +294,16 @@ impl AsyncRead for OwnedReadHalf {
 #[derive(Debug)]
 pub struct OwnedWriteHalf {
     stream: Arc<TcpDpdkStream>,
+    /// Keeps the owned half on the worker which owns the numeric socket handle.
+    _worker_affinity: PhantomData<*const ()>,
 }
 
 impl OwnedWriteHalf {
     pub(super) fn new(stream: Arc<TcpDpdkStream>) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            _worker_affinity: PhantomData,
+        }
     }
 
     /// Returns the local address of this stream.

@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::task::Waker;
 use std::time::Instant;
 
 use smoltcp::iface::{
@@ -23,7 +24,8 @@ use smoltcp::socket::Socket as SmolSocket;
 use smoltcp::storage::LinearBuffer;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address,
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
+    Ipv6Address,
 };
 
 use super::device::DpdkDevice;
@@ -85,6 +87,52 @@ pub(crate) struct TcpBufferPool {
     rx_buffer_size: usize,
     /// Required TX buffer size
     tx_buffer_size: usize,
+    /// Fixed listener waiter slots. A slot is allocated only while a listener
+    /// is blocked on this pool, and never grows after driver startup.
+    waiter_slots: Vec<TcpBufferWaiterSlot>,
+    /// Free waiter-slot indices, also fully allocated at driver startup.
+    waiter_free: Vec<usize>,
+    /// Dense fixed bitset of waiter slots which currently contain a waker.
+    waiter_registered_bits: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TcpBufferWaiterHandle {
+    index: usize,
+    generation: u64,
+}
+
+struct TcpBufferWaiterSlot {
+    generation: u64,
+    allocated: bool,
+    waker: Option<Waker>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TcpBufferWaiterError {
+    Full { capacity: usize },
+    InvalidHandle { index: usize },
+    StaleHandle { index: usize },
+    DuplicateFree { index: usize },
+}
+
+impl std::fmt::Display for TcpBufferWaiterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full { capacity } => {
+                write!(f, "TCP buffer listener waiter capacity exhausted capacity={}", capacity)
+            }
+            Self::InvalidHandle { index } => {
+                write!(f, "invalid TCP buffer listener waiter index={}", index)
+            }
+            Self::StaleHandle { index } => {
+                write!(f, "stale TCP buffer listener waiter index={}", index)
+            }
+            Self::DuplicateFree { index } => {
+                write!(f, "TCP buffer listener waiter already released index={}", index)
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -129,11 +177,19 @@ impl TcpBufferPool {
     pub(crate) fn new(capacity: usize, rx_size: usize, tx_size: usize) -> Self {
         let mut rx_free = Vec::with_capacity(capacity);
         let mut tx_free = Vec::with_capacity(capacity);
+        let mut waiter_slots = Vec::with_capacity(capacity);
+        let mut waiter_free = Vec::with_capacity(capacity);
 
         // Pre-allocate all buffers at startup
-        for _ in 0..capacity {
+        for index in 0..capacity {
             rx_free.push(vec![0u8; rx_size]);
             tx_free.push(vec![0u8; tx_size]);
+            waiter_slots.push(TcpBufferWaiterSlot {
+                generation: 0,
+                allocated: false,
+                waker: None,
+            });
+            waiter_free.push(capacity - index - 1);
         }
 
         Self {
@@ -142,6 +198,9 @@ impl TcpBufferPool {
             capacity,
             rx_buffer_size: rx_size,
             tx_buffer_size: tx_size,
+            waiter_slots,
+            waiter_free,
+            waiter_registered_bits: vec![0; (capacity + 63) / 64],
         }
     }
 
@@ -201,7 +260,125 @@ impl TcpBufferPool {
         }
         self.rx_free.push(rx);
         self.tx_free.push(tx);
+        self.wake_listener_waiters();
         Ok(())
+    }
+
+    fn allocate_listener_waiter(
+        &mut self,
+    ) -> Result<TcpBufferWaiterHandle, TcpBufferWaiterError> {
+        let Some(&index) = self.waiter_free.last() else {
+            return Err(TcpBufferWaiterError::Full {
+                capacity: self.waiter_slots.len(),
+            });
+        };
+        let Some(slot) = self.waiter_slots.get_mut(index) else {
+            return Err(TcpBufferWaiterError::InvalidHandle { index });
+        };
+        if slot.allocated {
+            return Err(TcpBufferWaiterError::StaleHandle { index });
+        }
+        self.waiter_free.pop();
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.allocated = true;
+        slot.waker = None;
+        Ok(TcpBufferWaiterHandle {
+            index,
+            generation: slot.generation,
+        })
+    }
+
+    fn register_listener_waiter(
+        &mut self,
+        handle: TcpBufferWaiterHandle,
+        waker: &Waker,
+    ) -> Result<(), TcpBufferWaiterError> {
+        let slot = self.listener_waiter_slot_mut(handle)?;
+        if slot
+            .waker
+            .as_ref()
+            .is_some_and(|registered| registered.will_wake(waker))
+        {
+            return Ok(());
+        }
+        slot.waker = Some(waker.clone());
+        let word = handle.index / 64;
+        let bit = 1u64 << (handle.index % 64);
+        self.waiter_registered_bits[word] |= bit;
+        Ok(())
+    }
+
+    fn clear_listener_waiter(
+        &mut self,
+        handle: TcpBufferWaiterHandle,
+    ) -> Result<(), TcpBufferWaiterError> {
+        self.listener_waiter_slot_mut(handle)?.waker = None;
+        let word = handle.index / 64;
+        let bit = 1u64 << (handle.index % 64);
+        self.waiter_registered_bits[word] &= !bit;
+        Ok(())
+    }
+
+    fn release_listener_waiter(
+        &mut self,
+        handle: TcpBufferWaiterHandle,
+    ) -> Result<(), TcpBufferWaiterError> {
+        if self.waiter_free.len() >= self.waiter_slots.len() {
+            return Err(TcpBufferWaiterError::DuplicateFree {
+                index: handle.index,
+            });
+        }
+        self.clear_listener_waiter(handle)?;
+        let slot = self.listener_waiter_slot_mut(handle)?;
+        slot.allocated = false;
+        self.waiter_free.push(handle.index);
+        Ok(())
+    }
+
+    fn listener_waiter_slot_mut(
+        &mut self,
+        handle: TcpBufferWaiterHandle,
+    ) -> Result<&mut TcpBufferWaiterSlot, TcpBufferWaiterError> {
+        let Some(slot) = self.waiter_slots.get_mut(handle.index) else {
+            return Err(TcpBufferWaiterError::InvalidHandle {
+                index: handle.index,
+            });
+        };
+        if !slot.allocated || slot.generation != handle.generation {
+            return Err(TcpBufferWaiterError::StaleHandle {
+                index: handle.index,
+            });
+        }
+        Ok(slot)
+    }
+
+    fn wake_listener_waiters(&mut self) {
+        for word_index in 0..self.waiter_registered_bits.len() {
+            let mut registered = std::mem::replace(
+                &mut self.waiter_registered_bits[word_index],
+                0,
+            );
+            while registered != 0 {
+                let bit_index = registered.trailing_zeros() as usize;
+                registered &= registered - 1;
+                let slot_index = word_index * 64 + bit_index;
+                let Some(slot) = self.waiter_slots.get_mut(slot_index) else {
+                    eprintln!(
+                        "[tokio-dpdk] ERROR TCP buffer waiter bit references invalid slot index={}",
+                        slot_index
+                    );
+                    continue;
+                };
+                let Some(waker) = slot.waker.take() else {
+                    eprintln!(
+                        "[tokio-dpdk] ERROR TCP buffer waiter bit has no waker index={}",
+                        slot_index
+                    );
+                    continue;
+                };
+                waker.wake();
+            }
+        }
     }
 }
 
@@ -231,6 +408,31 @@ struct ConnectSetupGuard<'a, O: ConnectResourceOwner> {
     handle: SocketHandle,
     local_port: Option<u16>,
     armed: bool,
+}
+
+struct ListenSetupGuard<'a, O: ConnectResourceOwner> {
+    owner: &'a mut O,
+    handle: SocketHandle,
+    armed: bool,
+}
+
+impl<'a, O: ConnectResourceOwner> ListenSetupGuard<'a, O> {
+    fn new(owner: &'a mut O, handle: SocketHandle) -> Self {
+        Self {
+            owner,
+            handle,
+            armed: true,
+        }
+    }
+
+    fn owner_mut(&mut self) -> &mut O {
+        self.owner
+    }
+
+    fn disarm(mut self) -> SocketHandle {
+        self.armed = false;
+        self.handle
+    }
 }
 
 impl<'a, O: ConnectResourceOwner> ConnectSetupGuard<'a, O> {
@@ -279,6 +481,20 @@ impl<O: ConnectResourceOwner> Drop for ConnectSetupGuard<'_, O> {
         }
         if let Some(port) = self.local_port.take() {
             self.owner.cleanup_connect_port(port);
+        }
+    }
+}
+
+impl<O: ConnectResourceOwner> Drop for ListenSetupGuard<'_, O> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.owner.cleanup_connect_socket(self.handle) {
+            eprintln!(
+                "[tokio-dpdk] ERROR TCP listen setup failed to remove socket handle={:?} error={}",
+                self.handle, error
+            );
         }
     }
 }
@@ -880,6 +1096,52 @@ impl DpdkDriver {
         Some(self.sockets.add(socket))
     }
 
+    /// Create and configure one listening TCP socket. `Ok(None)` means the
+    /// fixed buffer pool is temporarily exhausted; no resource was acquired.
+    pub(crate) fn try_create_tcp_listen_socket(
+        &mut self,
+        endpoint: IpListenEndpoint,
+    ) -> io::Result<Option<SocketHandle>> {
+        let Some(handle) = self.create_tcp_socket() else {
+            return Ok(None);
+        };
+        let mut setup = ListenSetupGuard::new(self, handle);
+        setup.owner_mut().register_listen_socket(handle);
+        setup
+            .owner_mut()
+            .get_tcp_socket_mut(handle)
+            .listen(endpoint)
+            .map_err(listen_error_to_io)?;
+        Ok(Some(setup.disarm()))
+    }
+
+    pub(crate) fn allocate_tcp_buffer_waiter(
+        &mut self,
+    ) -> io::Result<TcpBufferWaiterHandle> {
+        self.buffer_pool
+            .allocate_listener_waiter()
+            .map_err(tcp_buffer_waiter_error_to_io)
+    }
+
+    pub(crate) fn register_tcp_buffer_waiter(
+        &mut self,
+        handle: TcpBufferWaiterHandle,
+        waker: &Waker,
+    ) -> io::Result<()> {
+        self.buffer_pool
+            .register_listener_waiter(handle, waker)
+            .map_err(tcp_buffer_waiter_error_to_io)
+    }
+
+    pub(crate) fn release_tcp_buffer_waiter(
+        &mut self,
+        handle: TcpBufferWaiterHandle,
+    ) -> io::Result<()> {
+        self.buffer_pool
+            .release_listener_waiter(handle)
+            .map_err(tcp_buffer_waiter_error_to_io)
+    }
+
     /// Register a connect socket for tracking.
     ///
     /// This adds the socket handle to the registered set so has_registered_sockets() works.
@@ -954,14 +1216,18 @@ impl DpdkDriver {
 
     /// Remove a socket from the socket set and return its buffers to the pool.
     pub(crate) fn remove_socket(&mut self, handle: SocketHandle) -> io::Result<()> {
-        self.iface.unregister_tcp_flow(handle);
-        self.clear_socket_egress_pending(handle);
+        validate_socket_for_removal(&self.sockets, &self.registered_sockets, handle)?;
+
         if !self.registered_sockets.remove(&handle) {
             return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("socket handle {:?} is not registered", handle),
+                io::ErrorKind::InvalidData,
+                format!("socket handle {:?} registration changed during removal", handle),
             ));
         }
+        self.iface.unregister_tcp_flow(handle);
+        self.clear_socket_egress_pending(handle);
+        // SocketSet is exclusively borrowed and was validated immediately
+        // above, so its panic-only invalid-handle branch is unreachable here.
         let socket = self.sockets.remove(handle);
         recycle_removed_socket(&mut self.buffer_pool, socket).map_err(|error| {
             io::Error::new(
@@ -1405,6 +1671,24 @@ fn connect_error_to_io(error: smoltcp::socket::tcp::ConnectError) -> io::Error {
     io::Error::new(kind, format!("TCP connect setup failed: {}", error))
 }
 
+fn listen_error_to_io(error: smoltcp::socket::tcp::ListenError) -> io::Error {
+    let kind = match error {
+        smoltcp::socket::tcp::ListenError::InvalidState => io::ErrorKind::AlreadyExists,
+        smoltcp::socket::tcp::ListenError::Unaddressable => io::ErrorKind::InvalidInput,
+    };
+    io::Error::new(kind, format!("TCP listen setup failed: {}", error))
+}
+
+fn tcp_buffer_waiter_error_to_io(error: TcpBufferWaiterError) -> io::Error {
+    let kind = match &error {
+        TcpBufferWaiterError::Full { .. } => io::ErrorKind::OutOfMemory,
+        TcpBufferWaiterError::InvalidHandle { .. }
+        | TcpBufferWaiterError::StaleHandle { .. }
+        | TcpBufferWaiterError::DuplicateFree { .. } => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error.to_string())
+}
+
 fn connect_socket_and_register_flow<'a>(
     iface: &mut Interface,
     sockets: &mut SocketSet<'a, LinearBuffer<'a>>,
@@ -1487,6 +1771,29 @@ fn recycle_removed_socket<'a>(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
+fn validate_socket_for_removal<'a>(
+    sockets: &SocketSet<'a, LinearBuffer<'a>>,
+    registered_sockets: &HashSet<SocketHandle>,
+    handle: SocketHandle,
+) -> io::Result<()> {
+    if !registered_sockets.contains(&handle) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("socket handle {:?} is not registered", handle),
+        ));
+    }
+    if !sockets.iter().any(|(candidate, _)| candidate == handle) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "registered socket handle {:?} is absent from SocketSet",
+                handle
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn endpoint_to_socket_addr(endpoint: smoltcp::wire::IpEndpoint) -> std::io::Result<std::net::SocketAddr> {
     let ip = match endpoint.addr {
         smoltcp::wire::IpAddress::Ipv4(addr) => {
@@ -1507,6 +1814,23 @@ fn endpoint_to_socket_addr(endpoint: smoltcp::wire::IpEndpoint) -> std::io::Resu
 mod tests {
     use super::*;
     use smoltcp::phy::{Loopback, Medium};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Wake, Waker};
+
+    struct CountWake {
+        count: AtomicUsize,
+    }
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     #[derive(Default)]
     struct FakeConnectOwner {
@@ -1579,6 +1903,23 @@ mod tests {
     }
 
     #[test]
+    fn invalid_socket_removal_is_reported_before_socket_set_remove() {
+        let sockets: SocketSet<'_, LinearBuffer<'_>> =
+            SocketSet::new(Vec::with_capacity(1));
+        let handle = SocketHandle::default();
+        let mut registered = HashSet::with_capacity(1);
+
+        let unregistered = validate_socket_for_removal(&sockets, &registered, handle)
+            .expect_err("an unregistered handle must be rejected");
+        assert_eq!(unregistered.kind(), io::ErrorKind::NotFound);
+
+        registered.insert(handle);
+        let absent = validate_socket_for_removal(&sockets, &registered, handle)
+            .expect_err("a stale registered handle must be rejected without panic");
+        assert_eq!(absent.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn fixed_pool_reports_exhaustion_and_rejects_invalid_release() {
         let mut pool = TcpBufferPool::new(1, 64, 32);
         assert_eq!(
@@ -1597,6 +1938,56 @@ mod tests {
             })
         );
         assert_eq!(pool.available(), 0);
+    }
+
+    #[test]
+    fn fixed_pool_release_wakes_every_registered_listener_without_allocating() {
+        let mut pool = TcpBufferPool::new(2, 64, 32);
+        let (rx, tx) = pool.acquire().expect("one buffer pair must be checked out");
+        let first = pool
+            .allocate_listener_waiter()
+            .expect("first fixed waiter slot must exist");
+        let second = pool
+            .allocate_listener_waiter()
+            .expect("second fixed waiter slot must exist");
+        assert_eq!(
+            pool.allocate_listener_waiter(),
+            Err(TcpBufferWaiterError::Full { capacity: 2 })
+        );
+
+        let first_wake = Arc::new(CountWake {
+            count: AtomicUsize::new(0),
+        });
+        let second_wake = Arc::new(CountWake {
+            count: AtomicUsize::new(0),
+        });
+        let first_waker = Waker::from(first_wake.clone());
+        let second_waker = Waker::from(second_wake.clone());
+        pool.register_listener_waiter(first, &first_waker)
+            .expect("first listener must register");
+        pool.register_listener_waiter(second, &second_waker)
+            .expect("second listener must register");
+
+        pool.release(rx, tx)
+            .expect("returning a checked-out pair must wake waiters");
+        assert_eq!(first_wake.count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_wake.count.load(Ordering::Relaxed), 1);
+
+        let (rx, tx) = pool
+            .acquire()
+            .expect("a woken listener must be able to consume the returned pair");
+        pool.register_listener_waiter(first, &first_waker)
+            .expect("an exhausted listener must be able to register again");
+        pool.release(rx, tx)
+            .expect("a later return must wake a listener registered again");
+        assert_eq!(first_wake.count.load(Ordering::Relaxed), 2);
+        assert_eq!(second_wake.count.load(Ordering::Relaxed), 1);
+
+        pool.release_listener_waiter(first)
+            .expect("first waiter slot must return to the fixed free list");
+        pool.release_listener_waiter(second)
+            .expect("second waiter slot must return to the fixed free list");
+        assert_eq!(pool.waiter_free.len(), 2);
     }
 
     #[test]
@@ -1653,5 +2044,20 @@ mod tests {
         assert_eq!(resources.local_port, 50_002);
         assert!(owner.removed.is_empty());
         assert!(owner.released.is_empty());
+    }
+
+    #[test]
+    fn listen_setup_guard_removes_socket_on_every_early_return() {
+        let handle = SocketHandle::default();
+        let mut owner = FakeConnectOwner::default();
+        {
+            let _guard = ListenSetupGuard::new(&mut owner, handle);
+        }
+        assert_eq!(owner.removed, vec![handle]);
+
+        owner.removed.clear();
+        let transferred = ListenSetupGuard::new(&mut owner, handle).disarm();
+        assert_eq!(transferred, handle);
+        assert!(owner.removed.is_empty());
     }
 }

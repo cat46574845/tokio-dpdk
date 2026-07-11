@@ -91,6 +91,7 @@ struct OutboundConnectGuard<C: FnOnce(SocketHandle, u16, usize)> {
     local_port: u16,
     core_id: usize,
     cleanup: Option<C>,
+    _worker_affinity: PhantomData<*const ()>,
 }
 
 impl<C: FnOnce(SocketHandle, u16, usize)> OutboundConnectGuard<C> {
@@ -100,6 +101,7 @@ impl<C: FnOnce(SocketHandle, u16, usize)> OutboundConnectGuard<C> {
             local_port,
             core_id,
             cleanup: Some(cleanup),
+            _worker_affinity: PhantomData,
         }
     }
 
@@ -211,6 +213,9 @@ pub struct TcpDpdkStream {
     write_shutdown: std::sync::atomic::AtomicBool,
     /// Last error encountered (stored as ErrorKind since io::Error doesn't impl Clone)
     last_error: std::sync::Mutex<Option<io::ErrorKind>>,
+    /// Socket handles are indices into one worker-local SocketSet. Keeping the
+    /// stream !Send + !Sync makes that affinity a type-level invariant.
+    _worker_affinity: PhantomData<*const ()>,
 }
 
 impl TcpDpdkStream {
@@ -232,6 +237,7 @@ impl TcpDpdkStream {
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
             write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
+            _worker_affinity: PhantomData,
         }
     }
 
@@ -380,6 +386,7 @@ impl TcpDpdkStream {
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
             write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
+            _worker_affinity: PhantomData,
         })
     }
 
@@ -476,6 +483,7 @@ impl TcpDpdkStream {
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
             write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
+            _worker_affinity: PhantomData,
         })
     }
 
@@ -1610,6 +1618,25 @@ mod lifecycle_tests {
     use std::cell::RefCell;
     use std::mem::ManuallyDrop;
     use std::rc::Rc;
+
+    trait AmbiguousIfSend<Marker> {
+        fn marker() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+
+    struct ImplementsSend;
+
+    impl<T: ?Sized + Send> AmbiguousIfSend<ImplementsSend> for T {}
+
+    #[test]
+    fn worker_affine_socket_owners_are_not_send() {
+        let _ = <OutboundConnectGuard<fn(SocketHandle, u16, usize)> as AmbiguousIfSend<_>>::marker;
+        let _ = <TcpDpdkStream as AmbiguousIfSend<_>>::marker;
+        let _ = <crate::net::tcp_dpdk::OwnedReadHalf as AmbiguousIfSend<_>>::marker;
+        let _ = <crate::net::tcp_dpdk::OwnedWriteHalf as AmbiguousIfSend<_>>::marker;
+        let _ = <crate::net::tcp_dpdk::TcpDpdkListener as AmbiguousIfSend<_>>::marker;
+    }
 
     #[test]
     fn pending_connect_guard_cleans_handle_and_port_on_drop() {

@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::task::{Context, Poll};
 
@@ -14,6 +15,7 @@ use smoltcp::iface::SocketHandle;
 
 use super::stream::TcpDpdkStream;
 use crate::net::{to_socket_addrs, ToSocketAddrs};
+use crate::runtime::scheduler::dpdk::dpdk_driver::TcpBufferWaiterHandle;
 use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver};
 
 /// Default number of listening sockets in the pool.
@@ -30,6 +32,68 @@ struct ListenerInner {
     listen_pool: VecDeque<ListenSocket>,
     /// Backlog size (number of listening sockets to maintain)
     backlog: usize,
+    /// Fixed driver waiter slot held only while this listener has observed
+    /// buffer-pool exhaustion.
+    buffer_waiter: Option<TcpBufferWaiterHandle>,
+}
+
+struct ListenerBindGuard {
+    listen_pool: VecDeque<ListenSocket>,
+    port: u16,
+    core_id: usize,
+    armed: bool,
+}
+
+impl ListenerBindGuard {
+    fn new(listen_pool: VecDeque<ListenSocket>, port: u16, core_id: usize) -> Self {
+        Self {
+            listen_pool,
+            port,
+            core_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) -> VecDeque<ListenSocket> {
+        self.armed = false;
+        std::mem::take(&mut self.listen_pool)
+    }
+}
+
+impl Drop for ListenerBindGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if current_worker_index() != Some(self.core_id) {
+            eprintln!(
+                "[tokio-dpdk] ERROR listener bind cleanup outside owner worker owner={:?} current={:?}",
+                self.core_id,
+                current_worker_index()
+            );
+            return;
+        }
+        let port = self.port;
+        let listen_pool = &mut self.listen_pool;
+        if with_current_driver(|driver| {
+            for listen_socket in listen_pool.drain(..) {
+                if let Err(error) = driver.remove_socket(listen_socket.handle) {
+                    eprintln!(
+                        "[tokio-dpdk] ERROR listener bind cleanup failed handle={:?} error={}",
+                        listen_socket.handle, error
+                    );
+                }
+            }
+            driver.release_port(port);
+        })
+        .is_none()
+        {
+            eprintln!(
+                "[tokio-dpdk] ERROR DPDK driver unavailable during listener bind cleanup owner={}",
+                self.core_id
+            );
+        }
+    }
 }
 
 /// A DPDK-backed TCP listener with connection pool support.
@@ -75,6 +139,8 @@ pub struct TcpDpdkListener {
     core_id: usize,
     /// Local address
     local_addr: SocketAddr,
+    /// Listener handles are indices into one worker-local SocketSet.
+    _worker_affinity: PhantomData<*const ()>,
 }
 
 impl TcpDpdkListener {
@@ -130,6 +196,19 @@ impl TcpDpdkListener {
             )
         })?;
 
+        // Allocate listener-owned metadata before acquiring the worker-local
+        // port so an allocation failure cannot strand that port.
+        let mut listen_pool = VecDeque::new();
+        listen_pool.try_reserve_exact(backlog).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "failed to allocate TCP listener backlog capacity={} error={}",
+                    backlog, error
+                ),
+            )
+        })?;
+
         // Check if port is already in use
         let port = addr.port();
         with_current_driver(|driver| {
@@ -145,83 +224,73 @@ impl TcpDpdkListener {
         })
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to access DPDK driver"))??;
 
-        // Create initial pool of listening sockets
-        let mut listen_pool = VecDeque::with_capacity(backlog);
+        // From this point every early return removes all sockets and releases
+        // the bound port on this same worker.
+        let mut setup = ListenerBindGuard::new(listen_pool, port, core_id);
 
         // Create at least one listen socket, up to backlog size
         let initial_count = backlog.min(8); // Start with 8, grow on demand
         for _ in 0..initial_count {
-            match Self::create_listen_socket(addr) {
-                Ok(socket) => listen_pool.push_back(socket),
-                Err(e) => {
-                    // If we can't create even one socket, fail
-                    if listen_pool.is_empty() {
-                        // Release the port since we're failing
-                        with_current_driver(|driver| {
-                            driver.release_port(port);
-                        });
-                        return Err(e);
+            match Self::try_create_listen_socket(addr)? {
+                Some(socket) => setup.listen_pool.push_back(socket),
+                None => {
+                    if setup.listen_pool.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::OutOfMemory,
+                            "No buffers available in fixed TCP socket pool",
+                        ));
                     }
-                    // Otherwise, just use what we have
                     break;
                 }
             }
         }
+        let listen_pool = setup.disarm();
 
         Ok(Self {
             inner: RefCell::new(ListenerInner {
                 listen_pool,
                 backlog,
+                buffer_waiter: None,
             }),
             core_id,
             local_addr: addr,
+            _worker_affinity: PhantomData,
         })
     }
 
-    /// Create a new listening socket for the pool.
-    fn create_listen_socket(addr: SocketAddr) -> io::Result<ListenSocket> {
+    fn listen_endpoint(addr: SocketAddr) -> smoltcp::wire::IpListenEndpoint {
+        match addr {
+            SocketAddr::V4(v4) => smoltcp::wire::IpListenEndpoint {
+                addr: if v4.ip().is_unspecified() {
+                    None
+                } else {
+                    Some(smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(
+                        v4.ip().octets(),
+                    )))
+                },
+                port: v4.port(),
+            },
+            SocketAddr::V6(v6) => smoltcp::wire::IpListenEndpoint {
+                addr: if v6.ip().is_unspecified() {
+                    None
+                } else {
+                    Some(smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(
+                        v6.ip().octets(),
+                    )))
+                },
+                port: v6.port(),
+            },
+        }
+    }
+
+    /// `Ok(None)` is the expected fixed-pool exhaustion state. The caller
+    /// either fails setup or installs a pool waiter before returning Pending.
+    fn try_create_listen_socket(addr: SocketAddr) -> io::Result<Option<ListenSocket>> {
+        let endpoint = Self::listen_endpoint(addr);
         with_current_driver(|driver| {
-            // Create new TCP socket from pool
-            let handle = driver.create_tcp_socket().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "No buffers available in TCP socket pool",
-                )
-            })?;
-
-            // Register socket for tracking (waker management is by smoltcp)
-            driver.register_listen_socket(handle);
-
-            // Configure and listen
-            let socket = driver.get_tcp_socket_mut(handle);
-            let endpoint = match addr {
-                SocketAddr::V4(v4) => smoltcp::wire::IpListenEndpoint {
-                    addr: if v4.ip().is_unspecified() {
-                        None
-                    } else {
-                        Some(smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(
-                            v4.ip().octets(),
-                        )))
-                    },
-                    port: v4.port(),
-                },
-                SocketAddr::V6(v6) => smoltcp::wire::IpListenEndpoint {
-                    addr: if v6.ip().is_unspecified() {
-                        None
-                    } else {
-                        Some(smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(
-                            v6.ip().octets(),
-                        )))
-                    },
-                    port: v6.port(),
-                },
-            };
-
-            socket
-                .listen(endpoint)
-                .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, format!("{:?}", e)))?;
-
-            Ok::<_, io::Error>(ListenSocket { handle })
+            driver
+                .try_create_tcp_listen_socket(endpoint)
+                .map(|handle| handle.map(|handle| ListenSocket { handle }))
         })
         .ok_or_else(|| {
             io::Error::new(
@@ -231,15 +300,66 @@ impl TcpDpdkListener {
         })?
     }
 
-    /// Replenish the listen socket pool if needed.
-    fn replenish_pool(&self) {
+    /// Replenish only from the existing fixed pool. Exhaustion registers this
+    /// listener's waker in a fixed driver slot before returning Pending.
+    fn replenish_pool(&self, cx: &Context<'_>) -> io::Result<()> {
         let mut inner = self.inner.borrow_mut();
-        while inner.listen_pool.len() < inner.backlog {
-            match Self::create_listen_socket(self.local_addr) {
-                Ok(socket) => inner.listen_pool.push_back(socket),
-                Err(_) => break, // Pool exhausted or error, stop trying
+        let endpoint = Self::listen_endpoint(self.local_addr);
+        with_current_driver(|driver| -> io::Result<()> {
+            while inner.listen_pool.len() < inner.backlog {
+                match driver.try_create_tcp_listen_socket(endpoint) {
+                    Ok(Some(handle)) => inner.listen_pool.push_back(ListenSocket { handle }),
+                    Ok(None) => {
+                        let waiter = match inner.buffer_waiter {
+                            Some(waiter) => waiter,
+                            None => {
+                                let waiter = driver.allocate_tcp_buffer_waiter()?;
+                                inner.buffer_waiter = Some(waiter);
+                                waiter
+                            }
+                        };
+                        if let Err(error) = driver.register_tcp_buffer_waiter(waiter, cx.waker()) {
+                            match driver.release_tcp_buffer_waiter(waiter) {
+                                Ok(()) => inner.buffer_waiter = None,
+                                Err(release_error) => {
+                                    eprintln!(
+                                        "[tokio-dpdk] ERROR failed to release listener buffer waiter after registration error waiter={:?} error={}",
+                                        waiter, release_error
+                                    );
+                                }
+                            }
+                            return Err(error);
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        if let Some(waiter) = inner.buffer_waiter {
+                            match driver.release_tcp_buffer_waiter(waiter) {
+                                Ok(()) => inner.buffer_waiter = None,
+                                Err(release_error) => {
+                                    eprintln!(
+                                        "[tokio-dpdk] ERROR failed to release listener buffer waiter after listen error waiter={:?} error={}",
+                                        waiter, release_error
+                                    );
+                                }
+                            }
+                        }
+                        return Err(error);
+                    }
+                }
             }
-        }
+            if let Some(waiter) = inner.buffer_waiter {
+                driver.release_tcp_buffer_waiter(waiter)?;
+                inner.buffer_waiter = None;
+            }
+            Ok(())
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to access DPDK driver while replenishing listener pool",
+            )
+        })?
     }
 
     /// Accepts a new connection.
@@ -258,12 +378,36 @@ impl TcpDpdkListener {
     }
 
     fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpDpdkStream, SocketAddr)>> {
+        match current_worker_index() {
+            Some(current) if current == self.core_id => {}
+            Some(current) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "TcpDpdkListener polled on wrong worker owner={} current={}",
+                        self.core_id, current
+                    ),
+                )));
+            }
+            None => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "TcpDpdkListener polled outside DPDK worker owner={}",
+                        self.core_id
+                    ),
+                )));
+            }
+        }
+
         // Try to replenish pool if it's getting low
         {
             let inner = self.inner.borrow();
-            if inner.listen_pool.len() < inner.backlog / 2 {
+            if inner.buffer_waiter.is_some() || inner.listen_pool.len() < inner.backlog / 2 {
                 drop(inner);
-                self.replenish_pool();
+                if let Err(error) = self.replenish_pool(cx) {
+                    return Poll::Ready(Err(error));
+                }
             }
         }
 
@@ -292,12 +436,22 @@ impl TcpDpdkListener {
         }
 
         if let Some(idx) = found_idx {
-            // Remove the connected socket from the pool
-            let connected = self.inner.borrow_mut().listen_pool.remove(idx).unwrap();
-
-            // Get peer address
+            // Resolve every fallible property while the listen pool still owns
+            // the socket. An early return therefore cannot orphan the handle.
+            let connected_handle = self
+                .inner
+                .borrow()
+                .listen_pool
+                .get(idx)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("established listener socket index disappeared index={}", idx),
+                    )
+                })?
+                .handle;
             let peer_addr = with_current_driver(|driver| {
-                let socket = driver.get_tcp_socket_mut(connected.handle);
+                let socket = driver.get_tcp_socket_mut(connected_handle);
                 socket.remote_endpoint().map(|ep| {
                     SocketAddr::new(
                         match ep.addr {
@@ -315,6 +469,20 @@ impl TcpDpdkListener {
             .flatten()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "No remote endpoint"))?;
 
+            // No fallible operation remains before ownership transfers to the
+            // stream, so removing the pool entry cannot leak the handle.
+            let connected = self
+                .inner
+                .borrow_mut()
+                .listen_pool
+                .remove(idx)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("established listener socket index disappeared index={}", idx),
+                    )
+                })?;
+
             // Create stream from accepted connection
             let stream = TcpDpdkStream::from_handle(
                 connected.handle,
@@ -324,7 +492,10 @@ impl TcpDpdkListener {
             );
 
             // Replenish the pool
-            self.replenish_pool();
+            if let Err(error) = self.replenish_pool(cx) {
+                drop(stream);
+                return Poll::Ready(Err(error));
+            }
 
             Poll::Ready(Ok((stream, peer_addr)))
         } else {
@@ -387,28 +558,43 @@ impl TcpDpdkListener {
 
 impl Drop for TcpDpdkListener {
     fn drop(&mut self) {
-        let port = self.local_addr.port();
-
-        // Clean up all listening sockets in the pool
-        let mut inner = self.inner.borrow_mut();
-        for listen_socket in inner.listen_pool.drain(..) {
-            match with_current_driver(|driver| driver.remove_socket(listen_socket.handle)) {
-                Some(Ok(())) => {}
-                Some(Err(error)) => eprintln!(
-                    "[tokio-dpdk] ERROR listener socket cleanup failed handle={:?} error={}",
-                    listen_socket.handle, error
-                ),
-                None => eprintln!(
-                    "[tokio-dpdk] ERROR DPDK driver unavailable during listener socket cleanup handle={:?}",
-                    listen_socket.handle
-                ),
-            }
+        let current = current_worker_index();
+        if current != Some(self.core_id) {
+            eprintln!(
+                "[tokio-dpdk] ERROR listener cleanup outside owner worker owner={} current={:?}",
+                self.core_id, current
+            );
+            return;
         }
 
-        // Release the port
-        with_current_driver(|driver| {
+        let port = self.local_addr.port();
+        let mut inner = self.inner.borrow_mut();
+        if with_current_driver(|driver| {
+            if let Some(waiter) = inner.buffer_waiter.take() {
+                if let Err(error) = driver.release_tcp_buffer_waiter(waiter) {
+                    eprintln!(
+                        "[tokio-dpdk] ERROR listener buffer waiter cleanup failed waiter={:?} error={}",
+                        waiter, error
+                    );
+                }
+            }
+            for listen_socket in inner.listen_pool.drain(..) {
+                if let Err(error) = driver.remove_socket(listen_socket.handle) {
+                    eprintln!(
+                        "[tokio-dpdk] ERROR listener socket cleanup failed handle={:?} error={}",
+                        listen_socket.handle, error
+                    );
+                }
+            }
             driver.release_port(port);
-        });
+        })
+        .is_none()
+        {
+            eprintln!(
+                "[tokio-dpdk] ERROR DPDK driver unavailable during listener cleanup owner={}",
+                self.core_id
+            );
+        }
     }
 }
 
