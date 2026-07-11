@@ -4,17 +4,17 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ptr::NonNull;
 use std::task::{Context, Poll, Waker};
 
-use smoltcp::iface::{Interface, PollEgressHandleResult, SocketHandle, SocketSet};
+use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::tcp::Socket as TcpSocket;
 use smoltcp::storage::LinearBuffer;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpProtocol,
-    Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, ETHERNET_HEADER_LEN,
+    Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
 };
 
-use super::device::{DpdkDevice, OwnedMbuf};
+use super::device::OwnedMbuf;
 use super::WorkerIdentity;
 #[cfg(test)]
 use super::DpdkRuntimeId;
@@ -296,16 +296,6 @@ impl RssSlotMap {
     }
 }
 
-#[derive(Clone, Copy)]
-struct PreparedTail {
-    payload_offset: usize,
-    payload_len: usize,
-    tcp_seq: u32,
-    connection_closed: bool,
-    ack_required: bool,
-    egress_queued: bool,
-}
-
 struct TailConn {
     handle: RawTailHandle,
     tuple: RawTailTuple,
@@ -313,7 +303,6 @@ struct TailConn {
     socket_handle: Option<SocketHandle>,
     parser: Option<RawTailParserBinding>,
     pending_mbuf: Option<OwnedMbuf>,
-    prepared: Option<PreparedTail>,
     receiver_waker: Option<Waker>,
     pending_slot_pos: usize,
     packet_ordinal: u64,
@@ -390,6 +379,18 @@ enum PrepareError {
     PacketParse,
     TupleMismatch,
     TcpState,
+}
+
+#[derive(Clone, Copy)]
+enum ParserIssue {
+    TlsTailNotFound,
+    InvalidInput,
+}
+
+struct ProcessedTail {
+    socket_handle: SocketHandle,
+    gateway_mac: EthernetAddress,
+    parser_issue: Option<ParserIssue>,
 }
 
 /// Worker-local raw-tail registry and fixed-capacity selected-mbuf slots.
@@ -486,7 +487,6 @@ impl RawTailTable {
             socket_handle: None,
             parser: None,
             pending_mbuf: None,
-            prepared: None,
             receiver_waker: None,
             pending_slot_pos: RAW_TAIL_PENDING_NONE,
             packet_ordinal: 0,
@@ -644,7 +644,6 @@ impl RawTailTable {
             conn.publication_ready = false;
             conn.terminal_ready = false;
             let receiver_waker = conn.receiver_waker.take();
-            conn.prepared = None;
             conn.pending_mbuf = None;
             (was_active, receiver_waker)
         };
@@ -709,7 +708,6 @@ impl RawTailTable {
                 return Ok(());
             }
             let overflow = conn.advance_packet_ordinal();
-            conn.prepared = None;
             let old = replace_latest(&mut conn.pending_mbuf, mbuf);
             let old_was_none = old.is_none();
             drop(old);
@@ -727,19 +725,19 @@ impl RawTailTable {
         Ok(())
     }
 
-    /// Commit every selected TCP tail, queue and flush cumulative ACKs, then
-    /// invoke parsers with direct mbuf slices. No parser runs before the ACK
-    /// burst has been accepted by the DPDK TX queue.
+    /// Commit every selected TCP tail and synchronously invoke its parser while
+    /// the selected mbuf is still owned locally. The returned socket handles
+    /// are handed to the driver's existing shared egress scheduler only after
+    /// each parser has returned and its mbuf has been released.
     pub(crate) fn finish_drain(
         &mut self,
         now: SmolInstant,
         iface: &mut Interface,
         sockets: &mut SocketSet<'static, LinearBuffer<'static>>,
-        device: &mut DpdkDevice,
         gateway_neighbor_configured: bool,
-        exhausted_handles: &mut Vec<SocketHandle>,
+        egress_handles: &mut Vec<SocketHandle>,
     ) {
-        exhausted_handles.clear();
+        egress_handles.clear();
         let mut observed_gateway = None;
         for pending_index in 0..self.pending_slots.len() {
             let slot = self.pending_slots[pending_index];
@@ -747,17 +745,29 @@ impl RawTailTable {
                 let conn = self.conns[slot]
                     .as_mut()
                     .expect("pending raw-tail slot must contain a connection");
-                if conn.prepared.is_some() || conn.pending_mbuf.is_none() {
+                if conn.pending_mbuf.is_none() {
                     None
                 } else {
-                    Some(Self::prepare_selected_tail(conn, now, sockets))
+                    Some(Self::process_selected_tail(conn, now, sockets))
                 }
             };
             match outcome {
-                Some(Ok(gateway)) => {
+                Some(Ok(processed)) => {
                     if observed_gateway.is_none() {
-                        observed_gateway = gateway;
+                        observed_gateway = Some(processed.gateway_mac);
                     }
+                    match processed.parser_issue {
+                        Some(ParserIssue::TlsTailNotFound) => {
+                            self.errors.tls_tail_not_found =
+                                self.errors.tls_tail_not_found.saturating_add(1);
+                        }
+                        Some(ParserIssue::InvalidInput) => {
+                            self.errors.parser_input_invalid =
+                                self.errors.parser_input_invalid.saturating_add(1);
+                        }
+                        None => {}
+                    }
+                    egress_handles.push(processed.socket_handle);
                 }
                 Some(Err(PrepareError::PacketParse)) => {
                     self.errors.packet_parse_failed =
@@ -782,236 +792,96 @@ impl RawTailTable {
                 );
             }
         }
-
-        let mut any_ack_egress_queued = false;
-        for pending_index in 0..self.pending_slots.len() {
-            let slot = self.pending_slots[pending_index];
-            let retry_handle = {
-                let Some(conn) = self.conns[slot].as_mut() else {
-                    continue;
-                };
-                let Some(prepared) = conn.prepared.as_mut() else {
-                    continue;
-                };
-                let socket_handle = conn
-                    .socket_handle
-                    .expect("active raw-tail parser must retain its socket handle");
-                if !prepared.egress_queued {
-                    prepared.egress_queued = if prepared.ack_required {
-                        ack_egress_was_queued(iface.poll_egress_handle(
-                            now,
-                            device,
-                            sockets,
-                            socket_handle,
-                        ))
-                    } else {
-                        true
-                    };
-                }
-                any_ack_egress_queued |= prepared.ack_required && prepared.egress_queued;
-                (!prepared.egress_queued).then_some(socket_handle)
-            };
-            if let Some(socket_handle) = retry_handle {
-                push_egress_retry(
-                    &mut self.errors,
-                    exhausted_handles,
-                    socket_handle,
-                );
-            }
-        }
-
-        let ack_flush_complete = any_ack_egress_queued && device.flush_tx().is_ok();
-        self.complete_egress_flush(ack_flush_complete, exhausted_handles);
-    }
-
-    /// Record a packet emitted by the generic per-handle egress scheduler. Any
-    /// TCP packet generated after lossy-tail commit carries the cumulative ACK.
-    pub(crate) fn mark_socket_egress_queued(&mut self, socket_handle: SocketHandle) -> bool {
-        let Some(slot) = self
-            .socket_to_slot
-            .get(socket_handle.index())
-            .copied()
-            .flatten()
-        else {
-            return false;
-        };
-        let Some(prepared) = self.conns[slot]
-            .as_mut()
-            .and_then(|conn| conn.prepared.as_mut())
-        else {
-            return false;
-        };
-        if !prepared.ack_required {
-            return false;
-        }
-        prepared.egress_queued = true;
-        true
-    }
-
-    /// Complete parsers only after every queued TX mbuf was accepted by one
-    /// DPDK burst. On failure, feed all affected handles back into the shared
-    /// bounded per-handle retry scheduler.
-    pub(crate) fn complete_egress_flush(
-        &mut self,
-        flush_complete: bool,
-        exhausted_handles: &mut Vec<SocketHandle>,
-    ) {
-        for pending_index in 0..self.pending_slots.len() {
-            let slot = self.pending_slots[pending_index];
-            let should_dispatch = self.conns[slot]
-                .as_ref()
-                .and_then(|conn| conn.prepared)
-                .is_some_and(|prepared| prepared_can_dispatch(prepared, flush_complete));
-            if should_dispatch {
-                self.dispatch_prepared(slot);
-            }
-        }
-        if !flush_complete {
-            for pending_index in 0..self.pending_slots.len() {
-                let slot = self.pending_slots[pending_index];
-                let retry_handle = self.conns[slot].as_ref().and_then(|conn| {
-                    conn.prepared
-                        .filter(|prepared| prepared.ack_required && prepared.egress_queued)
-                        .and(conn.socket_handle)
-                });
-                if let Some(socket_handle) = retry_handle {
-                    push_egress_retry(
-                        &mut self.errors,
-                        exhausted_handles,
-                        socket_handle,
-                    );
-                }
-            }
-        }
         self.compact_pending_slots();
     }
 
-    fn prepare_selected_tail(
+    fn process_selected_tail(
         conn: &mut TailConn,
         now: SmolInstant,
         sockets: &mut SocketSet<'static, LinearBuffer<'static>>,
-    ) -> Result<Option<EthernetAddress>, PrepareError> {
+    ) -> Result<ProcessedTail, PrepareError> {
         let mbuf = conn
             .pending_mbuf
             .take()
-            .expect("new raw-tail preparation must own a selected mbuf");
-        conn.invalidate_for_selected_tail();
+            .expect("selected raw-tail slot must own one mbuf");
+        with_selected_owner(mbuf, |mbuf| {
+            let parser = conn.invalidate_for_selected_tail();
+            let parsed = parse_selected_tcp(mbuf).ok_or(PrepareError::PacketParse)?;
+            if !conn.tuple.matches_ingress(&parsed.ip_repr, &parsed.tcp_repr) {
+                return Err(PrepareError::TupleMismatch);
+            }
+            let socket_handle = conn
+                .socket_handle
+                .expect("active raw-tail connection must retain its socket handle");
+            // remove_socket() detaches raw-tail before removing/recycling this
+            // index, so this direct O(1) access remains the activated TCP socket.
+            let socket = sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(socket_handle);
+            let commit = socket
+                .commit_lossy_tail(now, &parsed.tcp_repr)
+                .map_err(|_| PrepareError::TcpState)?;
 
-        let parsed = parse_selected_tcp(&mbuf).ok_or(PrepareError::PacketParse)?;
-        if !conn.tuple.matches_ingress(&parsed.ip_repr, &parsed.tcp_repr) {
-            return Err(PrepareError::TupleMismatch);
-        }
-        let socket_handle = conn
-            .socket_handle
-            .expect("active raw-tail connection must retain its socket handle");
-        // remove_socket() detaches raw-tail before removing/recycling this
-        // index, so this direct O(1) access remains the activated TCP socket.
-        let socket = sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(socket_handle);
-        let commit = socket
-            .commit_lossy_tail(now, &parsed.tcp_repr)
-            .map_err(|_| PrepareError::TcpState)?;
-
-        let tcp_seq = parsed.tcp_repr.seq_number.0 as u32;
-        let connection_closed = commit.closed
-            || matches!(parsed.tcp_repr.control, TcpControl::Fin | TcpControl::Rst);
-        let gateway_mac = parsed.eth_src;
-        conn.prepared = Some(PreparedTail {
-            payload_offset: parsed.payload_offset,
-            payload_len: parsed.tcp_repr.payload.len(),
-            tcp_seq,
-            connection_closed,
-            ack_required: !commit.closed,
-            egress_queued: false,
-        });
-        conn.pending_mbuf = Some(mbuf);
-        Ok(Some(gateway_mac))
+            let tcp_seq = parsed.tcp_repr.seq_number.0 as u32;
+            let connection_closed = commit.closed
+                || matches!(parsed.tcp_repr.control, TcpControl::Fin | TcpControl::Rst);
+            let parser_issue = Self::dispatch_committed_payload(
+                conn,
+                parser,
+                parsed.tcp_repr.payload,
+                tcp_seq,
+                connection_closed,
+            );
+            Ok(ProcessedTail {
+                socket_handle,
+                gateway_mac: parsed.eth_src,
+                parser_issue,
+            })
+        })
     }
 
-    fn dispatch_prepared(&mut self, slot: usize) {
-        let (handle, rss_hash, packet_ordinal, parser, prepared, mbuf) = {
-            let conn = self.conns[slot]
-                .as_mut()
-                .expect("dispatching raw-tail slot must contain a connection");
-            (
-                conn.handle,
-                conn.rss_hash,
-                conn.packet_ordinal,
-                conn.parser
-                    .expect("active raw-tail connection must retain its parser"),
-                conn.prepared
-                    .take()
-                    .expect("dispatching raw-tail connection must be prepared"),
-                conn.pending_mbuf
-                    .take()
-                    .expect("prepared raw-tail connection must own an mbuf"),
-            )
-        };
-
-        let Some(data) = mbuf.data() else {
-            self.errors.parser_input_invalid =
-                self.errors.parser_input_invalid.saturating_add(1);
-            return;
-        };
-        let Some(payload_end) = prepared.payload_offset.checked_add(prepared.payload_len) else {
-            self.errors.parser_input_invalid =
-                self.errors.parser_input_invalid.saturating_add(1);
-            return;
-        };
-        if payload_end > data.len() {
-            self.errors.parser_input_invalid =
-                self.errors.parser_input_invalid.saturating_add(1);
-            return;
-        }
-        let payload = &data[prepared.payload_offset..payload_end];
-        let tls_tail = find_tail_aligned_tls_records(payload);
-        let (records, record_count, record_tcp_seq) = match tls_tail {
+    fn dispatch_committed_payload(
+        conn: &mut TailConn,
+        parser: RawTailParserBinding,
+        payload: &[u8],
+        tcp_seq: u32,
+        connection_closed: bool,
+    ) -> Option<ParserIssue> {
+        let (records, record_count, record_tcp_seq) = match find_tail_aligned_tls_records(payload) {
             Some(tls_tail) => {
-                let records_offset = tls_tail.offset;
-                let Some(records_start) = prepared.payload_offset.checked_add(records_offset) else {
-                    self.errors.parser_input_invalid =
-                        self.errors.parser_input_invalid.saturating_add(1);
-                    return;
+                let Ok(records_offset) = u32::try_from(tls_tail.offset) else {
+                    return Some(ParserIssue::InvalidInput);
                 };
-                if records_start > payload_end {
-                    self.errors.parser_input_invalid =
-                        self.errors.parser_input_invalid.saturating_add(1);
-                    return;
-                }
                 (
-                    &data[records_start..payload_end],
+                    &payload[tls_tail.offset..],
                     tls_tail.record_count,
-                    prepared.tcp_seq.wrapping_add(records_offset as u32),
+                    tcp_seq.wrapping_add(records_offset),
                 )
             }
-            None => (&data[payload_end..payload_end], 0, prepared.tcp_seq),
+            None => (&payload[payload.len()..], 0, tcp_seq),
         };
 
-        if records.is_empty() && !prepared.connection_closed {
-            if prepared.payload_len != 0 {
-                self.errors.tls_tail_not_found =
-                    self.errors.tls_tail_not_found.saturating_add(1);
-            }
-            return;
+        if records.is_empty() && !connection_closed {
+            return (!payload.is_empty()).then_some(ParserIssue::TlsTailNotFound);
         }
+        let Ok(records_len) = u32::try_from(records.len()) else {
+            return Some(ParserIssue::InvalidInput);
+        };
         let input = RawTailInput {
-            handle,
-            rss_hash,
+            handle: conn.handle,
+            rss_hash: conn.rss_hash,
             tcp_seq: record_tcp_seq,
-            tcp_seq_after_record: record_tcp_seq.wrapping_add(records.len() as u32),
+            tcp_seq_after_record: record_tcp_seq.wrapping_add(records_len),
             records,
             record_count,
-            packet_ordinal,
-            connection_closed: prepared.connection_closed,
+            packet_ordinal: conn.packet_ordinal,
+            connection_closed,
         };
         // SAFETY: the pinned binding contract remains active, and `records`
-        // cannot escape this synchronous HRTB call. `mbuf` is a local RAII
-        // owner, so parser unwinding frees the selected packet.
+        // cannot escape this synchronous HRTB call. The selected mbuf remains
+        // owned by process_selected_tail until this call returns.
         let disposition = unsafe { parser.parse(input) };
-        let disposition = latch_closed_disposition(disposition, prepared.connection_closed);
-        self.conns[slot]
-            .as_mut()
-            .expect("parser dispatch cannot remove its own raw-tail slot")
-            .latch_parser_disposition(disposition);
+        let disposition = latch_closed_disposition(disposition, connection_closed);
+        conn.latch_parser_disposition(disposition);
+        None
     }
 
     pub(crate) fn poll_publication_ready(
@@ -1062,7 +932,6 @@ impl RawTailTable {
                 .as_mut()
                 .expect("new raw-tail pending slot must contain a connection");
             conn.pending_mbuf = None;
-            conn.prepared = None;
             self.errors.pending_capacity_exceeded = self
                 .errors
                 .pending_capacity_exceeded
@@ -1151,26 +1020,8 @@ fn replace_latest<T>(slot: &mut Option<T>, latest: T) -> Option<T> {
 }
 
 #[inline(always)]
-fn ack_egress_was_queued(outcome: PollEgressHandleResult) -> bool {
-    matches!(outcome, PollEgressHandleResult::SocketStateChanged)
-}
-
-#[inline(always)]
-fn prepared_can_dispatch(prepared: PreparedTail, flush_complete: bool) -> bool {
-    prepared.egress_queued && (flush_complete || !prepared.ack_required)
-}
-
-#[inline(always)]
-fn push_egress_retry(
-    errors: &mut RawTailErrorCounters,
-    exhausted_handles: &mut Vec<SocketHandle>,
-    socket_handle: SocketHandle,
-) {
-    if exhausted_handles.len() < RAW_TAIL_CONNECTION_CAP {
-        exhausted_handles.push(socket_handle);
-    } else {
-        errors.pending_capacity_exceeded = errors.pending_capacity_exceeded.saturating_add(1);
-    }
+fn with_selected_owner<T, R>(owner: T, use_owner: impl FnOnce(&T) -> R) -> R {
+    use_owner(&owner)
 }
 
 #[inline(always)]
@@ -1189,7 +1040,6 @@ struct ParsedSelectedTcp<'a> {
     eth_src: EthernetAddress,
     ip_repr: Ipv4Repr,
     tcp_repr: TcpRepr<'a>,
-    payload_offset: usize,
 }
 
 /// Parse the selected frame once. All checksum capabilities are disabled; the
@@ -1211,18 +1061,10 @@ fn parse_selected_tcp(mbuf: &OwnedMbuf) -> Option<ParsedSelectedTcp<'_>> {
     let src = IpAddress::Ipv4(ip_repr.src_addr);
     let dst = IpAddress::Ipv4(ip_repr.dst_addr);
     let tcp_repr = TcpRepr::parse(&tcp, &src, &dst, &checksum).ok()?;
-    let payload_offset = ETHERNET_HEADER_LEN
-        .checked_add(ipv4.header_len() as usize)?
-        .checked_add(tcp.header_len() as usize)?;
-    let payload_end = payload_offset.checked_add(tcp_repr.payload.len())?;
-    if payload_end > data.len() {
-        return None;
-    }
     Some(ParsedSelectedTcp {
         eth_src: ethernet.src_addr(),
         ip_repr,
         tcp_repr,
-        payload_offset,
     })
 }
 
@@ -1315,6 +1157,8 @@ fn toeplitz_hash(input: &[u8], key: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::task::Wake;
@@ -1504,62 +1348,85 @@ mod tests {
     }
 
     #[test]
-    fn ack_state_requires_an_emitted_packet_and_a_successful_flush() {
-        assert!(!ack_egress_was_queued(PollEgressHandleResult::None));
-        assert!(!ack_egress_was_queued(
-            PollEgressHandleResult::DeviceExhausted
-        ));
-        assert!(ack_egress_was_queued(
-            PollEgressHandleResult::SocketStateChanged
-        ));
+    fn parser_precedes_shared_egress_and_selected_owner_drops_on_return() {
+        struct OrderParser {
+            events: Rc<RefCell<Vec<&'static str>>>,
+        }
 
-        let mut prepared = PreparedTail {
-            payload_offset: 0,
-            payload_len: 0,
-            tcp_seq: 0,
-            connection_closed: false,
-            ack_required: true,
-            egress_queued: false,
-        };
-        assert!(!prepared_can_dispatch(prepared, true));
-        prepared.egress_queued = true;
-        let stale_entry_flush_complete = true;
-        let final_flush_complete = false;
-        assert!(stale_entry_flush_complete);
-        assert!(!prepared_can_dispatch(prepared, final_flush_complete));
-        assert!(prepared_can_dispatch(prepared, true));
-        prepared.ack_required = false;
-        assert!(prepared_can_dispatch(prepared, false));
-    }
+        unsafe fn invalidate_order_parser(_context: NonNull<()>) {}
 
-    #[test]
-    fn generic_egress_success_marks_the_raw_tail_ack_handshake() {
+        unsafe fn parse_order_parser(
+            context: NonNull<()>,
+            _input: RawTailInput<'_>,
+        ) -> RawTailParseDisposition {
+            let parser = unsafe { context.cast::<OrderParser>().as_ref() };
+            parser.events.borrow_mut().push("parser");
+            RawTailParseDisposition::Ready
+        }
+
+        struct SelectedOwner {
+            payload: Vec<u8>,
+            events: Rc<RefCell<Vec<&'static str>>>,
+        }
+
+        impl Drop for SelectedOwner {
+            fn drop(&mut self) {
+                self.events.borrow_mut().push("mbuf_drop");
+            }
+        }
+
         let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
         let handle = table.register(tuple(443)).expect("reservation must succeed");
         let socket_handle = SocketHandle::default();
-        let mut probe = ParserProbe::default();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut parser = OrderParser {
+            events: events.clone(),
+        };
+        let binding = unsafe {
+            RawTailParserBinding::new(
+                NonNull::from(&mut parser).cast(),
+                invalidate_order_parser,
+                parse_order_parser,
+            )
+        };
         table
             .activate_parser(
                 handle,
                 tuple(443),
                 socket_handle,
-                parser_binding(&mut probe),
+                binding,
             )
             .expect("activation must succeed");
         let slot = table.slot_for_handle(handle).unwrap();
-        table.conns[slot].as_mut().unwrap().prepared = Some(PreparedTail {
-            payload_offset: 0,
-            payload_len: 0,
-            tcp_seq: 0,
-            connection_closed: false,
-            ack_required: true,
-            egress_queued: false,
+        let selected = SelectedOwner {
+            payload: tls_record(b"latest"),
+            events: events.clone(),
+        };
+        let committed_socket = with_selected_owner(selected, |selected| {
+            let conn = table.conns[slot].as_mut().unwrap();
+            let parser = conn.invalidate_for_selected_tail();
+            assert!(RawTailTable::dispatch_committed_payload(
+                conn,
+                parser,
+                &selected.payload,
+                7,
+                false,
+            )
+            .is_none());
+            assert_eq!(&*events.borrow(), &["parser"]);
+            conn.socket_handle.unwrap()
         });
-        assert!(table.mark_socket_egress_queued(socket_handle));
-        let prepared = table.conns[slot].as_ref().unwrap().prepared.unwrap();
-        assert!(prepared.egress_queued);
-        assert!(!prepared_can_dispatch(prepared, false));
-        assert!(prepared_can_dispatch(prepared, true));
+        assert_eq!(&*events.borrow(), &["parser", "mbuf_drop"]);
+
+        let mut shared_egress = Vec::with_capacity(RAW_TAIL_CONNECTION_CAP);
+        shared_egress.push(committed_socket);
+        events.borrow_mut().push("egress_queue");
+        events.borrow_mut().push("poll_tail_flush");
+        assert_eq!(shared_egress, [socket_handle]);
+        assert_eq!(
+            &*events.borrow(),
+            &["parser", "mbuf_drop", "egress_queue", "poll_tail_flush"]
+        );
     }
 
     #[test]

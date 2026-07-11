@@ -588,8 +588,8 @@ pub(crate) struct DpdkDriver {
     bound_ports: HashSet<u16>,
     /// RSS-hash based lossy tail receiver for market-data flows.
     raw_tail: RawTailTable,
-    /// Startup-allocated handoff for raw-tail ACKs that hit DeviceExhausted.
-    raw_tail_exhausted_handles: Vec<SocketHandle>,
+    /// Startup-allocated handoff from committed raw tails to shared egress.
+    raw_tail_egress_handles: Vec<SocketHandle>,
     /// Min-heap of socket handles with pending smoltcp egress work and their due time.
     pending_egress_heap: Vec<(SmolInstant, SocketHandle)>,
     /// Dense handle-index to pending_egress_heap slot map. PENDING_EGRESS_NONE means absent.
@@ -709,7 +709,7 @@ impl DpdkDriver {
                 WorkerIdentity::new(runtime_id, worker_index),
                 &raw_tail_rss_key,
             ),
-            raw_tail_exhausted_handles: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
+            raw_tail_egress_handles: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
             pending_egress_heap: Vec::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
             pending_egress_pos: vec![PENDING_EGRESS_NONE; DEFAULT_BUFFER_POOL_SIZE],
             ingress_touched: Vec::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
@@ -775,7 +775,7 @@ impl DpdkDriver {
         };
 
         #[cfg(feature = "market-trace")]
-        let flush_acks_start_ns = if trace_poll {
+        let raw_tail_finish_start_ns = if trace_poll {
             crate::runtime::market_trace::now_ns()
         } else {
             0
@@ -784,17 +784,16 @@ impl DpdkDriver {
             smol_now,
             &mut self.iface,
             &mut self.sockets,
-            &mut self.device,
             self.gateway_neighbor_configured,
-            &mut self.raw_tail_exhausted_handles,
+            &mut self.raw_tail_egress_handles,
         );
-        for index in 0..self.raw_tail_exhausted_handles.len() {
-            let handle = self.raw_tail_exhausted_handles[index];
+        for index in 0..self.raw_tail_egress_handles.len() {
+            let handle = self.raw_tail_egress_handles[index];
             self.queue_egress_at(handle, smol_now);
         }
         #[cfg(feature = "market-trace")]
-        let flush_acks_dur_ns = if trace_poll {
-            crate::runtime::market_trace::now_ns().saturating_sub(flush_acks_start_ns)
+        let raw_tail_finish_dur_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns().saturating_sub(raw_tail_finish_start_ns)
         } else {
             0
         };
@@ -1004,25 +1003,13 @@ impl DpdkDriver {
             Default::default()
         };
         #[cfg(not(feature = "market-trace"))]
-        let flush_tx_after_complete = self.device.flush_tx().is_ok();
-        #[cfg(feature = "market-trace")]
-        let flush_tx_after_complete = !self.device.has_pending_tx();
+        let _ = self.device.flush_tx();
         #[cfg(feature = "market-trace")]
         let flush_tx_after_dur_ns = if trace_flush_tx_after {
             crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_after_start_ns)
         } else {
             0
         };
-
-        self.raw_tail_exhausted_handles.clear();
-        self.raw_tail.complete_egress_flush(
-            flush_tx_after_complete,
-            &mut self.raw_tail_exhausted_handles,
-        );
-        for index in 0..self.raw_tail_exhausted_handles.len() {
-            let handle = self.raw_tail_exhausted_handles[index];
-            self.queue_egress_at(handle, smol_now);
-        }
 
         // Note: dispatch_wakers() is no longer needed!
         // smoltcp's native waker mechanism handles wakeups internally.
@@ -1068,9 +1055,9 @@ impl DpdkDriver {
                 );
             }
             crate::runtime::market_trace::complete(
-                flush_acks_start_ns,
-                flush_acks_dur_ns,
-                crate::runtime::market_trace::SPAN_DPDK_FLUSH_ACKS,
+                raw_tail_finish_start_ns,
+                raw_tail_finish_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_FINISH,
                 track_id,
                 0,
             );
@@ -1464,9 +1451,7 @@ impl DpdkDriver {
                 .iface
                 .poll_egress_handle(now, &mut self.device, &mut self.sockets, handle)
             {
-                PollEgressHandleResult::SocketStateChanged => {
-                    self.raw_tail.mark_socket_egress_queued(handle);
-                }
+                PollEgressHandleResult::SocketStateChanged => {}
                 PollEgressHandleResult::None => break,
                 PollEgressHandleResult::DeviceExhausted => {
                     device_exhausted = true;
@@ -1555,7 +1540,6 @@ impl DpdkDriver {
                 .poll_egress_handle(now, &mut self.device, &mut self.sockets, handle)
             {
                 PollEgressHandleResult::SocketStateChanged => {
-                    self.raw_tail.mark_socket_egress_queued(handle);
                     result = PollResult::SocketStateChanged;
                 }
                 PollEgressHandleResult::None => {}
