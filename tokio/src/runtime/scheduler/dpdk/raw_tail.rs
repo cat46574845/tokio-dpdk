@@ -816,6 +816,14 @@ impl RawTailTable {
         std::mem::take(&mut self.errors)
     }
 
+    #[cfg(feature = "dpdk-raw-mbuf-capture")]
+    pub(crate) fn release_pending_mbufs_for_shutdown(&mut self) {
+        self.pending_slots.clear();
+        for conn in self.conns.iter_mut().flatten() {
+            drop(conn.pending_mbuf.take());
+        }
+    }
+
     fn conn_for_handle_mut(&mut self, handle: RawTailHandle) -> Option<&mut TailConn> {
         let slot = self.slot_for_handle(handle)?;
         self.conns.get_mut(slot)?.as_mut()

@@ -5,6 +5,13 @@
 
 use std::{io, ptr, ptr::NonNull};
 
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+use std::fs::{self, File};
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+use std::io::{BufWriter, Write};
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+use std::path::PathBuf;
+
 use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
 
@@ -26,6 +33,125 @@ const DEFAULT_MTU: usize = 1500;
 
 // DPDK rte_mbuf_core.h: hash.rss is valid only with this RX offload flag.
 const RTE_MBUF_F_RX_RSS_HASH: u64 = 1u64 << 1;
+
+/// Shared mempool and per-worker pointer capacity for the diagnostic capture.
+/// 2^21 - 1 is a DPDK-optimal mempool size and consumes about 4.5 GiB of mbuf
+/// storage with the configured 2048-byte data room.
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+pub(crate) const RAW_MBUF_CAPTURE_MEMPOOL_SIZE: u32 = 2_097_151;
+
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+const RAW_MBUF_CAPTURE_DIR_ENV: &str = "TOKIO_DPDK_RAW_MBUF_CAPTURE_DIR";
+
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+fn raw_mbuf_capture_output_dir() -> io::Result<PathBuf> {
+    std::env::var_os(RAW_MBUF_CAPTURE_DIR_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is required by dpdk-raw-mbuf-capture", RAW_MBUF_CAPTURE_DIR_ENV),
+            )
+        })
+}
+
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+pub(crate) fn preflight_raw_mbuf_capture() -> io::Result<()> {
+    let output_dir = raw_mbuf_capture_output_dir()?;
+    fs::create_dir_all(&output_dir)?;
+    let probe = output_dir.join(".tokio-dpdk-raw-mbuf-capture-preflight");
+    File::create(&probe)?;
+    fs::remove_file(probe)
+}
+
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+struct RawMbufCapture {
+    retained: Box<[*mut ffi::rte_mbuf]>,
+    retained_len: usize,
+    output: PathBuf,
+    output_file: File,
+    port_id: u16,
+    queue_id: u16,
+}
+
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+impl RawMbufCapture {
+    fn new(port_id: u16, queue_id: u16) -> io::Result<Self> {
+        let output_dir = raw_mbuf_capture_output_dir()?;
+        let output = output_dir.join(format!("rx-port{}-queue{}.mbuf", port_id, queue_id));
+        let output_file = File::create(&output)?;
+        let mut retained =
+            vec![ptr::null_mut(); RAW_MBUF_CAPTURE_MEMPOOL_SIZE as usize].into_boxed_slice();
+        let pointers_per_page = 4096 / std::mem::size_of::<*mut ffi::rte_mbuf>();
+        for index in (0..retained.len()).step_by(pointers_per_page) {
+            unsafe { ptr::write_volatile(&mut retained[index], ptr::null_mut()) };
+        }
+        Ok(Self {
+            retained,
+            retained_len: 0,
+            output,
+            output_file,
+            port_id,
+            queue_id,
+        })
+    }
+
+    #[inline(always)]
+    unsafe fn retain(&mut self, mbuf: *mut ffi::rte_mbuf) {
+        debug_assert!(self.retained_len < self.retained.len());
+        unsafe {
+            *self.retained.get_unchecked_mut(self.retained_len) = mbuf;
+        }
+        self.retained_len += 1;
+    }
+
+    fn write_capture(&mut self) -> io::Result<u64> {
+        self.output_file.set_len(0)?;
+        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &mut self.output_file);
+        writer.write_all(b"TDPDKRX1")?;
+        writer.write_all(&1u32.to_le_bytes())?;
+        writer.write_all(&self.port_id.to_le_bytes())?;
+        writer.write_all(&self.queue_id.to_le_bytes())?;
+        writer.write_all(&(self.retained_len as u64).to_le_bytes())?;
+
+        let mut frame_bytes = 0u64;
+        for &head in &self.retained[..self.retained_len] {
+            let rss_hash = unsafe { (*head).__bindgen_anon_2.hash.rss };
+            let ol_flags = unsafe { (*head).ol_flags };
+            let pkt_len = unsafe { (*head).pkt_len };
+            let nb_segs = unsafe { (*head).nb_segs };
+            let ingress_port = unsafe { (*head).port };
+            writer.write_all(&rss_hash.to_le_bytes())?;
+            writer.write_all(&ol_flags.to_le_bytes())?;
+            writer.write_all(&pkt_len.to_le_bytes())?;
+            writer.write_all(&nb_segs.to_le_bytes())?;
+            writer.write_all(&ingress_port.to_le_bytes())?;
+
+            let mut segment = head;
+            for _ in 0..nb_segs {
+                let data_len = unsafe { (*segment).data_len };
+                writer.write_all(&data_len.to_le_bytes())?;
+                let data = unsafe { dpdk_wrappers::pktmbuf_mtod(segment) };
+                let bytes = unsafe { std::slice::from_raw_parts(data, data_len as usize) };
+                writer.write_all(bytes)?;
+                frame_bytes += u64::from(data_len);
+                segment = unsafe { (*segment).next };
+            }
+        }
+        writer.flush()?;
+        Ok(frame_bytes)
+    }
+
+    fn dump_and_release(&mut self) -> io::Result<(usize, u64)> {
+        let packet_count = self.retained_len;
+        let write_result = self.write_capture();
+        for &mbuf in &self.retained[..self.retained_len] {
+            unsafe { dpdk_wrappers::pktmbuf_free(mbuf) };
+        }
+        self.retained_len = 0;
+        write_result.map(|frame_bytes| (packet_count, frame_bytes))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DrainRxStats {
@@ -260,6 +386,8 @@ fn load_actual_rss_key(port_id: u16) -> io::Result<Box<[u8]>> {
 /// when ownership moves to the device TX pending vector.
 pub(crate) struct OwnedMbuf {
     ptr: NonNull<ffi::rte_mbuf>,
+    #[cfg(feature = "dpdk-raw-mbuf-capture")]
+    retained_for_capture: bool,
 }
 
 struct PreparedTxMbuf {
@@ -292,12 +420,23 @@ fn set_single_segment_len_fields(data_len: &mut u16, pkt_len: &mut u32, len: usi
 impl OwnedMbuf {
     #[inline(always)]
     unsafe fn try_alloc(pool: *mut ffi::rte_mempool) -> Option<Self> {
-        NonNull::new(unsafe { dpdk_wrappers::pktmbuf_alloc(pool) }).map(|ptr| Self { ptr })
+        NonNull::new(unsafe { dpdk_wrappers::pktmbuf_alloc(pool) }).map(|ptr| Self {
+            ptr,
+            #[cfg(feature = "dpdk-raw-mbuf-capture")]
+            retained_for_capture: false,
+        })
     }
 
     #[inline(always)]
-    pub(crate) unsafe fn from_received(ptr: *mut ffi::rte_mbuf) -> Option<Self> {
-        NonNull::new(ptr).map(|ptr| Self { ptr })
+    unsafe fn from_received(
+        ptr: *mut ffi::rte_mbuf,
+        #[cfg(feature = "dpdk-raw-mbuf-capture")] retained_for_capture: bool,
+    ) -> Option<Self> {
+        NonNull::new(ptr).map(|ptr| Self {
+            ptr,
+            #[cfg(feature = "dpdk-raw-mbuf-capture")]
+            retained_for_capture,
+        })
     }
 
     #[inline(always)]
@@ -375,6 +514,10 @@ fn rss_hash_metadata_is_valid(ol_flags: u64) -> bool {
 
 impl Drop for OwnedMbuf {
     fn drop(&mut self) {
+        #[cfg(feature = "dpdk-raw-mbuf-capture")]
+        if self.retained_for_capture {
+            return;
+        }
         unsafe { dpdk_wrappers::pktmbuf_free(self.ptr.as_ptr()) };
     }
 }
@@ -437,6 +580,8 @@ pub(crate) struct DpdkDevice {
     rx_burst_size: u16,
     /// Fixed counters consumed by the driver's rate-limited ERROR reporter.
     error_counters: DeviceErrorCounters,
+    #[cfg(feature = "dpdk-raw-mbuf-capture")]
+    raw_mbuf_capture: Box<RawMbufCapture>,
 }
 
 // DPDK mbufs are thread-safe when used correctly
@@ -487,6 +632,8 @@ impl DpdkDevice {
             rx_burst_buf: vec![ptr::null_mut(); rx_burst_len],
             rx_burst_size,
             error_counters: DeviceErrorCounters::default(),
+            #[cfg(feature = "dpdk-raw-mbuf-capture")]
+            raw_mbuf_capture: Box::new(RawMbufCapture::new(port_id, queue_id)?),
         })
     }
 
@@ -537,10 +684,20 @@ impl DpdkDevice {
                 // In particular, a superseded raw-tail mbuf is freed by
                 // capture_mbuf before the next burst is requested.
                 for &raw_mbuf in &self.rx_burst_buf[..n as usize] {
-                    let Some(mbuf) = (unsafe { OwnedMbuf::from_received(raw_mbuf) }) else {
+                    let Some(mbuf) = (unsafe {
+                        OwnedMbuf::from_received(
+                            raw_mbuf,
+                            #[cfg(feature = "dpdk-raw-mbuf-capture")]
+                            true,
+                        )
+                    }) else {
                         self.error_counters.record_rx_mbuf_invalid();
                         continue;
                     };
+                    #[cfg(feature = "dpdk-raw-mbuf-capture")]
+                    unsafe {
+                        self.raw_mbuf_capture.retain(raw_mbuf);
+                    }
                     let mbuf = if raw_tail.is_empty() {
                         mbuf
                     } else {
@@ -671,10 +828,28 @@ fn is_last_unprocessed_index(rx_index: usize, pending_len: usize) -> bool {
 impl Drop for DpdkDevice {
     fn drop(&mut self) {
         // The consumed prefix has already been freed by DpdkRxToken.
+        #[cfg(not(feature = "dpdk-raw-mbuf-capture"))]
         for mbuf in &self.rx_pending[self.rx_index..] {
             unsafe {
                 dpdk_wrappers::pktmbuf_free(*mbuf);
             }
+        }
+        #[cfg(feature = "dpdk-raw-mbuf-capture")]
+        let captured_packets = self.raw_mbuf_capture.retained_len;
+        #[cfg(feature = "dpdk-raw-mbuf-capture")]
+        match self.raw_mbuf_capture.dump_and_release() {
+            Ok((packets, frame_bytes)) => eprintln!(
+                "[tokio-dpdk] raw mbuf capture exported path={} packets={} frame_bytes={}",
+                self.raw_mbuf_capture.output.display(),
+                packets,
+                frame_bytes
+            ),
+            Err(error) => eprintln!(
+                "[tokio-dpdk] ERROR raw mbuf capture export failed path={} packets={} error={}",
+                self.raw_mbuf_capture.output.display(),
+                captured_packets,
+                error
+            ),
         }
 
         // Free any pending TX mbufs
@@ -760,7 +935,13 @@ impl Device for DpdkDevice {
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let raw_rx = *self.rx_pending.get(self.rx_index)?;
         let prepared = self.try_reserve_tx_mbuf()?;
-        let Some(rx_mbuf) = (unsafe { OwnedMbuf::from_received(raw_rx) }) else {
+        let Some(rx_mbuf) = (unsafe {
+            OwnedMbuf::from_received(
+                raw_rx,
+                #[cfg(feature = "dpdk-raw-mbuf-capture")]
+                true,
+            )
+        }) else {
             self.error_counters.record_rx_mbuf_invalid();
             return None;
         };

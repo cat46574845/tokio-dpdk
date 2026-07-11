@@ -730,6 +730,16 @@ pub(crate) struct DpdkDriver {
     last_infra_error_log: Option<Instant>,
 }
 
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+impl Drop for DpdkDriver {
+    fn drop(&mut self) {
+        // Every RX pointer was retained in NIC order at drain_rx entry. Drop
+        // the remaining wrappers before DpdkDevice exports and releases the
+        // underlying mbufs.
+        self.raw_tail.release_pending_mbufs_for_shutdown();
+    }
+}
+
 impl ConnectResourceOwner for DpdkDriver {
     fn cleanup_connect_socket(&mut self, handle: SocketHandle) -> io::Result<()> {
         self.remove_socket(handle)

@@ -87,6 +87,8 @@ market-trace = ["smoltcp?/market-trace"]
 time = []
 # DPDK scheduler - kernel-bypass networking with busy-poll workers
 dpdk = ["rt-multi-thread", "dep:smoltcp", "dep:serde", "dep:serde_json"]
+# Diagnostic-only zero-copy retention of every RX mbuf until worker shutdown.
+dpdk-raw-mbuf-capture = ["dpdk"]
 # DPDK scheduler debugging - enables detailed timing measurements
 dpdk-debug = ["dpdk"]
 # Current-thread scheduler load probe for production latency experiments.

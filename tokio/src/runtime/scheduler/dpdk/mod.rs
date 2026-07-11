@@ -141,6 +141,9 @@ impl Dpdk {
             ));
         }
 
+        #[cfg(feature = "dpdk-raw-mbuf-capture")]
+        device::preflight_raw_mbuf_capture()?;
+
         // Acquire resource locks BEFORE initialization
         let mut resource_lock = resource_lock::ResourceLock::new();
 
