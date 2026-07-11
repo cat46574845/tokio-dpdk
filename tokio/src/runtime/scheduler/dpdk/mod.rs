@@ -39,6 +39,9 @@ pub(crate) use worker::{
 };
 pub(crate) use identity::{DpdkRuntimeId, WorkerIdentity};
 
+/// Fixed per-worker capacity shared by every DPDK TCP socket lifecycle index.
+pub(crate) const SOCKET_LIFECYCLE_CAPACITY: usize = 8192;
+
 pub use raw_tail::{
     RawTailHandle, RawTailInput, RawTailParseDisposition, RawTailParserBinding,
     RawTailUnregisterStatus,
