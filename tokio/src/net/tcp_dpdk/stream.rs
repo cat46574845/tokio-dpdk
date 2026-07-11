@@ -19,9 +19,7 @@ use crate::net::{to_socket_addrs, ToSocketAddrs};
 
 // Import worker context from dpdk scheduler
 use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver};
-use crate::runtime::scheduler::dpdk::{
-    RawTailHandle, RawTailReadRequest, RawTailRecord,
-};
+use crate::runtime::scheduler::dpdk::{RawTailHandle, RawTailRecord};
 
 use std::marker::PhantomData;
 
@@ -947,8 +945,8 @@ impl TcpDpdkStream {
     /// Divert this connected TCP flow into the DPDK raw-tail market-data path.
     ///
     /// After activation, inbound packets for this flow are captured by RSS hash
-    /// before smoltcp receives them. The caller must poll raw-tail readiness and
-    /// drain captured TLS candidates explicitly.
+    /// before smoltcp receives them. The driver keeps only the latest packet and
+    /// publishes one overwriteable TLS-record slot to the receiver task.
     pub fn activate_raw_tail(&self) -> io::Result<RawTailHandle> {
         self.assert_on_correct_worker();
         let handle = self.handle;
@@ -963,29 +961,22 @@ impl TcpDpdkStream {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))?
     }
 
-    /// Poll until raw-tail has captured packets for this flow.
-    pub fn poll_raw_tail_ready(
+    /// Poll and synchronously consume the latest raw-tail TLS records.
+    ///
+    /// A flow is permanently bound to the first task waker that polls it. The
+    /// callback borrows the driver's single-slot buffer and must not await or
+    /// re-enter this DPDK driver.
+    pub fn poll_raw_tail_record<R>(
         &self,
         handle: RawTailHandle,
         cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+        consume: impl for<'record> FnOnce(RawTailRecord<'record>) -> R,
+    ) -> Poll<io::Result<R>> {
         self.assert_on_correct_worker();
-        match with_current_driver(|driver| driver.poll_raw_tail_ready(handle, cx)) {
+        match with_current_driver(|driver| driver.poll_raw_tail_record(handle, cx, consume)) {
             Some(result) => result,
             None => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "driver unavailable"))),
         }
-    }
-
-    /// Copy the next raw-tail TLS candidate into `out`.
-    pub fn try_next_raw_tail_record<'a>(
-        &self,
-        handle: RawTailHandle,
-        request: RawTailReadRequest,
-        out: &'a mut Vec<u8>,
-    ) -> io::Result<Option<RawTailRecord<'a>>> {
-        self.assert_on_correct_worker();
-        with_current_driver(|driver| driver.next_raw_tail_record(handle, request, out))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))?
     }
 
     /// Tries to read data from the stream into the provided buffer.

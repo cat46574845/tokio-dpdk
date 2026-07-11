@@ -84,6 +84,13 @@ fn configured_rx_drain_batch_cap() -> usize {
     parsed
 }
 
+#[inline(always)]
+fn mbufs_in_arrival_order(
+    batch: &[*mut ffi::rte_mbuf],
+) -> impl Iterator<Item = *mut ffi::rte_mbuf> + '_ {
+    batch.iter().copied()
+}
+
 // =============================================================================
 // DPDK wrapper functions
 // =============================================================================
@@ -327,12 +334,12 @@ impl DpdkDevice {
                 break;
             }
         }
-        for mbuf in self.rx_drain_batch.iter().rev() {
-            if !raw_tail.is_empty() && raw_tail.capture_mbuf(*mbuf) {
+        for mbuf in mbufs_in_arrival_order(&self.rx_drain_batch) {
+            if !raw_tail.is_empty() && raw_tail.capture_mbuf(mbuf) {
                 stats.raw_tail_captured += 1;
                 continue;
             }
-            self.rx_pending.push(*mbuf);
+            self.rx_pending.push(mbuf);
             stats.smoltcp_pending += 1;
         }
         #[cfg(feature = "market-trace")]
@@ -659,5 +666,23 @@ impl Device for DpdkDevice {
         caps.checksum.tcp = Checksum::Tx; // smoltcp calculates TX
 
         caps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drained_mbufs_keep_nic_arrival_order() {
+        let batch = [
+            1usize as *mut ffi::rte_mbuf,
+            2usize as *mut ffi::rte_mbuf,
+            3usize as *mut ffi::rte_mbuf,
+        ];
+        let ids = mbufs_in_arrival_order(&batch)
+            .map(|mbuf| mbuf as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }

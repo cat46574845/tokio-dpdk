@@ -22,7 +22,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
 use super::device::DpdkDevice;
-use super::raw_tail::{RawTailHandle, RawTailReadRequest, RawTailRecord, RawTailTable, RawTailTuple};
+use super::raw_tail::{RawTailHandle, RawTailRecord, RawTailTable, RawTailTuple};
 
 // =============================================================================
 // Constants
@@ -321,7 +321,7 @@ impl DpdkDriver {
         };
 
         // Drain the hardware RX queue at poll entry until rx_burst returns no
-        // packets. The collected mbufs are then processed newest-first inside
+        // packets. The collected mbufs are then processed in NIC arrival order inside
         // this same poll.
         let drain_rx_stats = self.device.drain_rx(&mut self.raw_tail);
         let received_rx = drain_rx_stats.received_any();
@@ -343,7 +343,7 @@ impl DpdkDriver {
         } else {
             0
         };
-        self.raw_tail.flush_acks(&mut self.device);
+        self.raw_tail.finish_drain(&mut self.device);
         #[cfg(feature = "market-trace")]
         let flush_acks_dur_ns = if trace_poll {
             crate::runtime::market_trace::now_ns().saturating_sub(flush_acks_start_ns)
@@ -700,21 +700,13 @@ impl DpdkDriver {
         self.raw_tail.unregister(handle);
     }
 
-    pub(crate) fn poll_raw_tail_ready(
+    pub(crate) fn poll_raw_tail_record<R>(
         &mut self,
         handle: RawTailHandle,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        self.raw_tail.poll_ready(handle, cx)
-    }
-
-    pub(crate) fn next_raw_tail_record<'a>(
-        &mut self,
-        handle: RawTailHandle,
-        request: RawTailReadRequest,
-        out: &'a mut Vec<u8>,
-    ) -> std::io::Result<Option<RawTailRecord<'a>>> {
-        self.raw_tail.next_record(handle, request, out)
+        consume: impl for<'record> FnOnce(RawTailRecord<'record>) -> R,
+    ) -> std::task::Poll<std::io::Result<R>> {
+        self.raw_tail.poll_record(handle, cx, consume)
     }
 
     /// Create a new TCP socket using pre-allocated buffers from the pool.

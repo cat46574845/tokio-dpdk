@@ -40,9 +40,7 @@ use crate::task::JoinHandle;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::io;
 
-pub use crate::runtime::scheduler::dpdk::{
-    RawTailRecordDecision, RawTailHandle, RawTailReadRequest, RawTailRecord,
-};
+pub use crate::runtime::scheduler::dpdk::{RawTailHandle, RawTailRecord};
 
 /// Identifies a specific DPDK worker thread.
 ///
