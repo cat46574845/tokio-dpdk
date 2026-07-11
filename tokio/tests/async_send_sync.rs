@@ -221,6 +221,25 @@ async_assert_fn!(tokio::net::TcpStream::readable(_): Send & Sync & !Unpin);
 async_assert_fn!(tokio::net::TcpStream::ready(_, tokio::io::Interest): Send & Sync & !Unpin);
 async_assert_fn!(tokio::net::TcpStream::writable(_): Send & Sync & !Unpin);
 
+#[cfg(feature = "dpdk")]
+mod dpdk_tcp {
+    use super::*;
+
+    assert_value!(tokio::net::TcpDpdkSocket: Send & Sync & Unpin);
+    assert_value!(tokio::net::TcpDpdkStream: Send & Sync & Unpin);
+    assert_value!(tokio::net::TcpDpdkListener: Send & !Sync & Unpin);
+
+    #[allow(unreachable_code, unused_variables)]
+    const _: fn() = || {
+        let connect = tokio::net::TcpDpdkStream::connect(into_todo!(SocketAddr));
+        require_send(&connect);
+
+        let socket_connect = into_todo!(tokio::net::TcpDpdkSocket)
+            .connect(into_todo!(SocketAddr));
+        require_send(&socket_connect);
+    };
+}
+
 // Wasi does not support UDP
 cfg_not_wasi! {
     mod udp_socket {

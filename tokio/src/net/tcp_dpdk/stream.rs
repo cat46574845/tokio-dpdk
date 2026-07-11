@@ -94,7 +94,6 @@ struct OutboundConnectGuard {
     local_port: u16,
     owner: WorkerIdentity,
     cleanup: Option<DriverCleanup>,
-    _worker_affinity: PhantomData<*const ()>,
 }
 
 impl OutboundConnectGuard {
@@ -109,7 +108,6 @@ impl OutboundConnectGuard {
             local_port,
             owner,
             cleanup: Some(cleanup),
-            _worker_affinity: PhantomData,
         }
     }
 
@@ -171,6 +169,36 @@ fn cleanup_socket_on_owner(
     }
 }
 
+#[inline]
+fn validate_worker_owner(
+    owner: WorkerIdentity,
+    current: Option<WorkerIdentity>,
+    operation: &'static str,
+) -> io::Result<()> {
+    match current {
+        Some(current) if current == owner => Ok(()),
+        Some(current) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} owner violation: owner {:?}, current worker {:?}",
+                operation, owner, current
+            ),
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("{} used outside DPDK worker owner {:?}", operation, owner),
+        )),
+    }
+}
+
+#[inline]
+fn ensure_current_worker_owner(
+    owner: WorkerIdentity,
+    operation: &'static str,
+) -> io::Result<()> {
+    validate_worker_owner(owner, current_worker_identity(), operation)
+}
+
 /// A DPDK-backed TCP stream.
 ///
 /// This struct provides a TCP connection that uses DPDK for packet I/O
@@ -217,9 +245,6 @@ pub struct TcpDpdkStream {
     write_shutdown: std::sync::atomic::AtomicBool,
     /// Last error encountered (stored as ErrorKind since io::Error doesn't impl Clone)
     last_error: std::sync::Mutex<Option<io::ErrorKind>>,
-    /// Socket handles are indices into one worker-local SocketSet. Keeping the
-    /// stream !Send + !Sync makes that affinity a type-level invariant.
-    _worker_affinity: PhantomData<*const ()>,
 }
 
 impl TcpDpdkStream {
@@ -243,7 +268,6 @@ impl TcpDpdkStream {
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
             write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
-            _worker_affinity: PhantomData,
         }
     }
 
@@ -323,6 +347,8 @@ impl TcpDpdkStream {
         let mut last_state_log = std::time::Instant::now();
 
         loop {
+            ensure_current_worker_owner(owner, "TcpDpdkStream::connect")?;
+
             if start_time.elapsed() > timeout {
                 // Get final socket state for error message
                 let state_str = with_current_driver(|driver| {
@@ -397,7 +423,6 @@ impl TcpDpdkStream {
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
             write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
-            _worker_affinity: PhantomData,
         })
     }
 
@@ -448,6 +473,8 @@ impl TcpDpdkStream {
         let timeout = std::time::Duration::from_secs(30);
 
         loop {
+            ensure_current_worker_owner(owner, "TcpDpdkStream::connect_with_local")?;
+
             if start_time.elapsed() > timeout {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -499,7 +526,6 @@ impl TcpDpdkStream {
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
             write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
-            _worker_affinity: PhantomData,
         })
     }
 
@@ -529,13 +555,8 @@ impl TcpDpdkStream {
     /// Panics if called from a different worker than where the stream was created.
     #[inline]
     fn assert_on_correct_worker(&self) {
-        let current = current_worker_identity()
-            .expect("TcpDpdkStream used outside of DPDK worker thread");
-        if current != self.owner {
-            panic!(
-                "TcpDpdkStream owner violation: stream owner {:?}, current worker {:?}",
-                self.owner, current
-            );
+        if let Err(error) = ensure_current_worker_owner(self.owner, "TcpDpdkStream") {
+            panic!("{}", error);
         }
     }
 
@@ -731,6 +752,8 @@ impl TcpDpdkStream {
         }).unwrap_or(0);
 
         poll_fn(|cx| {
+            self.assert_on_correct_worker();
+
             let handle = self.handle;
             let waker = cx.waker();
 
@@ -1650,12 +1673,78 @@ mod lifecycle_tests {
     impl<T: ?Sized + Send> AmbiguousIfSend<ImplementsSend> for T {}
 
     #[test]
-    fn worker_affine_socket_owners_are_not_send() {
-        let _ = <OutboundConnectGuard as AmbiguousIfSend<_>>::marker;
-        let _ = <TcpDpdkStream as AmbiguousIfSend<_>>::marker;
-        let _ = <crate::net::tcp_dpdk::OwnedReadHalf as AmbiguousIfSend<_>>::marker;
-        let _ = <crate::net::tcp_dpdk::OwnedWriteHalf as AmbiguousIfSend<_>>::marker;
-        let _ = <crate::net::tcp_dpdk::TcpDpdkListener as AmbiguousIfSend<_>>::marker;
+    fn socket_wrappers_restore_public_auto_traits() {
+        fn assert_send<T: Send>() {}
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<OutboundConnectGuard>();
+        assert_send_sync::<TcpDpdkStream>();
+        assert_send_sync::<crate::net::tcp_dpdk::ReadHalf<'static>>();
+        assert_send_sync::<crate::net::tcp_dpdk::WriteHalf<'static>>();
+        assert_send_sync::<crate::net::tcp_dpdk::OwnedReadHalf>();
+        assert_send_sync::<crate::net::tcp_dpdk::OwnedWriteHalf>();
+        assert_send::<crate::net::tcp_dpdk::TcpDpdkListener>();
+    }
+
+    #[test]
+    fn zero_copy_peek_guard_remains_worker_local() {
+        let _ = <PeekGuard<'static> as AmbiguousIfSend<_>>::marker;
+    }
+
+    #[test]
+    fn connect_and_wait_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+
+        let connect = TcpDpdkStream::connect(SocketAddr::from(([127, 0, 0, 1], 9)));
+        assert_send(&connect);
+        let socket_connect = crate::net::TcpDpdkSocket::new_v4()
+            .expect("test socket blueprint must construct")
+            .connect(SocketAddr::from(([127, 0, 0, 1], 9)));
+        assert_send(&socket_connect);
+
+        let owner = test_owner(7);
+        let stream = ManuallyDrop::new(TcpDpdkStream::from_handle(
+            SocketHandle::default(),
+            owner,
+            DriverCleanup::dead_for_test(owner),
+            None,
+            None,
+        ));
+        let wait = stream.wait_recv();
+        assert_send(&wait);
+    }
+
+    #[test]
+    fn owner_validation_rejects_other_worker_and_outside_runtime() {
+        let owner = test_owner(8);
+        assert!(validate_worker_owner(owner, Some(owner), "test operation").is_ok());
+
+        let other_worker = WorkerIdentity::new(owner.runtime_id, owner.worker_index + 1);
+        let wrong_worker = validate_worker_owner(owner, Some(other_worker), "test operation")
+            .expect_err("another worker must not access the socket handle");
+        assert_eq!(wrong_worker.kind(), io::ErrorKind::PermissionDenied);
+        assert!(wrong_worker.to_string().contains("current worker"));
+
+        let outside = validate_worker_owner(owner, None, "test operation")
+            .expect_err("a non-DPDK thread must not access the socket handle");
+        assert_eq!(outside.kind(), io::ErrorKind::Other);
+        assert!(outside.to_string().contains("outside DPDK worker"));
+    }
+
+    #[test]
+    fn reclaimed_owner_stream_can_move_and_drop_on_another_thread() {
+        let owner = test_owner(9);
+        let stream = TcpDpdkStream::from_handle(
+            SocketHandle::default(),
+            owner,
+            DriverCleanup::dead_for_test(owner),
+            None,
+            None,
+        );
+
+        std::thread::spawn(move || drop(stream))
+            .join()
+            .expect("late stream Drop after owner reclamation must remain safe");
     }
 
     #[test]

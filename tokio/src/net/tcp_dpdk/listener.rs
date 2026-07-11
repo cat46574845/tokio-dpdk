@@ -7,7 +7,6 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
-use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::task::{Context, Poll};
 
@@ -168,8 +167,6 @@ pub struct TcpDpdkListener {
     cleanup: DriverCleanup,
     /// Local address
     local_addr: SocketAddr,
-    /// Listener handles are indices into one worker-local SocketSet.
-    _worker_affinity: PhantomData<*const ()>,
 }
 
 impl TcpDpdkListener {
@@ -302,7 +299,6 @@ impl TcpDpdkListener {
             owner,
             cleanup,
             local_addr: addr,
-            _worker_affinity: PhantomData,
         })
     }
 
