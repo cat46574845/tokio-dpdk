@@ -533,19 +533,9 @@ impl<S: 'static> Notified<S> {
         mem::forget(self);
         raw
     }
-
-    #[cfg(feature = "dpdk")]
-    pub(crate) fn owner_id(&self) -> Option<std::num::NonZeroU64> {
-        self.0.header().get_owner_id()
-    }
 }
 
 impl<S: Schedule> Task<S> {
-    #[cfg(feature = "dpdk")]
-    pub(crate) fn owner_id(&self) -> Option<std::num::NonZeroU64> {
-        self.header().get_owner_id()
-    }
-
     /// Preemptively cancels the task as part of the shutdown process.
     pub(crate) fn shutdown(self) {
         let raw = self.raw;

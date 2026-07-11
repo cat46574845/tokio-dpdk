@@ -14,9 +14,6 @@ use smoltcp::wire::{
 };
 
 use super::device::OwnedMbuf;
-use super::WorkerIdentity;
-#[cfg(test)]
-use super::DpdkRuntimeId;
 
 pub(crate) const RAW_TAIL_CONNECTION_CAP: usize = super::SOCKET_LIFECYCLE_CAPACITY;
 const RAW_TAIL_RSS_MAP_CAP: usize = RAW_TAIL_CONNECTION_CAP * 4;
@@ -37,21 +34,16 @@ pub(crate) const RAW_TAIL_RSS_KEY: [u8; 40] = [
 pub struct RawTailHandle {
     id: u64,
     slot: usize,
-    owner: WorkerIdentity,
-}
-
-/// Outcome of releasing a raw-tail parser binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RawTailUnregisterStatus {
-    /// The live owner driver removed the binding.
-    Unregistered,
-    /// Runtime shutdown had already reclaimed every binding.
-    OwnerReclaimed,
+    worker_index: usize,
 }
 
 impl RawTailHandle {
-    pub(crate) fn new(id: u64, slot: usize, owner: WorkerIdentity) -> Self {
-        Self { id, slot, owner }
+    pub(crate) fn new(id: u64, slot: usize, worker_index: usize) -> Self {
+        Self {
+            id,
+            slot,
+            worker_index,
+        }
     }
 
     /// Runtime-local raw-tail flow id.
@@ -61,11 +53,7 @@ impl RawTailHandle {
 
     /// DPDK worker that owns this handle.
     pub fn worker_index(&self) -> usize {
-        self.owner.worker_index
-    }
-
-    pub(crate) fn owner(&self) -> WorkerIdentity {
-        self.owner
+        self.worker_index
     }
 
 }
@@ -113,11 +101,10 @@ impl RawTailParserBinding {
     /// # Safety
     ///
     /// `context` must remain valid and pinned until `unregister_raw_tail`
-    /// removes this binding (or returns `OwnerReclaimed`). The callback must
-    /// use that allocation with its declared signature and return
-    /// synchronously. The caller's single-worker DriverSlot call graph must
-    /// statically exclude overlapping entry; this hot path deliberately has no
-    /// dynamic re-entry guard.
+    /// removes this binding. The callback must use that allocation with its
+    /// declared signature and return synchronously. The caller's single-worker
+    /// DriverSlot call graph must statically exclude overlapping entry; this
+    /// hot path deliberately has no dynamic re-entry guard.
     pub unsafe fn new(context: NonNull<()>, parse: RawTailParseFn) -> Self {
         Self { context, parse }
     }
@@ -267,11 +254,6 @@ impl RssSlotMap {
         }
         Some(removed.slot)
     }
-
-    fn clear(&mut self) {
-        self.entries.fill(None);
-        self.len = 0;
-    }
 }
 
 struct TailConn {
@@ -339,7 +321,7 @@ struct ProcessedTail {
 /// Worker-local raw-tail registry and fixed-capacity selected-mbuf slots.
 pub(crate) struct RawTailTable {
     next_id: u64,
-    owner: WorkerIdentity,
+    worker_index: usize,
     rss_key: Box<[u8]>,
     conns: Vec<Option<TailConn>>,
     free_slots: Vec<usize>,
@@ -357,11 +339,13 @@ pub(crate) struct RawTailTable {
 unsafe impl Send for RawTailTable {}
 
 impl RawTailTable {
-    pub(crate) fn new(owner: WorkerIdentity, rss_key: &[u8]) -> Self {
-        assert!(!rss_key.is_empty(), "raw-tail RSS key must not be empty");
+    pub(crate) fn new(worker_index: usize, rss_key: &[u8]) -> Self {
+        if rss_key.is_empty() {
+            panic!("raw-tail RSS key must not be empty");
+        }
         Self {
             next_id: 1,
-            owner,
+            worker_index,
             rss_key: rss_key.into(),
             conns: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
             free_slots: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
@@ -401,14 +385,12 @@ impl RawTailTable {
             ));
         }
         let id = self.next_id;
-        let Some(next_id) = id.checked_add(1) else {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "raw-tail handle id space exhausted",
-            ));
-        };
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("raw-tail handle id overflow");
         let slot = self.free_slots.last().copied().unwrap_or(self.conns.len());
-        let handle = RawTailHandle::new(id, slot, self.owner);
+        let handle = RawTailHandle::new(id, slot, self.worker_index);
         match self.rss_to_slot.insert(rss_hash, slot) {
             Ok(None) => {}
             Ok(Some(_)) => {
@@ -421,7 +403,6 @@ impl RawTailTable {
                 ));
             }
         }
-        self.next_id = next_id;
         let conn = TailConn {
             handle,
             tuple,
@@ -605,23 +586,9 @@ impl RawTailTable {
         true
     }
 
-    pub(crate) fn reclaim_all(&mut self) {
-        self.pending_slots.clear();
-        self.socket_to_slot.fill(None);
-        self.rss_to_slot.clear();
-        self.free_slots.clear();
-        self.active_count = 0;
-        self.conns.clear();
-    }
-
     #[inline(always)]
     pub(crate) fn is_empty(&self) -> bool {
         self.active_count == 0
-    }
-
-    #[inline(always)]
-    pub(crate) fn owner(&self) -> WorkerIdentity {
-        self.owner
     }
 
     #[inline(always)]
@@ -854,7 +821,7 @@ impl RawTailTable {
     }
 
     fn slot_for_handle(&self, handle: RawTailHandle) -> Option<usize> {
-        if handle.owner != self.owner {
+        if handle.worker_index != self.worker_index {
             return None;
         }
         let conn = self.conns.get(handle.slot)?.as_ref()?;
@@ -1036,11 +1003,8 @@ mod tests {
         .expect("test tuple must be IPv4")
     }
 
-    fn test_owner(worker_index: usize) -> WorkerIdentity {
-        WorkerIdentity::new(
-            DpdkRuntimeId::allocate().expect("test runtime id must allocate"),
-            worker_index,
-        )
+    fn test_owner(worker_index: usize) -> usize {
+        worker_index
     }
 
     #[derive(Default)]
@@ -1112,18 +1076,6 @@ mod tests {
         assert_eq!(conn.packet_ordinal, u64::MAX);
         conn.advance_packet_ordinal();
         assert_eq!(conn.packet_ordinal, 0);
-    }
-
-    #[test]
-    fn exhausted_handle_id_space_is_an_io_error_without_partial_registration() {
-        let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
-        table.next_id = u64::MAX;
-        let error = table
-            .register(tuple(443))
-            .expect_err("exhausted ids must reject registration");
-        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
-        assert_eq!(table.rss_to_slot.len, 0);
-        assert!(table.conns.is_empty());
     }
 
     #[test]
@@ -1274,30 +1226,17 @@ mod tests {
     }
 
     #[test]
-    fn activation_is_transactional_across_identity_tuple_and_socket_binding() {
+    fn activation_is_transactional_across_worker_tuple_and_socket_binding() {
         let owner = test_owner(0);
         let mut table = RawTailTable::new(owner, &RAW_TAIL_RSS_KEY);
         let handle = table.register(tuple(443)).expect("reservation must succeed");
         let mut probe = ParserProbe::default();
         let binding = parser_binding(&mut probe);
 
-        let foreign = RawTailHandle::new(handle.id(), handle.slot, test_owner(0));
-        assert_eq!(
-            table
-                .activate_parser(foreign, tuple(443), SocketHandle::default(), binding)
-                .expect_err("foreign runtime handle must fail")
-                .kind(),
-            io::ErrorKind::NotFound
-        );
-        assert!(table.conns[table.slot_for_handle(handle).unwrap()]
-            .as_ref()
-            .unwrap()
-            .parser
-            .is_none());
         let foreign_worker = RawTailHandle::new(
             handle.id(),
             handle.slot,
-            WorkerIdentity::new(owner.runtime_id, owner.worker_index + 1),
+            owner + 1,
         );
         assert_eq!(
             table

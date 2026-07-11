@@ -34,7 +34,7 @@ use super::raw_tail::{
     RawTailHandle, RawTailParserBinding, RawTailTable, RawTailTuple,
     RAW_TAIL_CONNECTION_CAP,
 };
-use super::{DpdkRuntimeId, WorkerIdentity, SOCKET_LIFECYCLE_CAPACITY};
+use super::SOCKET_LIFECYCLE_CAPACITY;
 
 // =============================================================================
 // Constants
@@ -105,11 +105,6 @@ impl PendingEgress {
             position: vec![PENDING_EGRESS_NONE; SOCKET_LIFECYCLE_CAPACITY]
                 .into_boxed_slice(),
         }
-    }
-
-    fn clear_all(&mut self) {
-        self.heap.clear();
-        self.position.fill(PENDING_EGRESS_NONE);
     }
 
     fn clear_socket(&mut self, handle: SocketHandle) {
@@ -285,8 +280,8 @@ pub(crate) struct TcpBufferPool {
     rx_buffer_size: usize,
     /// Required TX buffer size
     tx_buffer_size: usize,
-    /// Fixed listener waiter slots. Each listener retains one slot from bind
-    /// through Drop; storage never grows after driver startup.
+    /// Fixed listener waiter slots. A slot is allocated only while a listener
+    /// is blocked on this pool, and never grows after driver startup.
     waiter_slots: Vec<TcpBufferWaiterSlot>,
     /// Free waiter-slot indices, also fully allocated at driver startup.
     waiter_free: Vec<usize>,
@@ -578,17 +573,6 @@ impl TcpBufferPool {
             }
         }
     }
-
-    fn reclaim_listener_waiters(&mut self) {
-        self.waiter_registered_bits.fill(0);
-        self.waiter_free.clear();
-        let capacity = self.waiter_slots.len();
-        for (index, slot) in self.waiter_slots.iter_mut().enumerate() {
-            slot.waker = None;
-            slot.allocated = false;
-            self.waiter_free.push(capacity - index - 1);
-        }
-    }
 }
 
 // =============================================================================
@@ -774,7 +758,6 @@ impl DpdkDriver {
     /// * `gateway_v6` - Optional IPv6 default gateway
     pub(crate) fn new(
         mut device: DpdkDevice,
-        runtime_id: DpdkRuntimeId,
         worker_index: usize,
         mac: [u8; 6],
         addresses: Vec<IpCidr>,
@@ -852,10 +835,7 @@ impl DpdkDriver {
             registered_sockets: HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
             buffer_pool: TcpBufferPool::with_defaults(),
             bound_ports: HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
-            raw_tail: RawTailTable::new(
-                WorkerIdentity::new(runtime_id, worker_index),
-                &raw_tail_rss_key,
-            ),
+            raw_tail: RawTailTable::new(worker_index, &raw_tail_rss_key),
             raw_tail_egress_handles: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
             pending_egress: PendingEgress::new(),
             ingress_touched: Vec::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
@@ -1300,25 +1280,6 @@ impl DpdkDriver {
         active
     }
 
-    pub(crate) fn reclaim_all_resources(&mut self) {
-        self.raw_tail.reclaim_all();
-
-        while let Some(handle) = self.registered_sockets.iter().next().copied() {
-            if let Err(error) = self.remove_socket(handle) {
-                eprintln!(
-                    "[tokio-dpdk] ERROR forced socket reclamation failed handle={:?} error={}",
-                    handle, error
-                );
-                self.registered_sockets.remove(&handle);
-                self.iface.unregister_tcp_flow(handle);
-                self.clear_socket_egress_pending(handle);
-            }
-        }
-        self.pending_egress.clear_all();
-        self.bound_ports.clear();
-        self.buffer_pool.reclaim_listener_waiters();
-    }
-
     pub(crate) fn reserve_raw_tail(
         &mut self,
         local_addr: std::net::SocketAddr,
@@ -1334,12 +1295,6 @@ impl DpdkDriver {
         socket_handle: SocketHandle,
         parser: RawTailParserBinding,
     ) -> std::io::Result<()> {
-        if raw_tail.owner() != self.raw_tail.owner() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "raw-tail handle does not belong to this driver runtime and worker",
-            ));
-        }
         validate_socket_for_removal(&self.sockets, &self.registered_sockets, socket_handle)
             .map_err(|error| {
                 std::io::Error::new(
@@ -1467,15 +1422,6 @@ impl DpdkDriver {
     ) -> io::Result<()> {
         self.buffer_pool
             .register_listener_waiter(handle, waker)
-            .map_err(tcp_buffer_waiter_error_to_io)
-    }
-
-    pub(crate) fn clear_tcp_buffer_waiter(
-        &mut self,
-        handle: TcpBufferWaiterHandle,
-    ) -> io::Result<()> {
-        self.buffer_pool
-            .clear_listener_waiter(handle)
             .map_err(tcp_buffer_waiter_error_to_io)
     }
 
@@ -2454,89 +2400,6 @@ mod tests {
         pool.release_listener_waiter(second)
             .expect("second waiter slot must return to the fixed free list");
         assert_eq!(pool.waiter_free.len(), 2);
-    }
-
-    #[test]
-    fn clearing_waiter_keeps_permanent_listener_token_allocated() {
-        let mut pool = TcpBufferPool::new(1, 64, 32);
-        let waiter = pool
-            .allocate_listener_waiter()
-            .expect("listener bind must allocate its permanent waiter token");
-        let wake = Arc::new(CountWake {
-            count: AtomicUsize::new(0),
-        });
-        let waker = Waker::from(wake);
-
-        pool.register_listener_waiter(waiter, &waker)
-            .expect("exhausted listener must register its permanent token");
-        pool.clear_listener_waiter(waiter)
-            .expect("replenished listener must clear without releasing its token");
-        assert_eq!(
-            pool.allocate_listener_waiter(),
-            Err(TcpBufferWaiterError::Full { capacity: 1 })
-        );
-        pool.register_listener_waiter(waiter, &waker)
-            .expect("the same listener token must register again");
-        pool.release_listener_waiter(waiter)
-            .expect("listener Drop must release its permanent token exactly once");
-    }
-
-    #[test]
-    fn released_waiter_token_cannot_alias_reallocated_slot() {
-        let mut pool = TcpBufferPool::new(1, 64, 32);
-        let released = pool
-            .allocate_listener_waiter()
-            .expect("first listener token must allocate");
-        pool.release_listener_waiter(released)
-            .expect("first listener token must release");
-        let replacement = pool
-            .allocate_listener_waiter()
-            .expect("released fixed slot must be reusable");
-        assert_eq!(released.index, replacement.index);
-        assert_ne!(released, replacement);
-
-        let wake = Arc::new(CountWake {
-            count: AtomicUsize::new(0),
-        });
-        let waker = Waker::from(wake);
-        assert_eq!(
-            pool.register_listener_waiter(released, &waker),
-            Err(TcpBufferWaiterError::StaleHandle {
-                index: released.index
-            })
-        );
-        pool.register_listener_waiter(replacement, &waker)
-            .expect("replacement listener token must remain valid");
-    }
-
-    #[test]
-    fn shutdown_reclaims_every_permanent_listener_waiter() {
-        let mut pool = TcpBufferPool::new(2, 64, 32);
-        let first = pool
-            .allocate_listener_waiter()
-            .expect("first listener token must allocate");
-        let second = pool
-            .allocate_listener_waiter()
-            .expect("second listener token must allocate");
-        let wake = Arc::new(CountWake {
-            count: AtomicUsize::new(0),
-        });
-        let waker = Waker::from(wake);
-        pool.register_listener_waiter(first, &waker)
-            .expect("first listener must register");
-        pool.register_listener_waiter(second, &waker)
-            .expect("second listener must register");
-
-        pool.reclaim_listener_waiters();
-
-        assert_eq!(pool.waiter_free.len(), 2);
-        assert!(pool.waiter_slots.iter().all(|slot| !slot.allocated));
-        assert!(pool.waiter_slots.iter().all(|slot| slot.waker.is_none()));
-        assert!(pool.waiter_registered_bits.iter().all(|word| *word == 0));
-        assert_eq!(
-            pool.register_listener_waiter(first, &waker),
-            Err(TcpBufferWaiterError::StaleHandle { index: first.index })
-        );
     }
 
     #[test]

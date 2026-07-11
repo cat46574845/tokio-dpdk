@@ -210,7 +210,7 @@ fn test_many_connections() {
 
         for i in 0..NUM_CONNECTIONS {
             let success = success_count.clone();
-            let handle = tokio::runtime::dpdk::spawn_local(async move {
+            let handle = tokio::spawn(async move {
                 // Stagger connections
                 tokio::time::sleep(Duration::from_millis(i as u64 * 10)).await;
 
@@ -265,7 +265,7 @@ fn test_multi_worker() {
 
         for _ in 0..total_tasks {
             let success = success_count.clone();
-            let handle = tokio::runtime::dpdk::spawn_local(async move {
+            let handle = tokio::spawn(async move {
                 match TcpDpdkStream::connect(CLOUDFLARE_V4).await {
                     Ok(mut stream) => {
                         stream.write_all(HTTP_GET).await.ok();

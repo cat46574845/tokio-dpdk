@@ -84,11 +84,6 @@ impl<S: 'static> OwnedTasks<S> {
         }
     }
 
-    #[cfg(feature = "dpdk")]
-    pub(crate) fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-    }
-
     /// Binds the provided task to this `OwnedTasks` instance. This fails if the
     /// `OwnedTasks` has been closed.
     pub(crate) fn bind<T>(
@@ -108,8 +103,11 @@ impl<S: 'static> OwnedTasks<S> {
         (join, notified)
     }
 
-    /// Bind a non-Send task for the current-thread LocalRuntime. Multi-worker
-    /// schedulers must use `LocalOwnedTasks` instead.
+    /// Bind a task that isn't safe to transfer across thread boundaries.
+    ///
+    /// # Safety
+    ///
+    /// Only use this in `LocalRuntime` where the task cannot move
     pub(crate) unsafe fn bind_local<T>(
         &self,
         task: T,
@@ -294,18 +292,15 @@ impl<S: 'static> LocalOwnedTasks<S> {
 
     /// Shuts down all tasks in the collection. This call also closes the
     /// collection, preventing new items from being added.
-    pub(crate) fn close_and_shutdown_all(&self) -> usize
+    pub(crate) fn close_and_shutdown_all(&self)
     where
         S: Schedule,
     {
         self.with_inner(|inner| inner.closed = true);
 
-        let mut shutdown_count = 0;
         while let Some(task) = self.with_inner(|inner| inner.list.pop_back()) {
-            shutdown_count += 1;
             task.shutdown();
         }
-        shutdown_count
     }
 
     pub(crate) fn remove(&self, task: &Task<S>) -> Option<Task<S>> {

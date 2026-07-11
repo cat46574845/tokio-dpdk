@@ -608,7 +608,6 @@ fn driver_shutdown_wakes_future_pending() {
 }
 
 #[test]
-#[cfg(not(feature = "dpdk"))]
 fn driver_shutdown_wakes_pending_race() {
     // TODO: make this a loom test
     for _ in 0..100 {
@@ -694,7 +693,6 @@ fn driver_shutdown_then_clear_readiness() {
 }
 
 #[test]
-#[cfg(not(feature = "dpdk"))]
 fn driver_shutdown_wakes_poll_race() {
     // TODO: make this a loom test
     for _ in 0..100 {

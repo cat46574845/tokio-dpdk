@@ -379,37 +379,15 @@ impl LocalWorkerHandle {
     /// Create a new worker for executing pinned tasks
     fn new_worker() -> LocalWorkerHandle {
         let (sender, receiver) = unbounded_channel();
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to start a pinned worker thread runtime");
+        let runtime_handle = runtime.handle().clone();
         let task_count = Arc::new(AtomicUsize::new(0));
         let task_count_clone = Arc::clone(&task_count);
-        let (init_sender, init_receiver) = std::sync::mpsc::sync_channel(1);
 
-        let worker_thread = std::thread::spawn(move || {
-            let runtime = match Builder::new_current_thread().enable_all().build() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = init_sender.send(Err(error));
-                    return;
-                }
-            };
-            if init_sender.send(Ok(runtime.handle().clone())).is_err() {
-                return;
-            }
-            Self::run(runtime, receiver, task_count_clone);
-        });
-
-        let runtime_handle = match init_receiver.recv() {
-            Ok(Ok(runtime_handle)) => runtime_handle,
-            Ok(Err(error)) => {
-                worker_thread
-                    .join()
-                    .expect("pinned worker thread panicked after reporting initialization error");
-                panic!("Failed to start a pinned worker thread runtime: {error}");
-            }
-            Err(_) => match worker_thread.join() {
-                Ok(()) => panic!("pinned worker exited without reporting runtime initialization"),
-                Err(panic) => std::panic::resume_unwind(panic),
-            },
-        };
+        std::thread::spawn(|| Self::run(runtime, receiver, task_count_clone));
 
         LocalWorkerHandle {
             runtime_handle,
