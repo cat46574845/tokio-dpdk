@@ -18,6 +18,7 @@ use super::device::OwnedMbuf;
 pub(crate) const RAW_TAIL_CONNECTION_CAP: usize = super::SOCKET_LIFECYCLE_CAPACITY;
 const RAW_TAIL_RSS_MAP_CAP: usize = RAW_TAIL_CONNECTION_CAP * 4;
 const TLS_HEADER_LEN: usize = 5;
+const TLS_MIN_CIPHERTEXT_LEN: usize = 17;
 const TLS_MAX_CIPHERTEXT_LEN: usize = 16_640;
 pub(crate) const RAW_TAIL_REQUIRED_RSS_HF: u64 = 1u64 << 4;
 
@@ -898,53 +899,46 @@ struct TailAlignedTlsRecords {
 
 #[inline(always)]
 fn tls_record_len_at(payload: &[u8], offset: usize) -> Option<usize> {
-    let header_end = offset.checked_add(TLS_HEADER_LEN)?;
+    let header_end = offset + TLS_HEADER_LEN;
     let header = payload.get(offset..header_end)?;
     if header[0] != 0x17 || header[1] != 0x03 || header[2] != 0x03 {
         return None;
     }
     let ciphertext_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-    if ciphertext_len == 0 || ciphertext_len > TLS_MAX_CIPHERTEXT_LEN {
+    if !(TLS_MIN_CIPHERTEXT_LEN..=TLS_MAX_CIPHERTEXT_LEN).contains(&ciphertext_len) {
         return None;
     }
-    TLS_HEADER_LEN.checked_add(ciphertext_len)
+    Some(TLS_HEADER_LEN + ciphertext_len)
 }
 
-fn tls_chain_count_at(payload: &[u8], offset: usize) -> Option<u16> {
-    let mut cursor = offset;
-    let mut count = 0u16;
-    while cursor < payload.len() {
-        let record_len = tls_record_len_at(payload, cursor)?;
-        cursor = cursor.checked_add(record_len)?;
-        if cursor > payload.len() {
-            return None;
-        }
-        count = count.checked_add(1)?;
-    }
-    (cursor == payload.len() && count != 0).then_some(count)
-}
-
-/// Locate complete TLS records that end exactly at this one TCP payload. The
-/// common offset-zero path touches only TLS headers. If the packet begins in a
-/// discarded record, the cold path scans for an independently complete suffix;
-/// it never consults or combines another mbuf.
+/// Locate the newest complete TLS 1.3 record ending at this TCP payload. The
+/// common single-record path reads only offset zero. Otherwise search backward
+/// from the minimum legal wire length and stop at the TLS ciphertext maximum;
+/// a miss never scans an earlier part of a large payload or another mbuf.
 fn find_tail_aligned_tls_records(payload: &[u8]) -> Option<TailAlignedTlsRecords> {
-    if payload.len() < TLS_HEADER_LEN {
+    const TLS_MIN_WIRE_LEN: usize = TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN;
+    const TLS_MAX_WIRE_LEN: usize = TLS_HEADER_LEN + TLS_MAX_CIPHERTEXT_LEN;
+
+    if payload.len() < TLS_MIN_WIRE_LEN {
         return None;
     }
-    if let Some(record_count) = tls_chain_count_at(payload, 0) {
-        return Some(TailAlignedTlsRecords {
-            offset: 0,
-            record_count,
-        });
+    if tls_record_len_at(payload, 0) == Some(payload.len()) {
+        return Some(TailAlignedTlsRecords { offset: 0, record_count: 1 });
     }
 
-    for offset in 1..=payload.len() - TLS_HEADER_LEN {
-        if let Some(record_count) = tls_chain_count_at(payload, offset) {
-            return Some(TailAlignedTlsRecords {
-                offset,
-                record_count,
-            });
+    let newest_offset = payload.len() - TLS_MIN_WIRE_LEN;
+    let oldest_offset = payload.len().saturating_sub(TLS_MAX_WIRE_LEN).max(1);
+    if oldest_offset > newest_offset {
+        return None;
+    }
+    for offset in (oldest_offset..=newest_offset).rev() {
+        if let Some(record_len) = tls_record_len_at(payload, offset) {
+            if offset + record_len == payload.len() {
+                return Some(TailAlignedTlsRecords {
+                    offset,
+                    record_count: 1,
+                });
+            }
         }
     }
     None
@@ -988,8 +982,10 @@ mod tests {
 
     fn tls_record(body: &[u8]) -> Vec<u8> {
         let mut record = vec![0x17, 0x03, 0x03];
-        record.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        let ciphertext_len = body.len().max(TLS_MIN_CIPHERTEXT_LEN);
+        record.extend_from_slice(&(ciphertext_len as u16).to_be_bytes());
         record.extend_from_slice(body);
+        record.resize(TLS_HEADER_LEN + ciphertext_len, 0);
         record
     }
 
@@ -1099,17 +1095,35 @@ mod tests {
     }
 
     #[test]
-    fn finds_multiple_tls_records_in_one_selected_payload() {
+    fn selects_only_the_newest_tls_record_from_one_payload() {
         let first = tls_record(b"first");
         let second = tls_record(b"second");
         let mut payload = vec![0xaa, 0xbb, 0xcc];
         payload.extend_from_slice(&first);
         payload.extend_from_slice(&second);
         let records = find_tail_aligned_tls_records(&payload)
-            .expect("complete TLS suffix must be found in one payload");
-        assert_eq!(records.offset, 3);
-        assert_eq!(records.record_count, 2);
-        assert_eq!(&payload[records.offset..], [first, second].concat());
+            .expect("newest complete TLS record must be found in one payload");
+        assert_eq!(records.offset, 3 + first.len());
+        assert_eq!(records.record_count, 1);
+        assert_eq!(&payload[records.offset..], second);
+    }
+
+    #[test]
+    fn finds_a_coalesced_ws_tls_record_at_the_tail_of_100kb() {
+        let record = tls_record(&vec![0x5a; 845]);
+        let mut payload = vec![0xaa; 100 * 1024 - record.len()];
+        payload.extend_from_slice(&record);
+        let records = find_tail_aligned_tls_records(&payload)
+            .expect("bounded tail search must find a large coalesced TLS record");
+        assert_eq!(records.offset, payload.len() - record.len());
+        assert_eq!(records.record_count, 1);
+        assert_eq!(&payload[records.offset..], record);
+    }
+
+    #[test]
+    fn large_non_tls_tail_is_an_accepted_bounded_miss() {
+        let payload = vec![0xaa; 100 * 1024];
+        assert!(find_tail_aligned_tls_records(&payload).is_none());
     }
 
     #[test]
