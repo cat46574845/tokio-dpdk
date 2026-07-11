@@ -38,12 +38,9 @@ pub(crate) struct InitializedWorker {
 
 /// Holds DPDK resources for cleanup when the last Arc<Handle> is dropped.
 ///
-/// This struct is stored in `Shared` and is dropped AFTER `drivers` (due to field order),
-/// ensuring all DpdkDevice instances have released their mbufs before mempool is freed.
-///
-/// Drop order in Shared:
-/// 1. drivers (DpdkDriver -> DpdkDevice::drop() frees mbufs)
-/// 2. dpdk_resources (this struct - frees mempool and calls rte_eal_cleanup())
+/// Each Worker declares its inline DpdkDriver before its Handle, so all
+/// DpdkDevice instances release mbufs before the last Handle drops Shared and
+/// invokes this cleaner. Shared releases ResourceLock only after this Drop.
 pub(crate) struct DpdkResourcesCleaner {
     /// Memory pool pointer to free
     mempool: *mut ffi::rte_mempool,
@@ -67,8 +64,20 @@ impl Drop for DpdkResourcesCleaner {
         // 1. Stop and close all ports
         for &port_id in &self.ports {
             unsafe {
-                let _ = ffi::rte_eth_dev_stop(port_id);
-                let _ = ffi::rte_eth_dev_close(port_id);
+                let stop_result = ffi::rte_eth_dev_stop(port_id);
+                if stop_result != 0 {
+                    eprintln!(
+                        "[tokio-dpdk] ERROR rte_eth_dev_stop failed port={} rc={}",
+                        port_id, stop_result
+                    );
+                }
+                let close_result = ffi::rte_eth_dev_close(port_id);
+                if close_result != 0 {
+                    eprintln!(
+                        "[tokio-dpdk] ERROR rte_eth_dev_close failed port={} rc={}",
+                        port_id, close_result
+                    );
+                }
             }
         }
 
@@ -81,7 +90,13 @@ impl Drop for DpdkResourcesCleaner {
 
         // 3. Clean up EAL
         unsafe {
-            let _ = ffi::rte_eal_cleanup();
+            let cleanup_result = ffi::rte_eal_cleanup();
+            if cleanup_result != 0 {
+                eprintln!(
+                    "[tokio-dpdk] ERROR rte_eal_cleanup failed rc={}",
+                    cleanup_result
+                );
+            }
         }
     }
 }

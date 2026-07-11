@@ -792,6 +792,89 @@ mod stream_property_tests {
     }
 }
 
+mod resource_owner_lifecycle {
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio::net::TcpDpdkListener;
+    use tokio::runtime::dpdk::{self, RawTailUnregisterStatus};
+
+    #[serial_isolation_test::serial_isolation_test]
+    #[test]
+    fn listener_drop_between_block_on_calls_releases_every_driver_resource() {
+        let rt = dpdk_rt();
+        let addr: SocketAddr = format!("{}:{}", get_dpdk_ip(), get_test_port())
+            .parse()
+            .expect("DPDK listener address must parse");
+
+        let listener = rt.block_on(async {
+            TcpDpdkListener::bind(addr)
+                .await
+                .expect("first listener bind must succeed")
+        });
+        assert!(dpdk::try_current_worker().is_none());
+        drop(listener);
+
+        let rebound = rt.block_on(async {
+            TcpDpdkListener::bind(addr)
+                .await
+                .expect("same port must bind after owner-thread out-of-context Drop")
+        });
+        drop(rebound);
+    }
+
+    #[serial_isolation_test::serial_isolation_test]
+    #[test]
+    fn raw_tail_unregister_between_block_on_calls_uses_owner_capability() {
+        let rt = dpdk_rt();
+        let local: SocketAddr = format!("{}:40000", get_dpdk_ip())
+            .parse()
+            .expect("raw-tail local address must parse");
+        let remote: SocketAddr = "198.51.100.1:443"
+            .parse()
+            .expect("raw-tail remote address must parse");
+        let handle = rt.block_on(async {
+            dpdk::reserve_raw_tail(local, remote).expect("raw-tail binding must reserve")
+        });
+
+        assert_eq!(
+            dpdk::unregister_raw_tail(handle)
+                .expect("owner-thread out-of-context unregister must succeed"),
+            RawTailUnregisterStatus::Unregistered
+        );
+    }
+
+    #[serial_isolation_test::serial_isolation_test]
+    #[test]
+    fn wrappers_outliving_runtime_observe_resources_already_reclaimed() {
+        let rt = dpdk_rt();
+        let listener_addr: SocketAddr = format!("{}:{}", get_dpdk_ip(), get_test_port())
+            .parse()
+            .expect("DPDK listener address must parse");
+        let raw_local: SocketAddr = format!("{}:40001", get_dpdk_ip())
+            .parse()
+            .expect("raw-tail local address must parse");
+        let raw_remote: SocketAddr = "198.51.100.2:443"
+            .parse()
+            .expect("raw-tail remote address must parse");
+        let (listener, raw_tail) = rt.block_on(async {
+            let listener = TcpDpdkListener::bind(listener_addr)
+                .await
+                .expect("listener bind must succeed");
+            let raw_tail = dpdk::reserve_raw_tail(raw_local, raw_remote)
+                .expect("raw-tail binding must reserve");
+            (listener, raw_tail)
+        });
+
+        drop(rt);
+        assert_eq!(
+            dpdk::unregister_raw_tail(raw_tail)
+                .expect("dead raw-tail owner must return a terminal outcome"),
+            RawTailUnregisterStatus::OwnerReclaimed
+        );
+        drop(listener);
+    }
+}
+
 // =============================================================================
 // Worker Affinity Tests
 // =============================================================================
@@ -893,7 +976,7 @@ mod worker_affinity_tests {
                 let addr = server_addr;
                 let streams_created = streams_created.clone();
 
-                handles.push(tokio::spawn(async move {
+                handles.push(tokio::runtime::dpdk::spawn_local(async move {
                     if let Ok(stream) = TcpDpdkStream::connect(addr).await {
                         assert!(stream.local_addr().is_ok());
                         streams_created.fetch_add(1, Ordering::SeqCst);
@@ -1202,7 +1285,7 @@ mod buffer_pool_tests {
             let mut client_handles = vec![];
             for i in 0..NUM_CONNECTIONS {
                 let addr = server_addr;
-                client_handles.push(tokio::spawn(async move {
+                client_handles.push(tokio::runtime::dpdk::spawn_local(async move {
                     let stream = TcpDpdkStream::connect(addr).await;
                     if let Ok(mut stream) = stream {
                         let msg = format!("msg{}", i);

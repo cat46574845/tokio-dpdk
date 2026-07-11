@@ -269,7 +269,7 @@ async fn run_isolation_test(
         let barrier = barrier.clone();
         let arrived = arrived.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = tokio::runtime::dpdk::spawn_local(async move {
             let task_start = Instant::now();
             dbg_print!(
                 task_start,
@@ -560,7 +560,7 @@ fn test_rapid_reconnect_isolation() {
 
         for client_id in 0..NUM_CLIENTS {
             let results = results.clone();
-            let handle = tokio::spawn(async move {
+            let handle = tokio::runtime::dpdk::spawn_local(async move {
                 for reconnect in 0..RECONNECTS_PER_CLIENT {
                     let unique_id = client_id * 1000 + reconnect;
                     let result =

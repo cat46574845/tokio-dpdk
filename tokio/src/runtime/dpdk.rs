@@ -40,7 +40,10 @@ use crate::task::JoinHandle;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::io;
 
-pub use crate::runtime::scheduler::dpdk::{RawTailHandle, RawTailRecord};
+pub use crate::runtime::scheduler::dpdk::{
+    RawTailHandle, RawTailRecord, RawTailUnregisterStatus,
+};
+use crate::runtime::scheduler::dpdk::DpdkRuntimeId;
 
 /// Identifies a specific DPDK worker thread.
 ///
@@ -48,12 +51,13 @@ pub use crate::runtime::scheduler::dpdk::{RawTailHandle, RawTailRecord};
 /// pinned to a dedicated CPU core and has its own DPDK network interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WorkerId {
+    runtime_id: DpdkRuntimeId,
     index: usize,
 }
 
 impl WorkerId {
-    pub(crate) fn new(index: usize) -> Self {
-        Self { index }
+    pub(crate) fn new(runtime_id: DpdkRuntimeId, index: usize) -> Self {
+        Self { runtime_id, index }
     }
 
     /// Returns the zero-based index of this worker.
@@ -64,7 +68,12 @@ impl WorkerId {
 
 impl std::fmt::Display for WorkerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WorkerId({})", self.index)
+        write!(
+            f,
+            "WorkerId(runtime={}, index={})",
+            self.runtime_id.as_u64(),
+            self.index
+        )
     }
 }
 
@@ -85,16 +94,33 @@ pub fn current_worker() -> WorkerId {
 /// Returns the [`WorkerId`] of the current DPDK worker thread, or `None`
 /// if not on a DPDK worker thread.
 pub fn try_current_worker() -> Option<WorkerId> {
-    crate::runtime::scheduler::dpdk::worker::current_worker_index().map(WorkerId::new)
+    crate::runtime::scheduler::dpdk::worker::current_worker_identity()
+        .map(|owner| WorkerId::new(owner.runtime_id, owner.worker_index))
 }
 
 /// Stop diverting a raw-tail flow and free any retained mbufs.
+///
+/// This may be called between `Runtime::block_on` calls on the worker's owner
+/// OS thread. [`RawTailUnregisterStatus::OwnerReclaimed`] means runtime
+/// shutdown already removed the binding, so parser-local state can be dropped.
 #[track_caller]
-pub fn unregister_raw_tail(handle: RawTailHandle) -> io::Result<()> {
-    crate::runtime::scheduler::dpdk::worker::with_current_driver(|driver| {
-        driver.unregister_raw_tail(handle);
-    })
-    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DPDK driver unavailable"))
+pub fn unregister_raw_tail(handle: RawTailHandle) -> io::Result<RawTailUnregisterStatus> {
+    let owner = handle.owner();
+    if crate::runtime::scheduler::dpdk::worker::current_worker_identity() == Some(owner) {
+        return crate::runtime::scheduler::dpdk::worker::with_current_driver(|driver| {
+            driver.unregister_raw_tail(handle)
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DPDK driver unavailable"))?
+        .map(|()| RawTailUnregisterStatus::Unregistered);
+    }
+
+    let Some(cleanup) = crate::runtime::scheduler::dpdk::driver_cleanup_for_identity(owner) else {
+        return Ok(RawTailUnregisterStatus::OwnerReclaimed);
+    };
+    match cleanup.with_driver(|driver| driver.unregister_raw_tail(handle))? {
+        Some(result) => result.map(|()| RawTailUnregisterStatus::Unregistered),
+        None => Ok(RawTailUnregisterStatus::OwnerReclaimed),
+    }
 }
 
 /// Reserve a raw-tail RSS hash before the TCP connection is established.
@@ -125,8 +151,11 @@ pub fn activate_raw_tail(handle: RawTailHandle) -> io::Result<()> {
 /// Panics if not called from within a DPDK runtime context.
 #[track_caller]
 pub fn workers() -> Vec<WorkerId> {
-    let n = num_workers();
-    (0..n).map(WorkerId::new).collect()
+    with_dpdk_handle(|handle| {
+        (0..handle.num_workers())
+            .map(|index| WorkerId::new(handle.runtime_id(), index))
+            .collect()
+    })
 }
 
 /// Returns the number of workers in the current DPDK runtime.
@@ -148,7 +177,7 @@ pub fn num_workers() -> usize {
 /// Panics if not called from within a DPDK runtime context.
 #[track_caller]
 pub fn worker_ipv4(id: WorkerId) -> Option<Ipv4Addr> {
-    with_dpdk_handle(|h| h.worker_ipv4(id.index))
+    with_worker_handle(id, |h| h.worker_ipv4(id.index))
 }
 
 /// Returns the IPv6 address configured on the specified worker's DPDK interface.
@@ -160,7 +189,7 @@ pub fn worker_ipv4(id: WorkerId) -> Option<Ipv4Addr> {
 /// Panics if not called from within a DPDK runtime context.
 #[track_caller]
 pub fn worker_ipv6(id: WorkerId) -> Option<Ipv6Addr> {
-    with_dpdk_handle(|h| h.worker_ipv6(id.index))
+    with_worker_handle(id, |h| h.worker_ipv6(id.index))
 }
 
 /// Returns the IPv4 address configured on the current worker's DPDK interface.
@@ -196,7 +225,7 @@ pub fn current_ipv6() -> Option<Ipv6Addr> {
 /// Panics if not called from within a DPDK runtime context.
 #[track_caller]
 pub fn worker_ipv4s(id: WorkerId) -> Vec<Ipv4Addr> {
-    with_dpdk_handle(|h| h.worker_ipv4s(id.index))
+    with_worker_handle(id, |h| h.worker_ipv4s(id.index))
 }
 
 /// Returns all IPv6 addresses configured on the specified worker's DPDK interface.
@@ -209,7 +238,7 @@ pub fn worker_ipv4s(id: WorkerId) -> Vec<Ipv4Addr> {
 /// Panics if not called from within a DPDK runtime context.
 #[track_caller]
 pub fn worker_ipv6s(id: WorkerId) -> Vec<Ipv6Addr> {
-    with_dpdk_handle(|h| h.worker_ipv6s(id.index))
+    with_worker_handle(id, |h| h.worker_ipv6s(id.index))
 }
 
 /// Returns all IPv4 addresses configured on the current worker's DPDK interface.
@@ -315,6 +344,7 @@ where
     let spawned_at = SpawnLocation::capture();
 
     with_dpdk_handle_arc(|h| {
+        assert_worker_runtime(h, worker);
         scheduler::dpdk::Handle::spawn_on_worker(h, worker.index, future, id, spawned_at)
     })
 }
@@ -362,6 +392,7 @@ where
     let spawned_at = SpawnLocation::capture();
 
     with_dpdk_handle_arc(|h| {
+        assert_worker_runtime(h, worker);
         let worker_index = worker.index;
         assert!(
             worker_index < h.num_workers(),
@@ -424,6 +455,28 @@ fn with_dpdk_handle<R>(f: impl FnOnce(&scheduler::dpdk::Handle) -> R) -> R {
         _ => panic!("not running in a DPDK runtime"),
     })
     .expect("must be called from within a Tokio runtime")
+}
+
+#[track_caller]
+fn with_worker_handle<R>(
+    worker: WorkerId,
+    f: impl FnOnce(&scheduler::dpdk::Handle) -> R,
+) -> R {
+    with_dpdk_handle(|handle| {
+        assert_worker_runtime(handle, worker);
+        f(handle)
+    })
+}
+
+#[track_caller]
+fn assert_worker_runtime(handle: &scheduler::dpdk::Handle, worker: WorkerId) {
+    assert_eq!(
+        worker.runtime_id,
+        handle.runtime_id(),
+        "WorkerId belongs to DPDK runtime {} but current runtime is {}",
+        worker.runtime_id.as_u64(),
+        handle.runtime_id().as_u64()
+    );
 }
 
 /// Access the DPDK handle Arc from the current runtime context.

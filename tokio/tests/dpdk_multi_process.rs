@@ -226,7 +226,7 @@ fn test_multi_task_real_traffic() {
         let mut handles = Vec::new();
 
         for i in 0..4 {
-            handles.push(tokio::spawn(async move {
+            handles.push(tokio::runtime::dpdk::spawn_local(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 use tokio::net::TcpDpdkStream;
 
@@ -294,7 +294,7 @@ fn test_e2e_multiple_connections() {
 
         for _ in 0..10 {
             let counter = success_count.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(tokio::runtime::dpdk::spawn_local(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 use tokio::net::TcpDpdkStream;
 
@@ -359,7 +359,7 @@ fn test_e2e_concurrent_workers_traffic() {
         for i in 0..8 {
             let thread_ids = thread_ids.clone();
             let worker = workers[i % workers.len()];
-            handles.push(dpdk::spawn_on(worker, async move {
+            handles.push(dpdk::spawn_local_on(worker, move || async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 use tokio::net::TcpDpdkStream;
 
@@ -406,7 +406,7 @@ fn test_e2e_traffic_distribution() {
             let rx = rx_count.clone();
             let tx = tx_count.clone();
 
-            handles.push(tokio::spawn(async move {
+            handles.push(tokio::runtime::dpdk::spawn_local(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 use tokio::net::TcpDpdkStream;
 

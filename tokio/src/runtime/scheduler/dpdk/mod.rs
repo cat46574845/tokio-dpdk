@@ -13,6 +13,7 @@ pub(crate) mod dpdk_driver;
 pub(crate) mod env_config;
 mod ffi;
 mod flow_rules;
+mod identity;
 pub(crate) mod raw_tail;
 pub(crate) mod init;
 pub(crate) mod io_thread;
@@ -32,9 +33,13 @@ pub(crate) use handle::Handle;
 pub(crate) use worker::Context;
 
 // Re-export worker context API for TcpDpdkStream
-pub(crate) use worker::{current_worker_index, with_current_driver};
+pub(crate) use worker::{
+    current_driver_cleanup, current_worker_identity, driver_cleanup_for_identity,
+    with_current_driver, DriverCleanup,
+};
+pub(crate) use identity::{DpdkRuntimeId, WorkerIdentity};
 
-pub use raw_tail::{RawTailHandle, RawTailRecord};
+pub use raw_tail::{RawTailHandle, RawTailRecord, RawTailUnregisterStatus};
 
 // Re-export debug APIs
 pub use worker::{current_tick, current_exec_count, current_scheduler_stats, DpdkSchedulerStats};
@@ -50,28 +55,36 @@ use crate::future::Future;
 use crate::loom::sync::Arc;
 use crate::runtime::scheduler;
 use crate::runtime::builder::ThreadNameFn;
+use crate::runtime::task::LocalOwnedTasks;
 use crate::runtime::Callback;
 
+use std::cell::Cell;
 use std::io;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// DPDK scheduler top-level struct (similar to MultiThread)
 ///
 /// The DPDK resource cleanup (mempool, EAL) is handled by `Shared::dpdk_resources`,
-/// which is dropped when the last `Arc<Handle>` is released. This ensures proper
-/// drop order: DpdkDevices drop first (releasing mbufs), then mempool is freed.
+/// which is dropped when the last `Arc<Handle>` is released. Every Worker owns
+/// its DpdkDriver inline and declares it before its Handle, so devices release
+/// their mbufs before that final Handle can free the mempool/EAL.
 pub(crate) struct Dpdk {
     /// Worker thread handles for joining during shutdown
     worker_handles: Vec<std::thread::JoinHandle<()>>,
     /// Worker 0 - reserved for main thread during block_on
     worker_0: Option<Arc<worker::Worker>>,
+    /// `!Send` tasks created on worker 0's permanent owner OS thread.
+    worker_0_local_owned: Rc<LocalOwnedTasks<Arc<Handle>>>,
+    /// DPDK runtimes are tied to the thread which successfully initialized
+    /// EAL, worker 0, and its local task collection.
+    owner_thread_id: std::thread::ThreadId,
+    worker_0_started: Cell<bool>,
+    worker_0_after_start: Option<Callback>,
+    worker_0_before_stop: Option<Callback>,
     /// I/O thread handle for shutdown coordination
     io_thread_handle: Option<io_thread::IoThreadHandle>,
-    /// Resource locks (devices and cores) - released when runtime is dropped.
-    #[allow(dead_code)]
-    resource_lock: resource_lock::ResourceLock,
-    /// Scheduler handle - contains Shared which holds DpdkDrivers/DpdkDevices
-    /// and the DpdkResourcesCleaner for mempool/EAL cleanup.
+    /// Scheduler handle whose Shared state owns the final mempool/EAL cleaner.
     handle: Arc<Handle>,
     /// Flag to detect concurrent block_on calls (not supported by DPDK scheduler)
     block_on_in_progress: AtomicBool,
@@ -104,6 +117,8 @@ impl Dpdk {
         after_start: Option<Callback>,
         before_stop: Option<Callback>,
     ) -> io::Result<(Self, worker::Launch)> {
+        let runtime_id = DpdkRuntimeId::allocate()?;
+
         // Validate configuration
         dpdk_builder
             .validate()
@@ -140,13 +155,17 @@ impl Dpdk {
         let mut resource_lock = resource_lock::ResourceLock::new();
 
         // Lock devices
-        let pci_addresses: Vec<String> =
+        let mut pci_addresses: Vec<String> =
             plan.workers.iter().map(|w| w.pci_address.clone()).collect();
-        let _ = resource_lock.acquire_devices(&pci_addresses);
+        pci_addresses.sort_unstable();
+        pci_addresses.dedup();
+        resource_lock.acquire_devices(&pci_addresses)?;
 
         // Lock cores
-        let core_ids: Vec<usize> = plan.workers.iter().map(|w| w.core_id).collect();
-        let _ = resource_lock.acquire_cores(&core_ids);
+        let mut core_ids: Vec<usize> = plan.workers.iter().map(|w| w.core_id).collect();
+        core_ids.sort_unstable();
+        core_ids.dedup();
+        resource_lock.acquire_cores(&core_ids)?;
 
         // Merge eal_args from env config with builder's extra args.
         // Env config args come first, builder args follow (allowing overrides).
@@ -260,11 +279,16 @@ impl Dpdk {
             );
         }
 
+        let worker_0_after_start = after_start.clone();
+        let worker_0_before_stop = before_stop.clone();
+
         // Create Handle and Launch using worker::create
         let (handle, mut launch) = worker::create(
             initialized_workers,
+            runtime_id,
             resources.mempool,
             resources.ports.clone(),
+            resource_lock,
             driver_handle,
             blocking_spawner,
             seed_generator,
@@ -282,8 +306,12 @@ impl Dpdk {
             Self {
                 worker_handles: Vec::new(),
                 worker_0,
+                worker_0_local_owned: Rc::new(LocalOwnedTasks::new()),
+                owner_thread_id: std::thread::current().id(),
+                worker_0_started: Cell::new(false),
+                worker_0_after_start,
+                worker_0_before_stop,
                 io_thread_handle: None,
-                resource_lock,
                 handle,
                 block_on_in_progress: AtomicBool::new(false),
             },
@@ -331,6 +359,11 @@ impl Dpdk {
     /// });
     /// ```
     pub(crate) fn block_on<F: Future>(&self, handle: &scheduler::Handle, future: F) -> F::Output {
+        assert_eq!(
+            std::thread::current().id(),
+            self.owner_thread_id,
+            "DPDK Runtime::block_on must run on the OS thread which created the runtime"
+        );
         // Check for concurrent block_on calls - DPDK scheduler only supports single block_on
         if self.block_on_in_progress.swap(true, Ordering::SeqCst) {
             panic!(
@@ -355,9 +388,20 @@ impl Dpdk {
             .expect("DPDK runtime has no worker 0 - this should never happen")
             .clone();
 
+        let after_start = (!self.worker_0_started.get())
+            .then(|| self.worker_0_after_start.as_ref())
+            .flatten();
+
         // Enter runtime context and run as worker 0
         crate::runtime::context::enter_runtime(handle, true, |_blocking| {
-            worker::run_with_future(worker_0, handle, future)
+            worker::run_with_future(
+                worker_0,
+                handle,
+                future,
+                Rc::clone(&self.worker_0_local_owned),
+                after_start,
+                &self.worker_0_started,
+            )
         })
     }
 
@@ -374,29 +418,32 @@ impl Dpdk {
     /// If we shutdown the I/O thread first, it sets time::is_shutdown=true,
     /// but workers may still be polling tasks with timers, causing panics in
     /// TimerEntry::poll_elapsed() when it asserts !is_shutdown().
-    pub(crate) fn shutdown(&mut self, _handle: &scheduler::Handle) {
+    pub(crate) fn shutdown(&mut self, scheduler_handle: &scheduler::Handle) {
+        assert_eq!(
+            std::thread::current().id(),
+            self.owner_thread_id,
+            "DPDK Runtime must be dropped on the OS thread which created it"
+        );
+        // Keep Handle::current()/tokio::spawn semantics available to every
+        // task destructor, including global Send tasks cancelled after joins.
+        let _runtime_context =
+            crate::runtime::context::try_set_current(scheduler_handle);
         // Step 1: Signal shutdown to all workers
-        // This closes inject queue and owned tasks, setting scheduler is_shutdown flag
+        // This closes spawn queues without dropping any future on this thread.
         self.handle.shutdown();
 
-        // Step 2: Worker 0 (main thread) drains its own queues
-        // The main thread still has CPU affinity from block_on, so this is correct.
+        // Step 2: worker 0 destroys its LocalOwnedTasks while its Context and
+        // DPDK driver are still available on the permanent owner thread.
         if let Some(ref worker_0) = self.worker_0 {
-            if let Some(mut core) = worker_0.core.take() {
-                core.is_shutdown = true;
-
-                // Drain local queues on worker 0's core
-                while let Some(task) = core.run_queue.pop() {
-                    drop(task);
-                }
-                while let Some(task) = core.local_overflow.pop_front() {
-                    drop(task);
-                }
-                drop(core.lifo_slot.take());
-
-                // Report this core as shutdown
-                self.handle.shutdown_core(core);
-            }
+            worker::shutdown_worker_zero(
+                Arc::clone(worker_0),
+                scheduler_handle,
+                Rc::clone(&self.worker_0_local_owned),
+                self.worker_0_started
+                    .get()
+                    .then(|| self.worker_0_before_stop.as_ref())
+                    .flatten(),
+            );
         }
 
         // Step 3: Wait for all other worker threads to complete
@@ -404,6 +451,13 @@ impl Dpdk {
         for handle in self.worker_handles.drain(..) {
             let _ = handle.join();
         }
+
+        // Every !Send future is gone. Remaining global tasks are Send and may
+        // now be cancelled on the owner thread.
+        while let Some(task) = self.handle.next_remote_task() {
+            drop(task);
+        }
+        self.handle.shared.owned.close_and_shutdown_all(0);
 
         // Step 4: Shut down the I/O thread (sets time driver is_shutdown flag)
         // IMPORTANT: This must happen AFTER all workers have exited (Step 3)
@@ -423,13 +477,11 @@ impl Dpdk {
             }
         }
 
-        // NOTE: DPDK resources cleanup (mempool, EAL) is handled by
-        // Shared::dpdk_resources, which is dropped when the last Arc<Handle>
-        // is released. This ensures proper drop order:
-        // 1. DpdkDevices drop first (freeing mbufs)
-        // 2. DpdkResourcesCleaner drops (freeing mempool, calling rte_eal_cleanup)
+        // Worker::driver is inline before Worker::handle. Consequently every
+        // DpdkDevice drops before the last Handle can drop Shared's cleaner;
+        // Shared then frees mempool/EAL before releasing resource locks.
     }
 }
 
-// No custom Drop implementation needed - mempool cleanup is handled by
-// Shared::dpdk_resources which is dropped when the last Arc<Handle> is released.
+// No custom Drop implementation is needed for mempool/EAL; Shared owns the
+// cleaner and the longer-lived resource locks.

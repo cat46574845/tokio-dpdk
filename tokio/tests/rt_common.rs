@@ -62,6 +62,7 @@ macro_rules! rt_test {
 }
 
 #[test]
+#[cfg(not(feature = "dpdk"))]
 fn send_sync_bound() {
     use tokio::runtime::Runtime;
     fn is_send<T: Send + Sync>() {}
@@ -433,7 +434,7 @@ rt_test! {
     #[test]
     fn spawn_from_other_thread_idle() {
         let rt = rt();
-        let handle = rt.clone();
+        let handle = rt.handle().clone();
 
         let (tx, rx) = oneshot::channel();
 
@@ -454,7 +455,7 @@ rt_test! {
     #[test]
     fn spawn_from_other_thread_under_load() {
         let rt = rt();
-        let handle = rt.clone();
+        let handle = rt.handle().clone();
 
         let (tx, rx) = oneshot::channel();
 
@@ -611,7 +612,7 @@ rt_test! {
         });
     }
 
-    #[cfg(not(target_os="wasi"))] // Wasi does not support threads
+    #[cfg(all(not(target_os="wasi"), not(feature = "dpdk")))]
     #[test]
     fn always_active_parker() {
         // This test it to show that we will always have

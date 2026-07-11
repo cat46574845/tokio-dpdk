@@ -480,7 +480,7 @@ async fn run_single_core_test(num_connections: usize) {
             .collect();
 
         let stop = stop.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(tokio::runtime::dpdk::spawn_local(async move {
             run_ws_connection(conn_id, symbols, stats, stop).await;
         }));
 
@@ -602,7 +602,7 @@ async fn run_dual_core_test(connections_per_core: usize) {
             .collect();
 
         let stop = stop.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(tokio::runtime::dpdk::spawn_local(async move {
             run_ws_connection(conn_id, symbols, stats, stop).await;
         }));
 
@@ -729,7 +729,7 @@ fn binance_ws_small() {
             let symbols: Vec<&'static str> = FUTURES_SYMBOLS[..SYMBOLS_PER_CONN].to_vec();
             let stop = stop.clone();
 
-            handles.push(tokio::spawn(async move {
+            handles.push(tokio::runtime::dpdk::spawn_local(async move {
                 run_ws_connection(conn_id, symbols, stats, stop).await;
             }));
         }

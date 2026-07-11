@@ -16,7 +16,10 @@ use smoltcp::iface::SocketHandle;
 use super::stream::TcpDpdkStream;
 use crate::net::{to_socket_addrs, ToSocketAddrs};
 use crate::runtime::scheduler::dpdk::dpdk_driver::TcpBufferWaiterHandle;
-use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver};
+use crate::runtime::scheduler::dpdk::{
+    current_driver_cleanup, current_worker_identity, with_current_driver, DriverCleanup,
+    WorkerIdentity,
+};
 
 /// Default number of listening sockets in the pool.
 const DEFAULT_BACKLOG: usize = 128;
@@ -32,31 +35,47 @@ struct ListenerInner {
     listen_pool: VecDeque<ListenSocket>,
     /// Backlog size (number of listening sockets to maintain)
     backlog: usize,
-    /// Fixed driver waiter slot held only while this listener has observed
-    /// buffer-pool exhaustion.
-    buffer_waiter: Option<TcpBufferWaiterHandle>,
+    /// Fixed driver waiter token allocated at bind and retained through Drop.
+    buffer_waiter: TcpBufferWaiterHandle,
+    buffer_waiting: bool,
+    pending_replenish_error: Option<io::Error>,
 }
 
 struct ListenerBindGuard {
     listen_pool: VecDeque<ListenSocket>,
     port: u16,
-    core_id: usize,
+    owner: WorkerIdentity,
+    cleanup: DriverCleanup,
+    buffer_waiter: Option<TcpBufferWaiterHandle>,
     armed: bool,
 }
 
 impl ListenerBindGuard {
-    fn new(listen_pool: VecDeque<ListenSocket>, port: u16, core_id: usize) -> Self {
+    fn new(
+        listen_pool: VecDeque<ListenSocket>,
+        port: u16,
+        owner: WorkerIdentity,
+        cleanup: DriverCleanup,
+        buffer_waiter: TcpBufferWaiterHandle,
+    ) -> Self {
         Self {
             listen_pool,
             port,
-            core_id,
+            owner,
+            cleanup,
+            buffer_waiter: Some(buffer_waiter),
             armed: true,
         }
     }
 
-    fn disarm(mut self) -> VecDeque<ListenSocket> {
+    fn disarm(mut self) -> (VecDeque<ListenSocket>, TcpBufferWaiterHandle) {
         self.armed = false;
-        std::mem::take(&mut self.listen_pool)
+        (
+            std::mem::take(&mut self.listen_pool),
+            self.buffer_waiter
+                .take()
+                .expect("armed listener bind guard owns one waiter"),
+        )
     }
 }
 
@@ -65,17 +84,26 @@ impl Drop for ListenerBindGuard {
         if !self.armed {
             return;
         }
-        if current_worker_index() != Some(self.core_id) {
+        if self.cleanup.identity() != self.owner {
             eprintln!(
-                "[tokio-dpdk] ERROR listener bind cleanup outside owner worker owner={:?} current={:?}",
-                self.core_id,
-                current_worker_index()
+                "[tokio-dpdk] ERROR listener bind cleanup capability mismatch owner={:?} capability={:?}",
+                self.owner,
+                self.cleanup.identity()
             );
             return;
         }
         let port = self.port;
         let listen_pool = &mut self.listen_pool;
-        if with_current_driver(|driver| {
+        let buffer_waiter = self.buffer_waiter.take();
+        match self.cleanup.with_driver(|driver| {
+            if let Some(buffer_waiter) = buffer_waiter {
+                if let Err(error) = driver.release_tcp_buffer_waiter(buffer_waiter) {
+                    eprintln!(
+                        "[tokio-dpdk] ERROR listener bind waiter cleanup failed waiter={:?} error={}",
+                        buffer_waiter, error
+                    );
+                }
+            }
             for listen_socket in listen_pool.drain(..) {
                 if let Err(error) = driver.remove_socket(listen_socket.handle) {
                     eprintln!(
@@ -85,13 +113,12 @@ impl Drop for ListenerBindGuard {
                 }
             }
             driver.release_port(port);
-        })
-        .is_none()
-        {
-            eprintln!(
-                "[tokio-dpdk] ERROR DPDK driver unavailable during listener bind cleanup owner={}",
-                self.core_id
-            );
+        }) {
+            Ok(Some(())) | Ok(None) => {}
+            Err(error) => eprintln!(
+                "[tokio-dpdk] ERROR listener bind cleanup owner access failed owner={:?} error={}",
+                self.owner, error
+            ),
         }
     }
 }
@@ -131,12 +158,14 @@ impl Drop for ListenerBindGuard {
 /// # Thread Affinity
 ///
 /// Each `TcpDpdkListener` is bound to a specific DPDK worker core.
-/// Operations should be performed on the same core for optimal performance.
+/// Operations must be performed in the same DPDK runtime and on the same core.
 pub struct TcpDpdkListener {
     /// Interior mutable state
     inner: RefCell<ListenerInner>,
     /// Worker core this listener is bound to
-    core_id: usize,
+    owner: WorkerIdentity,
+    /// Weak, owner-thread-checked capability used only for resource Drop.
+    cleanup: DriverCleanup,
     /// Local address
     local_addr: SocketAddr,
     /// Listener handles are indices into one worker-local SocketSet.
@@ -188,13 +217,22 @@ impl TcpDpdkListener {
 
     /// Binds to a specific SocketAddr with custom backlog size.
     pub fn bind_socket_addr_with_backlog(addr: SocketAddr, backlog: usize) -> io::Result<Self> {
-        // Get current worker index (must be on DPDK worker thread)
-        let core_id = current_worker_index().ok_or_else(|| {
+        if backlog == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DPDK TCP listener backlog must be greater than zero",
+            ));
+        }
+        let owner = current_worker_identity().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Other,
                 "TcpDpdkListener::bind must be called from a DPDK worker thread",
             )
         })?;
+        let cleanup = current_driver_cleanup().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "DPDK driver cleanup owner unavailable")
+        })?;
+        assert_eq!(cleanup.identity(), owner, "DPDK listener cleanup owner mismatch");
 
         // Allocate listener-owned metadata before acquiring the worker-local
         // port so an allocation failure cannot strand that port.
@@ -211,22 +249,29 @@ impl TcpDpdkListener {
 
         // Check if port is already in use
         let port = addr.port();
-        with_current_driver(|driver| {
+        let buffer_waiter = with_current_driver(|driver| {
             if driver.is_port_in_use(port) {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     format!("Address {}:{} already in use", addr.ip(), port),
                 ));
             }
+            let buffer_waiter = driver.allocate_tcp_buffer_waiter()?;
             // Mark port as bound
             driver.bind_port(port);
-            Ok(())
+            Ok(buffer_waiter)
         })
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to access DPDK driver"))??;
 
         // From this point every early return removes all sockets and releases
         // the bound port on this same worker.
-        let mut setup = ListenerBindGuard::new(listen_pool, port, core_id);
+        let mut setup = ListenerBindGuard::new(
+            listen_pool,
+            port,
+            owner,
+            cleanup.clone(),
+            buffer_waiter,
+        );
 
         // Create at least one listen socket, up to backlog size
         let initial_count = backlog.min(8); // Start with 8, grow on demand
@@ -244,15 +289,18 @@ impl TcpDpdkListener {
                 }
             }
         }
-        let listen_pool = setup.disarm();
+        let (listen_pool, buffer_waiter) = setup.disarm();
 
         Ok(Self {
             inner: RefCell::new(ListenerInner {
                 listen_pool,
                 backlog,
-                buffer_waiter: None,
+                buffer_waiter,
+                buffer_waiting: false,
+                pending_replenish_error: None,
             }),
-            core_id,
+            owner,
+            cleanup,
             local_addr: addr,
             _worker_affinity: PhantomData,
         })
@@ -310,48 +358,31 @@ impl TcpDpdkListener {
                 match driver.try_create_tcp_listen_socket(endpoint) {
                     Ok(Some(handle)) => inner.listen_pool.push_back(ListenSocket { handle }),
                     Ok(None) => {
-                        let waiter = match inner.buffer_waiter {
-                            Some(waiter) => waiter,
-                            None => {
-                                let waiter = driver.allocate_tcp_buffer_waiter()?;
-                                inner.buffer_waiter = Some(waiter);
-                                waiter
-                            }
-                        };
-                        if let Err(error) = driver.register_tcp_buffer_waiter(waiter, cx.waker()) {
-                            match driver.release_tcp_buffer_waiter(waiter) {
-                                Ok(()) => inner.buffer_waiter = None,
-                                Err(release_error) => {
-                                    eprintln!(
-                                        "[tokio-dpdk] ERROR failed to release listener buffer waiter after registration error waiter={:?} error={}",
-                                        waiter, release_error
-                                    );
-                                }
-                            }
+                        if let Err(error) = driver
+                            .register_tcp_buffer_waiter(inner.buffer_waiter, cx.waker())
+                        {
+                            inner.buffer_waiting = false;
                             return Err(error);
                         }
+                        inner.buffer_waiting = true;
                         return Ok(());
                     }
                     Err(error) => {
-                        if let Some(waiter) = inner.buffer_waiter {
-                            match driver.release_tcp_buffer_waiter(waiter) {
-                                Ok(()) => inner.buffer_waiter = None,
-                                Err(release_error) => {
-                                    eprintln!(
-                                        "[tokio-dpdk] ERROR failed to release listener buffer waiter after listen error waiter={:?} error={}",
-                                        waiter, release_error
-                                    );
-                                }
-                            }
+                        if let Err(clear_error) =
+                            driver.clear_tcp_buffer_waiter(inner.buffer_waiter)
+                        {
+                            eprintln!(
+                                "[tokio-dpdk] ERROR failed to clear listener buffer waiter after listen error waiter={:?} error={}",
+                                inner.buffer_waiter, clear_error
+                            );
                         }
+                        inner.buffer_waiting = false;
                         return Err(error);
                     }
                 }
             }
-            if let Some(waiter) = inner.buffer_waiter {
-                driver.release_tcp_buffer_waiter(waiter)?;
-                inner.buffer_waiter = None;
-            }
+            driver.clear_tcp_buffer_waiter(inner.buffer_waiter)?;
+            inner.buffer_waiting = false;
             Ok(())
         })
         .ok_or_else(|| {
@@ -378,14 +409,14 @@ impl TcpDpdkListener {
     }
 
     fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpDpdkStream, SocketAddr)>> {
-        match current_worker_index() {
-            Some(current) if current == self.core_id => {}
+        match current_worker_identity() {
+            Some(current) if current == self.owner => {}
             Some(current) => {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!(
-                        "TcpDpdkListener polled on wrong worker owner={} current={}",
-                        self.core_id, current
+                        "TcpDpdkListener polled on wrong worker owner={:?} current={:?}",
+                        self.owner, current
                     ),
                 )));
             }
@@ -393,17 +424,21 @@ impl TcpDpdkListener {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!(
-                        "TcpDpdkListener polled outside DPDK worker owner={}",
-                        self.core_id
+                        "TcpDpdkListener polled outside DPDK worker owner={:?}",
+                        self.owner
                     ),
                 )));
             }
         }
 
+        if let Some(error) = self.inner.borrow_mut().pending_replenish_error.take() {
+            return Poll::Ready(Err(error));
+        }
+
         // Try to replenish pool if it's getting low
         {
             let inner = self.inner.borrow();
-            if inner.buffer_waiter.is_some() || inner.listen_pool.len() < inner.backlog / 2 {
+            if inner.buffer_waiting || inner.listen_pool.len() < inner.backlog / 2 {
                 drop(inner);
                 if let Err(error) = self.replenish_pool(cx) {
                     return Poll::Ready(Err(error));
@@ -486,15 +521,19 @@ impl TcpDpdkListener {
             // Create stream from accepted connection
             let stream = TcpDpdkStream::from_handle(
                 connected.handle,
-                self.core_id,
+                self.owner,
+                self.cleanup.clone(),
                 Some(self.local_addr),
                 Some(peer_addr),
             );
 
             // Replenish the pool
             if let Err(error) = self.replenish_pool(cx) {
-                drop(stream);
-                return Poll::Ready(Err(error));
+                eprintln!(
+                    "[tokio-dpdk] ERROR listener replenishment failed after accepted stream transfer owner={:?} error={}",
+                    self.owner, error
+                );
+                self.inner.borrow_mut().pending_replenish_error = Some(error);
             }
 
             Poll::Ready(Ok((stream, peer_addr)))
@@ -512,7 +551,26 @@ impl TcpDpdkListener {
 
     /// Returns the worker core this listener is bound to.
     pub fn core_id(&self) -> usize {
-        self.core_id
+        self.owner.worker_index
+    }
+
+    fn ensure_on_correct_worker(&self) -> io::Result<()> {
+        let current = current_worker_identity().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("TcpDpdkListener used outside owner {:?}", self.owner),
+            )
+        })?;
+        if current != self.owner {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "TcpDpdkListener owner mismatch owner={:?} current={:?}",
+                    self.owner, current
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the current number of listening sockets in the pool.
@@ -527,6 +585,7 @@ impl TcpDpdkListener {
 
     /// Gets the value of the IP_TTL option for this socket.
     pub fn ttl(&self) -> io::Result<u32> {
+        self.ensure_on_correct_worker()?;
         // Get from first socket in pool
         let inner = self.inner.borrow();
         let ttl = inner.listen_pool.front().and_then(|s| {
@@ -542,6 +601,7 @@ impl TcpDpdkListener {
 
     /// Sets the value of the IP_TTL option (hop limit).
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        self.ensure_on_correct_worker()?;
         let ttl_u8 = ttl.min(255) as u8;
 
         // Set on all sockets in pool
@@ -558,25 +618,23 @@ impl TcpDpdkListener {
 
 impl Drop for TcpDpdkListener {
     fn drop(&mut self) {
-        let current = current_worker_index();
-        if current != Some(self.core_id) {
+        if self.cleanup.identity() != self.owner {
             eprintln!(
-                "[tokio-dpdk] ERROR listener cleanup outside owner worker owner={} current={:?}",
-                self.core_id, current
+                "[tokio-dpdk] ERROR listener cleanup capability mismatch owner={:?} capability={:?}",
+                self.owner,
+                self.cleanup.identity()
             );
             return;
         }
 
         let port = self.local_addr.port();
         let mut inner = self.inner.borrow_mut();
-        if with_current_driver(|driver| {
-            if let Some(waiter) = inner.buffer_waiter.take() {
-                if let Err(error) = driver.release_tcp_buffer_waiter(waiter) {
-                    eprintln!(
-                        "[tokio-dpdk] ERROR listener buffer waiter cleanup failed waiter={:?} error={}",
-                        waiter, error
-                    );
-                }
+        match self.cleanup.with_driver(|driver| {
+            if let Err(error) = driver.release_tcp_buffer_waiter(inner.buffer_waiter) {
+                eprintln!(
+                    "[tokio-dpdk] ERROR listener buffer waiter cleanup failed waiter={:?} error={}",
+                    inner.buffer_waiter, error
+                );
             }
             for listen_socket in inner.listen_pool.drain(..) {
                 if let Err(error) = driver.remove_socket(listen_socket.handle) {
@@ -587,13 +645,12 @@ impl Drop for TcpDpdkListener {
                 }
             }
             driver.release_port(port);
-        })
-        .is_none()
-        {
-            eprintln!(
-                "[tokio-dpdk] ERROR DPDK driver unavailable during listener cleanup owner={}",
-                self.core_id
-            );
+        }) {
+            Ok(Some(())) | Ok(None) => {}
+            Err(error) => eprintln!(
+                "[tokio-dpdk] ERROR listener cleanup owner access failed owner={:?} error={}",
+                self.owner, error
+            ),
         }
     }
 }
@@ -603,7 +660,7 @@ impl std::fmt::Debug for TcpDpdkListener {
         let inner = self.inner.borrow();
         f.debug_struct("TcpDpdkListener")
             .field("local_addr", &self.local_addr)
-            .field("core_id", &self.core_id)
+            .field("owner", &self.owner)
             .field("pool_size", &inner.listen_pool.len())
             .field("backlog", &inner.backlog)
             .finish()

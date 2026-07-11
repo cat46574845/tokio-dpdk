@@ -18,6 +18,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
 
 use super::worker::{self, Notified as WorkerNotified, Shared};
+use super::DpdkRuntimeId;
 
 #[cfg(feature = "market-trace")]
 static OUTSIDE_WORKER_SCHEDULE_BACKTRACES: AtomicUsize = AtomicUsize::new(0);
@@ -58,6 +59,7 @@ fn log_task_spawn(
 
 /// Handle to the DPDK scheduler
 pub(crate) struct Handle {
+    pub(crate) runtime_id: DpdkRuntimeId,
     /// Task spawner (shared state)
     pub(super) shared: Shared,
 
@@ -82,6 +84,9 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
+    pub(crate) fn runtime_id(&self) -> DpdkRuntimeId {
+        self.runtime_id
+    }
     /// Spawns a future onto the thread pool
     pub(crate) fn spawn<F>(
         me: &Arc<Self>,
@@ -109,7 +114,9 @@ impl Handle {
     /// 3. Draining any remaining tasks from the inject queue
     /// 4. Cleaning up all DPDK devices (releasing mbufs back to mempool)
     pub(crate) fn shutdown(&self) {
-        // First, close the inject queue and signal workers to stop
+        // Stop accepting work and signal every permanent owner. Futures are
+        // deliberately not destroyed here: this method may be called from an
+        // arbitrary thread through RuntimeHandle::shutdown.
         self.close();
 
         // Close per-worker inject queues to prevent new targeted tasks
@@ -119,31 +126,10 @@ impl Handle {
 
         // Mark as shutting down
         self.is_shutdown.store(true, Ordering::SeqCst);
+        self.shared.owned.close();
 
-        // Shut down all owned tasks. This calls shutdown() on each task,
-        // which causes futures to be dropped and resources to be released.
-        // The parameter 0 is the starting shard for iteration.
-        self.shared.owned.close_and_shutdown_all(0);
-
-        // Drain any remaining tasks from the inject queue
-        let mut synced = self.shared.synced.lock();
-        // Safety: `synced.inject` was created together with `self.shared.inject`
-        // in the same `Shared` struct construction.
-        while let Some(task) = unsafe { self.shared.inject.pop(&mut synced.inject) } {
-            drop(task);
-        }
-        drop(synced);
-
-        // Drain per-worker inject queues
-        for remote in self.shared.remotes.iter() {
-            while let Some(task) = remote.per_inject.pop() {
-                drop(task);
-            }
-        }
-
-        // Note: DPDK device cleanup (mbufs) is handled automatically by DpdkDevice::drop,
-        // which is guaranteed to run BEFORE DpdkResourcesCleaner::drop (mempool/EAL cleanup)
-        // due to field ordering in Shared.
+        // Worker declares its inline DriverSlot before its Handle, so every
+        // DpdkDevice drops before the last Handle can drop Shared's EAL cleaner.
     }
 
     /// Binds a new task to the scheduler
@@ -445,10 +431,13 @@ impl Handle {
 
         if let Some(task) = notified {
             task.dpdk_set_worker_affinity(worker_index);
-            // If already on the target worker, schedule locally for lower latency
-            if worker::current_worker_index() == Some(worker_index) {
-                worker::with_current(|ctx| {
-                    if let Some(cx) = ctx {
+            worker::with_current(|ctx| {
+                if let Some(cx) = ctx {
+                    let same_runtime = std::ptr::eq(
+                        &cx.worker.handle.shared as *const _,
+                        &me.shared as *const _,
+                    );
+                    if same_runtime && cx.worker.index == worker_index {
                         match cx.core.try_borrow_mut() {
                             Ok(mut core_slot) => {
                                 if let Some(core) = core_slot.as_mut() {
@@ -463,11 +452,9 @@ impl Handle {
                         }
                         return;
                     }
-                    me.push_worker_task(worker_index, task);
-                });
-            } else {
+                }
                 me.push_worker_task(worker_index, task);
-            }
+            });
         }
 
         handle
@@ -507,11 +494,12 @@ impl Handle {
                 return None;
             }
 
-            // Safety: DPDK workers never migrate tasks (no work stealing, CPU affinity).
-            // Tasks in the local queue are only consumed by the owning worker.
-            let (handle, notified) = unsafe {
-                me.shared.owned.bind_local(future, me.clone(), id, spawned_at)
-            };
+            let (handle, notified) = cx.local_owned.bind(future, me.clone(), id, spawned_at);
+            if notified.is_some() {
+                me.shared
+                    .local_owned_task_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
 
             me.task_hooks.spawn(&TaskMeta {
                 id,
@@ -580,11 +568,20 @@ impl Handle {
         factory: Box<dyn FnOnce() + Send + 'static>,
     ) {
         assert!(worker_index < self.shared.remotes.len());
+        if self.is_shutdown() {
+            drop(factory);
+            return;
+        }
         let mut queue = self.shared.remotes[worker_index]
             .local_spawn_queue
             .lock()
             .unwrap();
-        queue.push(factory);
+        if self.is_shutdown() {
+            drop(queue);
+            drop(factory);
+        } else {
+            queue.push(factory);
+        }
     }
 
     /// Returns the IPv4 address configured on the specified worker's DPDK interface.
@@ -663,6 +660,10 @@ impl Handle {
     /// Returns the number of alive tasks
     pub(crate) fn num_alive_tasks(&self) -> usize {
         self.shared.owned.num_alive_tasks()
+            + self
+                .shared
+                .local_owned_task_count
+                .load(Ordering::Relaxed)
     }
 
     /// Returns the depth of the injection queue
@@ -678,7 +679,36 @@ impl Handle {
 
 impl task::Schedule for Arc<Handle> {
     fn release(&self, task: &Task<Self>) -> Option<Task<Self>> {
-        self.shared.owned.remove(task)
+        let owner_id = task.owner_id();
+        if owner_id == Some(self.shared.owned.id) {
+            return self.shared.owned.remove(task);
+        }
+        worker::with_current(|current| {
+            let current = current.unwrap_or_else(|| {
+                panic!(
+                    "DPDK local task released outside its owner worker owner={:?}",
+                    owner_id
+                )
+            });
+            assert!(
+                std::ptr::eq(&current.worker.handle.shared, &self.shared),
+                "DPDK local task released in a different runtime"
+            );
+            assert_eq!(
+                owner_id,
+                Some(current.local_owned.id),
+                "DPDK local task released in a different worker"
+            );
+            let removed = current.local_owned.remove(task);
+            if removed.is_some() {
+                let previous = self
+                    .shared
+                    .local_owned_task_count
+                    .fetch_sub(1, Ordering::Relaxed);
+                assert!(previous > 0, "DPDK local task count underflow");
+            }
+            removed
+        })
     }
 
     fn schedule(&self, task: Notified<Self>) {

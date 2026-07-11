@@ -277,6 +277,9 @@ impl Builder {
     ///
     /// Use `worker_threads()` to control how many DPDK workers to create.
     /// Use `dpdk_pci_addresses()` to select specific devices.
+    /// Worker 0 is permanently owned by the OS thread that builds the runtime;
+    /// `block_on` and runtime destruction must remain on that thread. Enabling
+    /// the `dpdk` feature therefore makes [`Runtime`] `!Send` and `!Sync`.
     ///
     /// # Example
     ///

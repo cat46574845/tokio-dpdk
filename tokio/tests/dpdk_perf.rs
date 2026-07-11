@@ -84,7 +84,7 @@ async fn run_dpdk_io_benchmark(num_connections: usize) {
     for _ in 0..num_connections {
         let counter = counter.clone();
         let stop = stop.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(tokio::runtime::dpdk::spawn_local(async move {
             // Connect to external server
             let stream = match tokio::time::timeout(
                 Duration::from_secs(5),
@@ -397,7 +397,7 @@ async fn run_mixed_benchmark(dpdk_conns: usize, kernel_conns: usize, sync_tasks:
         let await_write = dpdk_await_write.clone();
         let await_read = dpdk_await_read.clone();
         let await_yield = dpdk_await_yield.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(tokio::runtime::dpdk::spawn_local(async move {
             let stream = match tokio::time::timeout(
                 Duration::from_secs(5),
                 TcpDpdkStream::connect(CLOUDFLARE_V4),
@@ -592,7 +592,7 @@ async fn run_mixed_interleaved_benchmark(
         if i < dpdk_conns {
             let counter = dpdk_counter.clone();
             let stop = stop.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(tokio::runtime::dpdk::spawn_local(async move {
                 let stream = match tokio::time::timeout(
                     Duration::from_secs(5),
                     TcpDpdkStream::connect(CLOUDFLARE_V4),

@@ -18,7 +18,10 @@ use crate::io::{AsyncRead, AsyncWrite, Interest, ReadBuf, Ready};
 use crate::net::{to_socket_addrs, ToSocketAddrs};
 
 // Import worker context from dpdk scheduler
-use crate::runtime::scheduler::dpdk::{current_worker_index, with_current_driver};
+use crate::runtime::scheduler::dpdk::{
+    current_driver_cleanup, current_worker_identity, with_current_driver, DriverCleanup,
+    WorkerIdentity,
+};
 use crate::runtime::scheduler::dpdk::{RawTailHandle, RawTailRecord};
 
 use std::marker::PhantomData;
@@ -86,20 +89,25 @@ impl Drop for PeekGuard<'_> {
 // The *const () is inherently !Send + !Sync
 // =============================================================================
 
-struct OutboundConnectGuard<C: FnOnce(SocketHandle, u16, usize)> {
+struct OutboundConnectGuard {
     handle: SocketHandle,
     local_port: u16,
-    core_id: usize,
-    cleanup: Option<C>,
+    owner: WorkerIdentity,
+    cleanup: Option<DriverCleanup>,
     _worker_affinity: PhantomData<*const ()>,
 }
 
-impl<C: FnOnce(SocketHandle, u16, usize)> OutboundConnectGuard<C> {
-    fn new(handle: SocketHandle, local_port: u16, core_id: usize, cleanup: C) -> Self {
+impl OutboundConnectGuard {
+    fn new(
+        handle: SocketHandle,
+        local_port: u16,
+        owner: WorkerIdentity,
+        cleanup: DriverCleanup,
+    ) -> Self {
         Self {
             handle,
             local_port,
-            core_id,
+            owner,
             cleanup: Some(cleanup),
             _worker_affinity: PhantomData,
         }
@@ -115,56 +123,50 @@ impl<C: FnOnce(SocketHandle, u16, usize)> OutboundConnectGuard<C> {
     }
 }
 
-impl<C: FnOnce(SocketHandle, u16, usize)> Drop for OutboundConnectGuard<C> {
+impl Drop for OutboundConnectGuard {
     fn drop(&mut self) {
         if let Some(cleanup) = self.cleanup.take() {
-            cleanup(self.handle, self.local_port, self.core_id);
+            cleanup_socket_on_owner(
+                self.handle,
+                Some(self.local_port),
+                self.owner,
+                &cleanup,
+            );
         }
     }
-}
-
-fn cleanup_outbound_connect(handle: SocketHandle, local_port: u16, core_id: usize) {
-    cleanup_socket_on_owner(handle, Some(local_port), core_id);
 }
 
 fn cleanup_socket_on_owner(
     handle: SocketHandle,
     outbound_local_port: Option<u16>,
-    core_id: usize,
+    owner: WorkerIdentity,
+    cleanup: &DriverCleanup,
 ) {
-    match current_worker_index() {
-        Some(current) if current == core_id => {}
-        Some(current) => {
-            eprintln!(
-                "[tokio-dpdk] ERROR socket cleanup on wrong worker handle={:?} owner={} current={}",
-                handle, core_id, current
-            );
-            return;
-        }
-        None => {
-            eprintln!(
-                "[tokio-dpdk] ERROR socket cleanup outside DPDK worker handle={:?} owner={}",
-                handle, core_id
-            );
-            return;
-        }
+    if cleanup.identity() != owner {
+        eprintln!(
+            "[tokio-dpdk] ERROR socket cleanup capability mismatch handle={:?} owner={:?} capability={:?}",
+            handle,
+            owner,
+            cleanup.identity()
+        );
+        return;
     }
 
-    match with_current_driver(|driver| {
+    match cleanup.with_driver(|driver| {
         let remove_result = driver.remove_socket(handle);
         if let Some(port) = outbound_local_port {
             driver.release_port(port);
         }
         remove_result
     }) {
-        Some(Ok(())) => {}
-        Some(Err(error)) => eprintln!(
+        Ok(Some(Ok(()))) | Ok(None) => {}
+        Ok(Some(Err(error))) => eprintln!(
             "[tokio-dpdk] ERROR socket cleanup failed handle={:?} error={}",
             handle, error
         ),
-        None => eprintln!(
-            "[tokio-dpdk] ERROR DPDK driver unavailable during socket cleanup handle={:?}",
-            handle
+        Err(error) => eprintln!(
+            "[tokio-dpdk] ERROR socket cleanup owner access failed handle={:?} error={}",
+            handle, error
         ),
     }
 }
@@ -199,7 +201,9 @@ pub struct TcpDpdkStream {
     /// smoltcp socket handle
     handle: SocketHandle,
     /// Worker core this stream is bound to
-    core_id: usize,
+    owner: WorkerIdentity,
+    /// Weak, owner-thread-checked capability used only for resource Drop.
+    cleanup: DriverCleanup,
     /// Local address (cached)
     local_addr: Option<SocketAddr>,
     /// Peer address (cached)
@@ -224,13 +228,15 @@ impl TcpDpdkStream {
     /// This is typically called internally after connection establishment.
     pub(crate) fn from_handle(
         handle: SocketHandle,
-        core_id: usize,
+        owner: WorkerIdentity,
+        cleanup: DriverCleanup,
         local_addr: Option<SocketAddr>,
         peer_addr: Option<SocketAddr>,
     ) -> Self {
         Self {
             handle,
-            core_id,
+            owner,
+            cleanup,
             local_addr,
             peer_addr,
             outbound_local_port: None,
@@ -278,12 +284,16 @@ impl TcpDpdkStream {
     /// Connect to a specific SocketAddr.
     async fn connect_addr(addr: SocketAddr) -> io::Result<Self> {
         // Get current worker index (must be on DPDK worker thread)
-        let core_id = current_worker_index().ok_or_else(|| {
+        let owner = current_worker_identity().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Other,
                 "TcpDpdkStream::connect must be called from a DPDK worker thread",
             )
         })?;
+        let cleanup = current_driver_cleanup().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "DPDK driver cleanup owner unavailable")
+        })?;
+        assert_eq!(cleanup.identity(), owner, "DPDK stream cleanup owner mismatch");
 
         let (connect_guard, local_addr) = with_current_driver(|driver| {
             driver.start_tcp_connect(addr, None).map(|started| {
@@ -291,8 +301,8 @@ impl TcpDpdkStream {
                     OutboundConnectGuard::new(
                         started.handle,
                         started.local_addr.port(),
-                        core_id,
-                        cleanup_outbound_connect,
+                        owner,
+                        cleanup.clone(),
                     ),
                     started.local_addr,
                 )
@@ -379,7 +389,8 @@ impl TcpDpdkStream {
 
         Ok(Self {
             handle,
-            core_id,
+            owner,
+            cleanup,
             local_addr: Some(local_addr),
             peer_addr: Some(addr),
             outbound_local_port: Some(outbound_local_port),
@@ -398,12 +409,16 @@ impl TcpDpdkStream {
         local_addr: SocketAddr,
     ) -> io::Result<Self> {
         // Get current worker index (must be on DPDK worker thread)
-        let core_id = current_worker_index().ok_or_else(|| {
+        let owner = current_worker_identity().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Other,
                 "TcpDpdkStream::connect must be called from a DPDK worker thread",
             )
         })?;
+        let cleanup = current_driver_cleanup().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "DPDK driver cleanup owner unavailable")
+        })?;
+        assert_eq!(cleanup.identity(), owner, "DPDK stream cleanup owner mismatch");
 
         let (connect_guard, result_local_addr) = with_current_driver(|driver| {
             driver
@@ -413,8 +428,8 @@ impl TcpDpdkStream {
                         OutboundConnectGuard::new(
                             started.handle,
                             started.local_addr.port(),
-                            core_id,
-                            cleanup_outbound_connect,
+                            owner,
+                            cleanup.clone(),
                         ),
                         started.local_addr,
                     )
@@ -476,7 +491,8 @@ impl TcpDpdkStream {
 
         Ok(Self {
             handle,
-            core_id,
+            owner,
+            cleanup,
             local_addr: Some(result_local_addr),
             peer_addr: Some(remote_addr),
             outbound_local_port: Some(outbound_local_port),
@@ -506,21 +522,19 @@ impl TcpDpdkStream {
 
     /// Returns the core ID this stream is bound to.
     pub fn core_id(&self) -> usize {
-        self.core_id
+        self.owner.worker_index
     }
 
     /// Assert that we are on the correct worker thread.
     /// Panics if called from a different worker than where the stream was created.
     #[inline]
     fn assert_on_correct_worker(&self) {
-        let current =
-            current_worker_index().expect("TcpDpdkStream used outside of DPDK worker thread");
-        if current != self.core_id {
+        let current = current_worker_identity()
+            .expect("TcpDpdkStream used outside of DPDK worker thread");
+        if current != self.owner {
             panic!(
-                "TcpDpdkStream worker affinity violation: stream created on worker {} \
-                 but used on worker {}. DPDK streams must be used on the same worker \
-                 where they were created.",
-                self.core_id, current
+                "TcpDpdkStream owner violation: stream owner {:?}, current worker {:?}",
+                self.owner, current
             );
         }
     }
@@ -587,6 +601,7 @@ impl TcpDpdkStream {
 
     /// Poll for read readiness.
     pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.assert_on_correct_worker();
         let handle = self.handle;
         let waker = cx.waker();
 
@@ -610,6 +625,7 @@ impl TcpDpdkStream {
 
     /// Poll for write readiness.
     pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.assert_on_correct_worker();
         let handle = self.handle;
         let waker = cx.waker();
 
@@ -1295,6 +1311,8 @@ impl TcpDpdkStream {
     ///    without our side initiating shutdown, this indicates a connection reset
     ///    (RST received from peer).
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        self.assert_on_correct_worker();
+
         // 1. Check stored error first (take semantics)
         {
             let mut guard = self
@@ -1595,7 +1613,8 @@ impl Drop for TcpDpdkStream {
         cleanup_socket_on_owner(
             self.handle,
             self.outbound_local_port.take(),
-            self.core_id,
+            self.owner,
+            &self.cleanup,
         );
     }
 }
@@ -1604,7 +1623,7 @@ impl std::fmt::Debug for TcpDpdkStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TcpDpdkStream")
             .field("handle", &format_args!("{:?}", self.handle))
-            .field("core_id", &self.core_id)
+            .field("owner", &self.owner)
             .field("local_addr", &self.local_addr)
             .field("peer_addr", &self.peer_addr)
             .field("outbound_local_port", &self.outbound_local_port)
@@ -1615,9 +1634,15 @@ impl std::fmt::Debug for TcpDpdkStream {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use std::cell::RefCell;
     use std::mem::ManuallyDrop;
-    use std::rc::Rc;
+
+    fn test_owner(worker_index: usize) -> WorkerIdentity {
+        WorkerIdentity::new(
+            crate::runtime::scheduler::dpdk::DpdkRuntimeId::allocate()
+                .expect("test runtime id must allocate"),
+            worker_index,
+        )
+    }
 
     trait AmbiguousIfSend<Marker> {
         fn marker() {}
@@ -1631,7 +1656,7 @@ mod lifecycle_tests {
 
     #[test]
     fn worker_affine_socket_owners_are_not_send() {
-        let _ = <OutboundConnectGuard<fn(SocketHandle, u16, usize)> as AmbiguousIfSend<_>>::marker;
+        let _ = <OutboundConnectGuard as AmbiguousIfSend<_>>::marker;
         let _ = <TcpDpdkStream as AmbiguousIfSend<_>>::marker;
         let _ = <crate::net::tcp_dpdk::OwnedReadHalf as AmbiguousIfSend<_>>::marker;
         let _ = <crate::net::tcp_dpdk::OwnedWriteHalf as AmbiguousIfSend<_>>::marker;
@@ -1639,46 +1664,41 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn pending_connect_guard_cleans_handle_and_port_on_drop() {
-        let cleaned = Rc::new(RefCell::new(Vec::new()));
-        let cleaned_by_drop = cleaned.clone();
-        {
-            let _guard = OutboundConnectGuard::new(
-                SocketHandle::default(),
-                50_000,
-                3,
-                move |handle, port, core| {
-                    cleaned_by_drop.borrow_mut().push((handle, port, core));
-                },
-            );
-        }
+    fn pending_connect_guard_retains_owner_cleanup_capability() {
+        let owner = test_owner(3);
+        let guard = ManuallyDrop::new(OutboundConnectGuard::new(
+            SocketHandle::default(),
+            50_000,
+            owner,
+            DriverCleanup::dead_for_test(owner),
+        ));
         assert_eq!(
-            cleaned.borrow().as_slice(),
-            &[(SocketHandle::default(), 50_000, 3)]
+            guard.cleanup.as_ref().map(DriverCleanup::identity),
+            Some(owner)
         );
     }
 
     #[test]
     fn successful_connect_transfers_guard_ownership_without_cleanup() {
-        let cleaned = Rc::new(RefCell::new(false));
-        let cleaned_by_drop = cleaned.clone();
+        let owner = test_owner(4);
         let guard = OutboundConnectGuard::new(
             SocketHandle::default(),
             50_001,
-            4,
-            move |_, _, _| *cleaned_by_drop.borrow_mut() = true,
+            owner,
+            DriverCleanup::dead_for_test(owner),
         );
         let (handle, port) = guard.disarm();
         assert_eq!(handle, SocketHandle::default());
         assert_eq!(port, 50_001);
-        assert!(!*cleaned.borrow());
     }
 
     #[test]
     fn accepted_stream_does_not_own_listener_port() {
+        let owner = test_owner(0);
         let stream = ManuallyDrop::new(TcpDpdkStream::from_handle(
             SocketHandle::default(),
-            0,
+            owner,
+            DriverCleanup::dead_for_test(owner),
             None,
             None,
         ));

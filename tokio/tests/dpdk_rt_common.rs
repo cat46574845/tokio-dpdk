@@ -85,6 +85,37 @@ fn block_on_async() {
 
 #[serial_isolation_test::serial_isolation_test]
 #[test]
+fn block_on_drops_top_level_future_inside_worker_context() {
+    struct ContextCheckedFuture {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Future for ContextCheckedFuture {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            Poll::Ready(())
+        }
+    }
+
+    impl Drop for ContextCheckedFuture {
+        fn drop(&mut self) {
+            assert!(tokio::runtime::dpdk::try_current_worker().is_some());
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    let rt = rt();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    rt.block_on(ContextCheckedFuture {
+        dropped: Arc::clone(&dropped),
+    });
+    assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[serial_isolation_test::serial_isolation_test]
+#[test]
 fn spawn_one_bg() {
     let rt = rt();
 
@@ -399,7 +430,7 @@ fn complete_task_under_load() {
 #[test]
 fn spawn_from_other_thread_idle() {
     let rt = rt();
-    let handle = rt.clone();
+    let handle = rt.handle().clone();
 
     let (tx, rx) = oneshot::channel();
 
@@ -420,7 +451,7 @@ fn spawn_from_other_thread_idle() {
 #[test]
 fn spawn_from_other_thread_under_load() {
     let rt = rt();
-    let handle = rt.clone();
+    let handle = rt.handle().clone();
 
     let (tx, rx) = oneshot::channel();
 

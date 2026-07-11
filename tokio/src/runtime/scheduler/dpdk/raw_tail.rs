@@ -6,6 +6,9 @@ use std::task::{Context, Poll, Waker};
 
 use super::device::DpdkDevice;
 use super::ffi;
+use super::WorkerIdentity;
+#[cfg(test)]
+use super::DpdkRuntimeId;
 
 const RAW_TAIL_DIRTY_CAP: usize = 8192;
 const RAW_TAIL_RSS_MAP_CAP: usize = RAW_TAIL_DIRTY_CAP * 4;
@@ -66,12 +69,22 @@ fn complete_raw_tail_record_detail(
 /// Identifies a TCP flow registered in the DPDK raw-tail receiver.
 pub struct RawTailHandle {
     id: u64,
-    worker_index: usize,
+    owner: WorkerIdentity,
+}
+
+/// Outcome of releasing a raw-tail binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawTailUnregisterStatus {
+    /// The live owner driver removed this binding.
+    Unregistered,
+    /// Runtime shutdown had already reclaimed every binding. The parser may
+    /// drop its local state without retaining the handle.
+    OwnerReclaimed,
 }
 
 impl RawTailHandle {
-    pub(crate) fn new(id: u64, worker_index: usize) -> Self {
-        Self { id, worker_index }
+    pub(crate) fn new(id: u64, owner: WorkerIdentity) -> Self {
+        Self { id, owner }
     }
 
     /// Runtime-local raw-tail flow id.
@@ -81,7 +94,16 @@ impl RawTailHandle {
 
     /// DPDK worker that owns this handle.
     pub fn worker_index(&self) -> usize {
-        self.worker_index
+        self.owner.worker_index
+    }
+
+    pub(crate) fn owner(&self) -> WorkerIdentity {
+        self.owner
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_id(&self) -> DpdkRuntimeId {
+        self.owner.runtime_id
     }
 }
 
@@ -308,6 +330,11 @@ impl RssSlotMap {
         }
         None
     }
+
+    fn clear(&mut self) {
+        self.entries.fill(RssSlotEntry::EMPTY);
+        self.len = 0;
+    }
 }
 
 struct TailConn {
@@ -347,7 +374,7 @@ impl Drop for TailConn {
 
 pub(crate) struct RawTailTable {
     next_id: u64,
-    worker_index: usize,
+    owner: WorkerIdentity,
     rss_key: Box<[u8]>,
     conns: Vec<Option<TailConn>>,
     free_slots: Vec<usize>,
@@ -360,13 +387,13 @@ pub(crate) struct RawTailTable {
 unsafe impl Send for RawTailTable {}
 
 impl RawTailTable {
-    pub(crate) fn new(worker_index: usize, rss_key: &[u8]) -> Self {
+    pub(crate) fn new(owner: WorkerIdentity, rss_key: &[u8]) -> Self {
         if rss_key.is_empty() {
             panic!("raw-tail RSS key must not be empty");
         }
         Self {
             next_id: 1,
-            worker_index,
+            owner,
             rss_key: rss_key.into(),
             conns: Vec::new(),
             free_slots: Vec::new(),
@@ -413,7 +440,7 @@ impl RawTailTable {
             .next_id
             .checked_add(1)
             .expect("raw-tail handle id overflow");
-        let handle = RawTailHandle::new(id, self.worker_index);
+        let handle = RawTailHandle::new(id, self.owner);
         let slot = self.free_slots.last().copied().unwrap_or(self.conns.len());
         match self.rss_to_slot.insert(rss_hash, slot) {
             Ok(None) => {}
@@ -482,10 +509,19 @@ impl RawTailTable {
         Ok(())
     }
 
-    pub(crate) fn unregister(&mut self, handle: RawTailHandle) {
-        if let Some(idx) = self.slot_for_handle(handle) {
+    pub(crate) fn unregister(&mut self, handle: RawTailHandle) -> io::Result<()> {
+        let Some(idx) = self.slot_for_handle(handle) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "raw-tail handle not registered in its owner runtime and worker",
+            ));
+        };
+        {
             let Some(conn) = self.conns[idx].as_ref() else {
-                return;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "raw-tail handle index points to an empty connection slot",
+                ));
             };
             let rss = conn.rss_hash;
             let was_active = conn.active;
@@ -508,6 +544,16 @@ impl RawTailTable {
             drop(removed);
             self.free_slots.push(idx);
         }
+        Ok(())
+    }
+
+    pub(crate) fn reclaim_all(&mut self) {
+        self.pending_slots.clear();
+        self.id_to_slot.clear();
+        self.rss_to_slot.clear();
+        self.free_slots.clear();
+        self.active_count = 0;
+        self.conns.clear();
     }
 
     #[inline(always)]
@@ -757,7 +803,7 @@ impl RawTailTable {
     }
 
     fn slot_for_handle(&self, handle: RawTailHandle) -> Option<usize> {
-        if handle.worker_index != self.worker_index {
+        if handle.owner != self.owner {
             return None;
         }
         self.id_to_slot.get(&handle.id).copied()
@@ -1001,9 +1047,16 @@ mod tests {
         .expect("test tuple must be IPv4")
     }
 
+    fn test_owner(worker_index: usize) -> WorkerIdentity {
+        WorkerIdentity::new(
+            DpdkRuntimeId::allocate().expect("test runtime id must allocate"),
+            worker_index,
+        )
+    }
+
     fn test_conn() -> TailConn {
         TailConn {
-            handle: RawTailHandle::new(1, 0),
+            handle: RawTailHandle::new(1, test_owner(0)),
             rss_hash: 7,
             pending_mbuf: ptr::null_mut(),
             data_slot: TailDataSlot::new(),
@@ -1068,10 +1121,10 @@ mod tests {
 
     #[test]
     fn unregister_reuses_connection_slot_with_fresh_receiver_state() {
-        let mut table = RawTailTable::new(0, &RAW_TAIL_RSS_KEY);
+        let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
         let first = table.register(tuple(443)).expect("first registration must succeed");
         let first_slot = table.slot_for_handle(first).expect("first slot must exist");
-        table.unregister(first);
+        table.unregister(first).expect("registered handle must unregister");
 
         let second = table.register(tuple(444)).expect("second registration must succeed");
         let second_slot = table.slot_for_handle(second).expect("second slot must exist");
@@ -1083,8 +1136,58 @@ mod tests {
     }
 
     #[test]
+    fn runtime_local_handle_cannot_alias_same_id_on_another_runtime() {
+        let mut first = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
+        let mut second = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
+        let first_handle = first
+            .register(tuple(443))
+            .expect("first runtime registration must succeed");
+        let second_handle = second
+            .register(tuple(443))
+            .expect("second runtime registration must succeed");
+        assert_eq!(first_handle.id(), second_handle.id());
+        assert_eq!(first_handle.worker_index(), second_handle.worker_index());
+        assert_ne!(first_handle.runtime_id(), second_handle.runtime_id());
+
+        let activate = second
+            .activate(first_handle)
+            .expect_err("foreign runtime handle must not activate local flow");
+        assert_eq!(activate.kind(), io::ErrorKind::NotFound);
+        let unregister = second
+            .unregister(first_handle)
+            .expect_err("foreign runtime handle must not unregister local flow");
+        assert_eq!(unregister.kind(), io::ErrorKind::NotFound);
+        assert!(second.slot_for_handle(second_handle).is_some());
+    }
+
+    #[test]
+    fn shutdown_reclaims_every_raw_tail_binding() {
+        let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
+        let first = table
+            .register(tuple(443))
+            .expect("first binding must register");
+        let second = table
+            .register(tuple(444))
+            .expect("second binding must register");
+        table.activate(first).expect("first binding must activate");
+        table.activate(second).expect("second binding must activate");
+
+        table.reclaim_all();
+
+        assert!(table.is_empty());
+        assert!(table.conns.is_empty());
+        assert!(table.id_to_slot.is_empty());
+        assert!(table.pending_slots.is_empty());
+        assert_eq!(table.rss_to_slot.len, 0);
+        assert_eq!(
+            table.unregister(first).expect_err("reclaimed binding must be absent").kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
     fn receiver_claim_survives_recreated_poll_and_rejects_other_task() {
-        let mut table = RawTailTable::new(0, &RAW_TAIL_RSS_KEY);
+        let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
         let handle = table.register(tuple(443)).expect("registration must succeed");
         let owner_waker = Waker::from(Arc::new(TestWake));
         let mut owner_cx = Context::from_waker(&owner_waker);
@@ -1105,7 +1208,7 @@ mod tests {
 
     #[test]
     fn consume_result_is_preserved_and_ready_is_cleared_before_callback() {
-        let mut table = RawTailTable::new(0, &RAW_TAIL_RSS_KEY);
+        let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
         let handle = table.register(tuple(443)).expect("registration must succeed");
         let slot = table.slot_for_handle(handle).expect("slot must exist");
         table.conns[slot]
@@ -1133,7 +1236,7 @@ mod tests {
 
     #[test]
     fn repeated_publish_exposes_only_latest_single_slot_value() {
-        let mut table = RawTailTable::new(0, &RAW_TAIL_RSS_KEY);
+        let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
         let handle = table.register(tuple(443)).expect("registration must succeed");
         let slot = table.slot_for_handle(handle).expect("slot must exist");
         let data_slot = &mut table.conns[slot]
