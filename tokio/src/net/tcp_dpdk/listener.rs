@@ -392,9 +392,17 @@ impl Drop for TcpDpdkListener {
         // Clean up all listening sockets in the pool
         let mut inner = self.inner.borrow_mut();
         for listen_socket in inner.listen_pool.drain(..) {
-            with_current_driver(|driver| {
-                driver.remove_socket(listen_socket.handle);
-            });
+            match with_current_driver(|driver| driver.remove_socket(listen_socket.handle)) {
+                Some(Ok(())) => {}
+                Some(Err(error)) => eprintln!(
+                    "[tokio-dpdk] ERROR listener socket cleanup failed handle={:?} error={}",
+                    listen_socket.handle, error
+                ),
+                None => eprintln!(
+                    "[tokio-dpdk] ERROR DPDK driver unavailable during listener socket cleanup handle={:?}",
+                    listen_socket.handle
+                ),
+            }
         }
 
         // Release the port

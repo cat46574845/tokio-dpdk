@@ -10,16 +10,21 @@
 //! (`register_recv_waker`/`register_send_waker`), not by a separate ScheduledIo.
 
 use std::collections::HashSet;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 use smoltcp::iface::{
     Config as IfaceConfig, Interface, PollEgressHandleResult, PollIngressSingleResult, PollResult,
-    SocketHandle, SocketSet,
+    SocketHandle, SocketSet, TcpFlowCacheError,
 };
 use smoltcp::socket::tcp::Socket as TcpSocket;
+use smoltcp::socket::Socket as SmolSocket;
 use smoltcp::storage::LinearBuffer;
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address,
+};
 
 use super::device::DpdkDevice;
 use super::raw_tail::{RawTailHandle, RawTailRecord, RawTailTable, RawTailTuple};
@@ -56,14 +61,19 @@ fn pack_trace_aux3(a: usize, b: usize, c: usize) -> u64 {
     assert!(c <= TRACE_AUX_FIELD_MASK, "market trace aux field c overflow value={}", c);
     a | (b << TRACE_AUX_FIELD_BITS) | (c << (TRACE_AUX_FIELD_BITS * 2))
 }
+
+fn dpdk_iface_config(mac: [u8; 6]) -> IfaceConfig {
+    let mut config = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    config.tcp_flow_cache_capacity = DEFAULT_BUFFER_POOL_SIZE;
+    config
+}
 // =============================================================================
 // TcpBufferPool - Pre-allocated buffer management
 // =============================================================================
 
 /// Pre-allocated buffer pool for TCP socket buffers.
 ///
-/// Provides zero-allocation socket creation by reusing buffers.
-/// When pool runs low, it can be replenished by background tasks.
+/// Provides zero-allocation socket creation by reusing a fixed startup pool.
 pub(crate) struct TcpBufferPool {
     /// Free RX buffers available for allocation
     rx_free: Vec<Vec<u8>>,
@@ -71,12 +81,42 @@ pub(crate) struct TcpBufferPool {
     tx_free: Vec<Vec<u8>>,
     /// Maximum pool capacity
     capacity: usize,
-    /// RX buffer size for replenishment
+    /// Required RX buffer size
     rx_buffer_size: usize,
-    /// TX buffer size for replenishment
+    /// Required TX buffer size
     tx_buffer_size: usize,
-    /// Low watermark - trigger replenishment when available < this
-    low_watermark: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TcpBufferPoolReleaseError {
+    RxLength { expected: usize, actual: usize },
+    TxLength { expected: usize, actual: usize },
+    Imbalanced { rx_available: usize, tx_available: usize },
+    Full { capacity: usize },
+}
+
+impl std::fmt::Display for TcpBufferPoolReleaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RxLength { expected, actual } => {
+                write!(f, "TCP RX buffer length mismatch expected={} actual={}", expected, actual)
+            }
+            Self::TxLength { expected, actual } => {
+                write!(f, "TCP TX buffer length mismatch expected={} actual={}", expected, actual)
+            }
+            Self::Imbalanced {
+                rx_available,
+                tx_available,
+            } => write!(
+                f,
+                "TCP buffer pool is imbalanced rx_available={} tx_available={}",
+                rx_available, tx_available
+            ),
+            Self::Full { capacity } => {
+                write!(f, "TCP buffer pool release exceeds fixed capacity={}", capacity)
+            }
+        }
+    }
 }
 
 impl TcpBufferPool {
@@ -102,7 +142,6 @@ impl TcpBufferPool {
             capacity,
             rx_buffer_size: rx_size,
             tx_buffer_size: tx_size,
-            low_watermark: capacity / 4, // 25% threshold
         }
     }
 
@@ -119,6 +158,9 @@ impl TcpBufferPool {
     ///
     /// Returns `None` if pool is exhausted.
     pub(crate) fn acquire(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.rx_free.is_empty() || self.tx_free.is_empty() {
+            return None;
+        }
         let rx = self.rx_free.pop()?;
         let tx = self.tx_free.pop()?;
         Some((rx, tx))
@@ -129,34 +171,117 @@ impl TcpBufferPool {
         self.rx_free.len().min(self.tx_free.len())
     }
 
-    /// Check if pool needs replenishment.
-    pub(crate) fn needs_replenish(&self) -> bool {
-        self.available() < self.low_watermark
-    }
-
-    /// Replenish the pool by adding new buffer pairs.
-    ///
-    /// This should be called from a background task to avoid
-    /// blocking the hot path.
-    ///
-    /// Returns the number of buffer pairs added.
-    pub(crate) fn replenish(&mut self, count: usize) -> usize {
-        let mut added = 0;
-        let target = self.capacity.min(self.available() + count);
-
-        while self.available() < target {
-            self.rx_free.push(vec![0u8; self.rx_buffer_size]);
-            self.tx_free.push(vec![0u8; self.tx_buffer_size]);
-            added += 1;
+    fn release(
+        &mut self,
+        rx: Vec<u8>,
+        tx: Vec<u8>,
+    ) -> Result<(), TcpBufferPoolReleaseError> {
+        if rx.len() != self.rx_buffer_size {
+            return Err(TcpBufferPoolReleaseError::RxLength {
+                expected: self.rx_buffer_size,
+                actual: rx.len(),
+            });
         }
-
-        added
+        if tx.len() != self.tx_buffer_size {
+            return Err(TcpBufferPoolReleaseError::TxLength {
+                expected: self.tx_buffer_size,
+                actual: tx.len(),
+            });
+        }
+        if self.rx_free.len() != self.tx_free.len() {
+            return Err(TcpBufferPoolReleaseError::Imbalanced {
+                rx_available: self.rx_free.len(),
+                tx_available: self.tx_free.len(),
+            });
+        }
+        if self.rx_free.len() >= self.capacity {
+            return Err(TcpBufferPoolReleaseError::Full {
+                capacity: self.capacity,
+            });
+        }
+        self.rx_free.push(rx);
+        self.tx_free.push(tx);
+        Ok(())
     }
 }
 
 // =============================================================================
 // DpdkDriver - Network stack driver
 // =============================================================================
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StartedTcpConnect {
+    pub(crate) handle: SocketHandle,
+    pub(crate) local_addr: SocketAddr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConnectResources {
+    handle: SocketHandle,
+    local_port: u16,
+}
+
+trait ConnectResourceOwner {
+    fn cleanup_connect_socket(&mut self, handle: SocketHandle) -> io::Result<()>;
+    fn cleanup_connect_port(&mut self, port: u16);
+}
+
+struct ConnectSetupGuard<'a, O: ConnectResourceOwner> {
+    owner: &'a mut O,
+    handle: SocketHandle,
+    local_port: Option<u16>,
+    armed: bool,
+}
+
+impl<'a, O: ConnectResourceOwner> ConnectSetupGuard<'a, O> {
+    fn new(owner: &'a mut O, handle: SocketHandle) -> Self {
+        Self {
+            owner,
+            handle,
+            local_port: None,
+            armed: true,
+        }
+    }
+
+    fn owner_mut(&mut self) -> &mut O {
+        self.owner
+    }
+
+    fn set_local_port(&mut self, port: u16) {
+        self.local_port = Some(port);
+    }
+
+    fn disarm(mut self) -> io::Result<ConnectResources> {
+        let Some(local_port) = self.local_port else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TCP connect setup completed without owning a local port",
+            ));
+        };
+        self.armed = false;
+        Ok(ConnectResources {
+            handle: self.handle,
+            local_port,
+        })
+    }
+}
+
+impl<O: ConnectResourceOwner> Drop for ConnectSetupGuard<'_, O> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.owner.cleanup_connect_socket(self.handle) {
+            eprintln!(
+                "[tokio-dpdk] ERROR TCP connect setup failed to remove socket handle={:?} error={}",
+                self.handle, error
+            );
+        }
+        if let Some(port) = self.local_port.take() {
+            self.owner.cleanup_connect_port(port);
+        }
+    }
+}
 
 /// DPDK network driver.
 ///
@@ -195,6 +320,16 @@ pub(crate) struct DpdkDriver {
     ingress_touched_bits: Vec<u64>,
 }
 
+impl ConnectResourceOwner for DpdkDriver {
+    fn cleanup_connect_socket(&mut self, handle: SocketHandle) -> io::Result<()> {
+        self.remove_socket(handle)
+    }
+
+    fn cleanup_connect_port(&mut self, port: u16) {
+        self.release_port(port);
+    }
+}
+
 impl DpdkDriver {
     /// Create a new DPDK driver.
     ///
@@ -216,7 +351,7 @@ impl DpdkDriver {
         let now = SmolInstant::from_millis(0);
 
         // Create smoltcp interface config
-        let config = IfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+        let config = dpdk_iface_config(mac);
 
         // Create interface
         let mut iface = Interface::new(config, &mut device, now);
@@ -256,8 +391,8 @@ impl DpdkDriver {
                 .expect("Failed to add IPv6 default route");
         }
 
-        // Create socket set
-        let sockets = SocketSet::new(vec![]);
+        // Pre-allocate every TCP-lifecycle index at the same fixed socket cap.
+        let sockets = SocketSet::new(Vec::with_capacity(DEFAULT_BUFFER_POOL_SIZE));
         let raw_tail_rss_key = device.raw_tail_rss_key().to_vec();
 
         Self {
@@ -266,14 +401,14 @@ impl DpdkDriver {
             iface,
             sockets,
             start_time,
-            registered_sockets: HashSet::new(),
+            registered_sockets: HashSet::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
             buffer_pool: TcpBufferPool::with_defaults(),
-            bound_ports: HashSet::new(),
+            bound_ports: HashSet::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
             raw_tail: RawTailTable::new(worker_index, &raw_tail_rss_key),
-            pending_egress_heap: Vec::new(),
-            pending_egress_pos: Vec::new(),
-            ingress_touched: Vec::new(),
-            ingress_touched_bits: Vec::new(),
+            pending_egress_heap: Vec::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
+            pending_egress_pos: vec![PENDING_EGRESS_NONE; DEFAULT_BUFFER_POOL_SIZE],
+            ingress_touched: Vec::with_capacity(DEFAULT_BUFFER_POOL_SIZE),
+            ingress_touched_bits: vec![0; (DEFAULT_BUFFER_POOL_SIZE + 63) / 64],
         }
     }
 
@@ -761,33 +896,55 @@ impl DpdkDriver {
         self.registered_sockets.insert(handle);
     }
 
-    /// Unregister a socket from readiness tracking.
-    pub(crate) fn unregister_socket(&mut self, handle: SocketHandle) {
-        self.registered_sockets.remove(&handle);
+    /// Create, bind and initiate an outbound TCP connection as one guarded setup.
+    pub(crate) fn start_tcp_connect(
+        &mut self,
+        remote_addr: SocketAddr,
+        local_hint: Option<SocketAddr>,
+    ) -> io::Result<StartedTcpConnect> {
+        let (local_ip, local_std_ip, requested_port) =
+            self.resolve_outbound_local(remote_addr, local_hint)?;
+        let remote_endpoint = socket_addr_to_endpoint(remote_addr);
+
+        let handle = self.create_tcp_socket().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "No buffers available in fixed TCP socket pool",
+            )
+        })?;
+        let mut setup = ConnectSetupGuard::new(self, handle);
+        setup.owner_mut().register_socket(handle);
+
+        let local_port = setup.owner_mut().reserve_local_port(requested_port)?;
+        setup.set_local_port(local_port);
+        let local_endpoint = IpEndpoint::new(local_ip, local_port);
+        setup
+            .owner_mut()
+            .tcp_connect(handle, remote_endpoint, local_endpoint)?;
+        let resources = setup.disarm()?;
+
+        Ok(StartedTcpConnect {
+            handle: resources.handle,
+            local_addr: SocketAddr::new(local_std_ip, resources.local_port),
+        })
     }
 
-    /// Initiate TCP connection.
-    ///
-    /// This is a non-blocking call that initiates the TCP handshake.
-    /// The connection completes asynchronously.
-    pub(crate) fn tcp_connect<T, U>(
+    /// Initiate TCP connection and register its complete tuple before SYN egress.
+    fn tcp_connect(
         &mut self,
         handle: SocketHandle,
-        remote_endpoint: T,
-        local_endpoint: U,
-    ) -> Result<(), smoltcp::socket::tcp::ConnectError>
-    where
-        T: Into<smoltcp::wire::IpEndpoint>,
-        U: Into<smoltcp::wire::IpListenEndpoint>,
-    {
-        let cx = self.iface.context();
-        let result = self.sockets
-            .get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle)
-            .connect(cx, remote_endpoint, local_endpoint);
-        if result.is_ok() {
-            self.mark_socket_egress_pending(handle);
-        }
-        result
+        remote_endpoint: IpEndpoint,
+        local_endpoint: IpEndpoint,
+    ) -> io::Result<()> {
+        connect_socket_and_register_flow(
+            &mut self.iface,
+            &mut self.sockets,
+            handle,
+            remote_endpoint,
+            local_endpoint,
+        )?;
+        self.mark_socket_egress_pending(handle);
+        Ok(())
     }
 
     /// Get TCP socket mutable reference.
@@ -796,35 +953,28 @@ impl DpdkDriver {
     }
 
     /// Remove a socket from the socket set and return its buffers to the pool.
-    pub(crate) fn remove_socket(&mut self, handle: SocketHandle) {
-        self.unregister_socket(handle);
+    pub(crate) fn remove_socket(&mut self, handle: SocketHandle) -> io::Result<()> {
+        self.iface.unregister_tcp_flow(handle);
         self.clear_socket_egress_pending(handle);
-
-        // Remove socket and get its buffers
+        if !self.registered_sockets.remove(&handle) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("socket handle {:?} is not registered", handle),
+            ));
+        }
         let socket = self.sockets.remove(handle);
-
-        // Extract buffers from socket for reuse (if this is a TCP socket)
-        // Note: smoltcp's Socket type doesn't provide direct buffer extraction,
-        // so we rely on the socket being dropped and buffers being freed.
-        // For true zero-allocation, we would need to store buffer ownership separately.
-        drop(socket);
-    }
-
-    /// Check if buffer pool needs replenishment.
-    pub(crate) fn buffer_pool_needs_replenish(&self) -> bool {
-        self.buffer_pool.needs_replenish()
+        recycle_removed_socket(&mut self.buffer_pool, socket).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to recycle socket handle={:?}: {}", handle, error),
+            )
+        })
     }
 
     /// Get available buffer count.
     #[allow(dead_code)] // Reserved for monitoring/diagnostics
     pub(crate) fn buffer_pool_available(&self) -> usize {
         self.buffer_pool.available()
-    }
-
-    /// Replenish the buffer pool.
-    /// Returns the number of buffer pairs added.
-    pub(crate) fn buffer_pool_replenish(&mut self, count: usize) -> usize {
-        self.buffer_pool.replenish(count)
     }
 
     /// Check if there are any registered sockets.
@@ -1103,6 +1253,66 @@ impl DpdkDriver {
         addrs
     }
 
+    fn resolve_outbound_local(
+        &self,
+        remote_addr: SocketAddr,
+        local_hint: Option<SocketAddr>,
+    ) -> io::Result<(IpAddress, IpAddr, u16)> {
+        let requested_port = local_hint.map(|addr| addr.port()).unwrap_or(0);
+        match remote_addr {
+            SocketAddr::V4(_) => {
+                let local_ip = match local_hint {
+                    Some(SocketAddr::V4(local)) if !local.ip().is_unspecified() => {
+                        Ipv4Address::from_octets(local.ip().octets())
+                    }
+                    Some(SocketAddr::V4(_)) | None => self.get_ipv4_address().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::AddrNotAvailable,
+                            "No IPv4 address configured on DPDK interface",
+                        )
+                    })?,
+                    Some(SocketAddr::V6(_)) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "local and remote address families differ",
+                        ));
+                    }
+                };
+                let octets = local_ip.octets();
+                Ok((
+                    IpAddress::Ipv4(local_ip),
+                    IpAddr::V4(std::net::Ipv4Addr::from(octets)),
+                    requested_port,
+                ))
+            }
+            SocketAddr::V6(_) => {
+                let local_ip = match local_hint {
+                    Some(SocketAddr::V6(local)) if !local.ip().is_unspecified() => {
+                        Ipv6Address::from_octets(local.ip().octets())
+                    }
+                    Some(SocketAddr::V6(_)) | None => self.get_ipv6_address().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::AddrNotAvailable,
+                            "No global unicast IPv6 address configured on DPDK interface",
+                        )
+                    })?,
+                    Some(SocketAddr::V4(_)) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "local and remote address families differ",
+                        ));
+                    }
+                };
+                let octets = local_ip.octets();
+                Ok((
+                    IpAddress::Ipv6(local_ip),
+                    IpAddr::V6(std::net::Ipv6Addr::from(octets)),
+                    requested_port,
+                ))
+            }
+        }
+    }
+
     /// Check if a port is already in use.
     ///
     /// This uses the internal bound_ports set since smoltcp doesn't reliably expose
@@ -1123,11 +1333,23 @@ impl DpdkDriver {
         self.bound_ports.remove(&port);
     }
 
+    fn reserve_local_port(&mut self, requested_port: u16) -> io::Result<u16> {
+        if requested_port == 0 {
+            return self.allocate_ephemeral_port().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "No available ephemeral ports",
+                )
+            });
+        }
+        reserve_explicit_port(&mut self.bound_ports, requested_port)
+    }
+
     /// Allocate an ephemeral port that is not currently in use.
     ///
     /// Uses time-based randomization with collision avoidance.
     /// Returns None if no port is available after max attempts.
-    pub(crate) fn allocate_ephemeral_port(&mut self) -> Option<u16> {
+    fn allocate_ephemeral_port(&mut self) -> Option<u16> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         // Ephemeral port range: 49152-65535 (16384 ports)
@@ -1152,6 +1374,119 @@ impl DpdkDriver {
     }
 }
 
+fn reserve_explicit_port(bound_ports: &mut HashSet<u16>, port: u16) -> io::Result<u16> {
+    if !bound_ports.insert(port) {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("local TCP port {} is already in use", port),
+        ));
+    }
+    Ok(port)
+}
+
+fn socket_addr_to_endpoint(addr: SocketAddr) -> IpEndpoint {
+    match addr {
+        SocketAddr::V4(addr) => IpEndpoint::new(
+            IpAddress::Ipv4(Ipv4Address::from_octets(addr.ip().octets())),
+            addr.port(),
+        ),
+        SocketAddr::V6(addr) => IpEndpoint::new(
+            IpAddress::Ipv6(Ipv6Address::from_octets(addr.ip().octets())),
+            addr.port(),
+        ),
+    }
+}
+
+fn connect_error_to_io(error: smoltcp::socket::tcp::ConnectError) -> io::Error {
+    let kind = match error {
+        smoltcp::socket::tcp::ConnectError::InvalidState => io::ErrorKind::AlreadyExists,
+        smoltcp::socket::tcp::ConnectError::Unaddressable => io::ErrorKind::InvalidInput,
+    };
+    io::Error::new(kind, format!("TCP connect setup failed: {}", error))
+}
+
+fn connect_socket_and_register_flow<'a>(
+    iface: &mut Interface,
+    sockets: &mut SocketSet<'a, LinearBuffer<'a>>,
+    handle: SocketHandle,
+    remote_endpoint: IpEndpoint,
+    local_endpoint: IpEndpoint,
+) -> io::Result<()> {
+    {
+        let cx = iface.context();
+        sockets
+            .get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle)
+            .connect(cx, remote_endpoint, local_endpoint)
+            .map_err(connect_error_to_io)?;
+    }
+
+    let (registered_local, registered_remote) = {
+        let socket = sockets.get::<TcpSocket<'_, LinearBuffer<'_>>>(handle);
+        let local = socket.local_endpoint().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "connected TCP socket has no local endpoint",
+            )
+        })?;
+        let remote = socket.remote_endpoint().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "connected TCP socket has no remote endpoint",
+            )
+        })?;
+        (local, remote)
+    };
+    register_outbound_tcp_flow(iface, handle, registered_local, registered_remote)
+}
+
+fn register_outbound_tcp_flow(
+    iface: &mut Interface,
+    handle: SocketHandle,
+    local: IpEndpoint,
+    remote: IpEndpoint,
+) -> io::Result<()> {
+    iface
+        .register_tcp_flow(handle, local, remote)
+        .map_err(|error| {
+            let kind = match error {
+                TcpFlowCacheError::Full => io::ErrorKind::OutOfMemory,
+                TcpFlowCacheError::HandleOutOfRange => io::ErrorKind::InvalidData,
+            };
+            io::Error::new(
+                kind,
+                format!(
+                    "failed to register outbound TCP flow handle={:?} local={} remote={}: {}",
+                    handle, local, remote, error
+                ),
+            )
+        })
+}
+
+fn recycle_removed_socket<'a>(
+    pool: &mut TcpBufferPool,
+    socket: SmolSocket<'a, LinearBuffer<'a>>,
+) -> io::Result<()> {
+    let socket = match socket {
+        SmolSocket::Tcp(socket) => socket,
+        other => {
+            drop(other);
+            return Ok(());
+        }
+    };
+    let (rx, tx) = match socket.into_owned_buffers() {
+        Ok(buffers) => buffers,
+        Err(socket) => {
+            drop(socket);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "removed TCP socket did not own its LinearBuffer allocations",
+            ));
+        }
+    };
+    pool.release(rx, tx)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
 fn endpoint_to_socket_addr(endpoint: smoltcp::wire::IpEndpoint) -> std::io::Result<std::net::SocketAddr> {
     let ip = match endpoint.addr {
         smoltcp::wire::IpAddress::Ipv4(addr) => {
@@ -1166,4 +1501,157 @@ fn endpoint_to_socket_addr(endpoint: smoltcp::wire::IpEndpoint) -> std::io::Resu
         }
     };
     Ok(std::net::SocketAddr::new(ip, endpoint.port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smoltcp::phy::{Loopback, Medium};
+
+    #[derive(Default)]
+    struct FakeConnectOwner {
+        removed: Vec<SocketHandle>,
+        released: Vec<u16>,
+    }
+
+    impl ConnectResourceOwner for FakeConnectOwner {
+        fn cleanup_connect_socket(&mut self, handle: SocketHandle) -> io::Result<()> {
+            self.removed.push(handle);
+            Ok(())
+        }
+
+        fn cleanup_connect_port(&mut self, port: u16) {
+            self.released.push(port);
+        }
+    }
+
+    #[test]
+    fn iface_flow_cache_matches_fixed_tcp_socket_capacity() {
+        let config = dpdk_iface_config([0x02, 0, 0, 0, 0, 1]);
+        assert_eq!(config.tcp_flow_cache_capacity, DEFAULT_BUFFER_POOL_SIZE);
+    }
+
+    #[test]
+    fn explicit_local_port_check_and_mark_is_atomic() {
+        let mut ports = HashSet::with_capacity(1);
+        assert_eq!(reserve_explicit_port(&mut ports, 50_000).unwrap(), 50_000);
+        let error = reserve_explicit_port(&mut ports, 50_000)
+            .expect_err("the second owner must not acquire the same port");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(ports.len(), 1);
+    }
+
+    #[test]
+    fn removed_tcp_socket_reuses_original_buffer_pointers() {
+        let mut pool = TcpBufferPool::new(1, 64, 32);
+        let (rx, tx) = pool.acquire().expect("startup pool must contain one pair");
+        let rx_ptr = rx.as_ptr();
+        let tx_ptr = tx.as_ptr();
+        let socket = TcpSocket::new(
+            LinearBuffer::with_reserve(rx, 8),
+            LinearBuffer::with_reserve(tx, 8),
+        );
+
+        recycle_removed_socket(&mut pool, SmolSocket::Tcp(socket))
+            .expect("owned TCP buffers must return to the pool");
+        let (reused_rx, reused_tx) = pool.acquire().expect("released pair must be reusable");
+        assert_eq!(reused_rx.as_ptr(), rx_ptr);
+        assert_eq!(reused_tx.as_ptr(), tx_ptr);
+    }
+
+    #[test]
+    fn removing_non_tcp_socket_does_not_touch_tcp_pool() {
+        let mut pool = TcpBufferPool::new(1, 64, 32);
+        let rx = smoltcp::socket::udp::PacketBuffer::new(
+            vec![smoltcp::socket::udp::PacketMetadata::EMPTY],
+            vec![0; 32],
+        );
+        let tx = smoltcp::socket::udp::PacketBuffer::new(
+            vec![smoltcp::socket::udp::PacketMetadata::EMPTY],
+            vec![0; 32],
+        );
+        let socket: SmolSocket<'_, LinearBuffer<'_>> =
+            SmolSocket::Udp(smoltcp::socket::udp::Socket::new(rx, tx));
+
+        recycle_removed_socket(&mut pool, socket)
+            .expect("non-TCP socket removal must preserve its existing drop behavior");
+        assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn fixed_pool_reports_exhaustion_and_rejects_invalid_release() {
+        let mut pool = TcpBufferPool::new(1, 64, 32);
+        assert_eq!(
+            pool.release(vec![0; 64], vec![0; 32]),
+            Err(TcpBufferPoolReleaseError::Full { capacity: 1 })
+        );
+
+        let (mut rx, tx) = pool.acquire().expect("startup pair must be available");
+        assert!(pool.acquire().is_none());
+        rx.truncate(63);
+        assert_eq!(
+            pool.release(rx, tx),
+            Err(TcpBufferPoolReleaseError::RxLength {
+                expected: 64,
+                actual: 63,
+            })
+        );
+        assert_eq!(pool.available(), 0);
+    }
+
+    #[test]
+    fn outbound_flow_is_registered_before_first_syn_ack_lookup() {
+        let mut device = Loopback::new(Medium::Ethernet);
+        let config = dpdk_iface_config([0x02, 0, 0, 0, 0, 1]);
+        let mut iface = Interface::new(config, &mut device, SmolInstant::ZERO);
+        let mut sockets = SocketSet::new(Vec::with_capacity(1));
+        let socket = TcpSocket::new(
+            LinearBuffer::with_reserve(vec![0; 64], 8),
+            LinearBuffer::with_reserve(vec![0; 64], 8),
+        );
+        let handle = sockets.add(socket);
+        let local = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 1).into(), 50_000);
+        let remote = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 2).into(), 443);
+
+        connect_socket_and_register_flow(&mut iface, &mut sockets, handle, remote, local)
+            .expect("SYN setup must register its tuple before returning");
+        assert_eq!(
+            sockets
+                .get::<TcpSocket<'_, LinearBuffer<'_>>>(handle)
+                .state(),
+            smoltcp::socket::tcp::State::SynSent
+        );
+        assert!(iface.unregister_tcp_flow(handle));
+    }
+
+    #[test]
+    fn connect_setup_guard_releases_every_acquired_resource() {
+        let handle = SocketHandle::default();
+        let mut owner = FakeConnectOwner::default();
+        {
+            let _guard = ConnectSetupGuard::new(&mut owner, handle);
+        }
+        assert_eq!(owner.removed, vec![handle]);
+        assert!(owner.released.is_empty());
+
+        owner.removed.clear();
+        {
+            let mut guard = ConnectSetupGuard::new(&mut owner, handle);
+            guard.set_local_port(50_001);
+        }
+        assert_eq!(owner.removed, vec![handle]);
+        assert_eq!(owner.released, vec![50_001]);
+
+        owner.removed.clear();
+        owner.released.clear();
+        let resources = {
+            let mut guard = ConnectSetupGuard::new(&mut owner, handle);
+            guard.set_local_port(50_002);
+            guard.disarm().expect("complete setup must transfer ownership")
+        };
+        assert_eq!(resources.handle, handle);
+        assert_eq!(resources.local_port, 50_002);
+        assert!(owner.removed.is_empty());
+        assert!(owner.released.is_empty());
+    }
 }

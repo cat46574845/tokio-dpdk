@@ -86,6 +86,87 @@ impl Drop for PeekGuard<'_> {
 // The *const () is inherently !Send + !Sync
 // =============================================================================
 
+struct OutboundConnectGuard<C: FnOnce(SocketHandle, u16, usize)> {
+    handle: SocketHandle,
+    local_port: u16,
+    core_id: usize,
+    cleanup: Option<C>,
+}
+
+impl<C: FnOnce(SocketHandle, u16, usize)> OutboundConnectGuard<C> {
+    fn new(handle: SocketHandle, local_port: u16, core_id: usize, cleanup: C) -> Self {
+        Self {
+            handle,
+            local_port,
+            core_id,
+            cleanup: Some(cleanup),
+        }
+    }
+
+    fn handle(&self) -> SocketHandle {
+        self.handle
+    }
+
+    fn disarm(mut self) -> (SocketHandle, u16) {
+        self.cleanup = None;
+        (self.handle, self.local_port)
+    }
+}
+
+impl<C: FnOnce(SocketHandle, u16, usize)> Drop for OutboundConnectGuard<C> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup(self.handle, self.local_port, self.core_id);
+        }
+    }
+}
+
+fn cleanup_outbound_connect(handle: SocketHandle, local_port: u16, core_id: usize) {
+    cleanup_socket_on_owner(handle, Some(local_port), core_id);
+}
+
+fn cleanup_socket_on_owner(
+    handle: SocketHandle,
+    outbound_local_port: Option<u16>,
+    core_id: usize,
+) {
+    match current_worker_index() {
+        Some(current) if current == core_id => {}
+        Some(current) => {
+            eprintln!(
+                "[tokio-dpdk] ERROR socket cleanup on wrong worker handle={:?} owner={} current={}",
+                handle, core_id, current
+            );
+            return;
+        }
+        None => {
+            eprintln!(
+                "[tokio-dpdk] ERROR socket cleanup outside DPDK worker handle={:?} owner={}",
+                handle, core_id
+            );
+            return;
+        }
+    }
+
+    match with_current_driver(|driver| {
+        let remove_result = driver.remove_socket(handle);
+        if let Some(port) = outbound_local_port {
+            driver.release_port(port);
+        }
+        remove_result
+    }) {
+        Some(Ok(())) => {}
+        Some(Err(error)) => eprintln!(
+            "[tokio-dpdk] ERROR socket cleanup failed handle={:?} error={}",
+            handle, error
+        ),
+        None => eprintln!(
+            "[tokio-dpdk] ERROR DPDK driver unavailable during socket cleanup handle={:?}",
+            handle
+        ),
+    }
+}
+
 /// A DPDK-backed TCP stream.
 ///
 /// This struct provides a TCP connection that uses DPDK for packet I/O
@@ -121,6 +202,8 @@ pub struct TcpDpdkStream {
     local_addr: Option<SocketAddr>,
     /// Peer address (cached)
     peer_addr: Option<SocketAddr>,
+    /// Local port owned by an outbound connect; accepted streams leave this empty.
+    outbound_local_port: Option<u16>,
     /// Read shutdown flag (smoltcp doesn't support half-close on read side)
     read_shutdown: std::sync::atomic::AtomicBool,
     /// Write shutdown flag — tracks whether we initiated close (FIN sent)
@@ -145,6 +228,7 @@ impl TcpDpdkStream {
             core_id,
             local_addr,
             peer_addr,
+            outbound_local_port: None,
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
             write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
@@ -195,81 +279,18 @@ impl TcpDpdkStream {
             )
         })?;
 
-        // Create socket and initiate connection via worker's DpdkDriver
-        let (handle, local_endpoint) = with_current_driver(|driver| {
-            // Create new TCP socket from pool
-            let handle = driver.create_tcp_socket().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "No buffers available in TCP socket pool",
+        let (connect_guard, local_addr) = with_current_driver(|driver| {
+            driver.start_tcp_connect(addr, None).map(|started| {
+                (
+                    OutboundConnectGuard::new(
+                        started.handle,
+                        started.local_addr.port(),
+                        core_id,
+                        cleanup_outbound_connect,
+                    ),
+                    started.local_addr,
                 )
-            })?;
-
-            // Register socket for tracking
-            driver.register_socket(handle);
-
-            // Pick a local ephemeral port that's not in use
-            let local_port = driver.allocate_ephemeral_port().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "No available ephemeral ports",
-                )
-            })?;
-
-            // Build local and remote endpoints based on address family
-            let (local_endpoint, remote_endpoint) = match addr {
-                SocketAddr::V4(v4) => {
-                    // Get the local IPv4 address from the driver (uses first configured address).
-                    // For multi-homed setups with multiple IPs, this selects the first one.
-                    // To query all addresses, use tokio::runtime::dpdk::worker_ipv4s().
-                    let local_ip = driver.get_ipv4_address().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::AddrNotAvailable,
-                            "No IPv4 address configured on DPDK interface",
-                        )
-                    })?;
-                    let local_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv4(local_ip),
-                        local_port,
-                    );
-                    let octets = v4.ip().octets();
-                    let remote_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(octets)),
-                        v4.port(),
-                    );
-                    (local_ep, remote_ep)
-                }
-                SocketAddr::V6(v6) => {
-                    // Get the local IPv6 address from the driver (uses first configured address).
-                    // For multi-homed setups with multiple IPs, this selects the first one.
-                    // To query all addresses, use tokio::runtime::dpdk::worker_ipv6s().
-                    let local_ip = driver.get_ipv6_address().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::AddrNotAvailable,
-                            "No global unicast IPv6 address configured on DPDK interface",
-                        )
-                    })?;
-                    let local_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv6(local_ip),
-                        local_port,
-                    );
-                    let octets = v6.ip().octets();
-                    let remote_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(octets)),
-                        v6.port(),
-                    );
-                    (local_ep, remote_ep)
-                }
-            };
-
-            // Initiate TCP connection
-            driver
-                .tcp_connect(handle, remote_endpoint, local_endpoint)
-                .map_err(|e| {
-                    io::Error::new(io::ErrorKind::ConnectionRefused, format!("{:?}", e))
-                })?;
-
-            Ok::<_, io::Error>((handle, local_endpoint))
+            })
         })
         .ok_or_else(|| {
             io::Error::new(
@@ -277,6 +298,7 @@ impl TcpDpdkStream {
                 "Failed to access DPDK driver (not on worker thread or driver busy)",
             )
         })??;
+        let handle = connect_guard.handle();
 
         // Wait for connection establishment by polling until socket is connected
         // TCP handshake typically completes in < 1 second, use 30 second timeout
@@ -347,16 +369,14 @@ impl TcpDpdkStream {
             crate::task::yield_now().await;
         }
 
-        let local_addr = Some(SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            local_endpoint.port,
-        ));
+        let (handle, outbound_local_port) = connect_guard.disarm();
 
         Ok(Self {
             handle,
             core_id,
-            local_addr,
+            local_addr: Some(local_addr),
             peer_addr: Some(addr),
+            outbound_local_port: Some(outbound_local_port),
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
             write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
@@ -378,108 +398,20 @@ impl TcpDpdkStream {
             )
         })?;
 
-        // Create socket and initiate connection via worker's DpdkDriver
-        let (handle, local_endpoint) = with_current_driver(|driver| {
-            // Create new TCP socket from pool
-            let handle = driver.create_tcp_socket().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "No buffers available in TCP socket pool",
-                )
-            })?;
-
-            // Register socket for tracking
-            driver.register_socket(handle);
-
-            // Use the provided local address
-            let local_port = if local_addr.port() == 0 {
-                // Generate ephemeral port that's not in use
-                driver.allocate_ephemeral_port().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        "No available ephemeral ports",
-                    )
-                })?
-            } else {
-                local_addr.port()
-            };
-
-            // Build local and remote endpoints based on address family
-            let (local_endpoint, remote_endpoint) = match remote_addr {
-                SocketAddr::V4(v4) => {
-                    // Use provided local IP or get from driver if unspecified
-                    let local_ip = if local_addr.ip().is_unspecified() {
-                        driver.get_ipv4_address().ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::AddrNotAvailable,
-                                "No IPv4 address configured on DPDK interface",
-                            )
-                        })?
-                    } else {
-                        match local_addr.ip() {
-                            std::net::IpAddr::V4(v4) => smoltcp::wire::Ipv4Address::from_octets(v4.octets()),
-                            _ => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "Address family mismatch",
-                                ))
-                            }
-                        }
-                    };
-
-                    let local_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv4(local_ip),
-                        local_port,
-                    );
-                    let octets = v4.ip().octets();
-                    let remote_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(octets)),
-                        v4.port(),
-                    );
-                    (local_ep, remote_ep)
-                }
-                SocketAddr::V6(v6) => {
-                    // Use provided local IP or get from driver if unspecified
-                    let local_ip = if local_addr.ip().is_unspecified() {
-                        driver.get_ipv6_address().ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::AddrNotAvailable,
-                                "No global unicast IPv6 address configured on DPDK interface",
-                            )
-                        })?
-                    } else {
-                        match local_addr.ip() {
-                            std::net::IpAddr::V6(v6) => smoltcp::wire::Ipv6Address::from_octets(v6.octets()),
-                            _ => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "Address family mismatch",
-                                ))
-                            }
-                        }
-                    };
-
-                    let local_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv6(local_ip),
-                        local_port,
-                    );
-                    let octets = v6.ip().octets();
-                    let remote_ep = smoltcp::wire::IpEndpoint::new(
-                        smoltcp::wire::IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(octets)),
-                        v6.port(),
-                    );
-                    (local_ep, remote_ep)
-                }
-            };
-
-            // Initiate TCP connection
+        let (connect_guard, result_local_addr) = with_current_driver(|driver| {
             driver
-                .tcp_connect(handle, remote_endpoint, local_endpoint)
-                .map_err(|e| {
-                    io::Error::new(io::ErrorKind::ConnectionRefused, format!("{:?}", e))
-                })?;
-
-            Ok::<_, io::Error>((handle, local_endpoint))
+                .start_tcp_connect(remote_addr, Some(local_addr))
+                .map(|started| {
+                    (
+                        OutboundConnectGuard::new(
+                            started.handle,
+                            started.local_addr.port(),
+                            core_id,
+                            cleanup_outbound_connect,
+                        ),
+                        started.local_addr,
+                    )
+                })
         })
         .ok_or_else(|| {
             io::Error::new(
@@ -487,6 +419,7 @@ impl TcpDpdkStream {
                 "Failed to access DPDK driver (not on worker thread or driver busy)",
             )
         })??;
+        let handle = connect_guard.handle();
 
         // Wait for connection establishment
         let start_time = std::time::Instant::now();
@@ -532,13 +465,14 @@ impl TcpDpdkStream {
             crate::task::yield_now().await;
         }
 
-        let result_local_addr = Some(SocketAddr::new(local_addr.ip(), local_endpoint.port));
+        let (handle, outbound_local_port) = connect_guard.disarm();
 
         Ok(Self {
             handle,
             core_id,
-            local_addr: result_local_addr,
+            local_addr: Some(result_local_addr),
             peer_addr: Some(remote_addr),
+            outbound_local_port: Some(outbound_local_port),
             read_shutdown: std::sync::atomic::AtomicBool::new(false),
             write_shutdown: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
@@ -1650,23 +1584,11 @@ impl AsyncWrite for TcpDpdkStream {
 
 impl Drop for TcpDpdkStream {
     fn drop(&mut self) {
-        // Verify worker affinity - but only warn, don't panic in destructor
-        if let Some(current) = current_worker_index() {
-            if current != self.core_id {
-                // Log error but don't panic - panicking in Drop can cause issues
-                eprintln!(
-                    "WARNING: TcpDpdkStream dropped on wrong worker: created on {} but dropped on {}",
-                    self.core_id, current
-                );
-            }
-        }
-
-        // Remove socket from DpdkDriver via worker context.
-        // This releases the socket handle and returns buffers to the pool.
-        let handle = self.handle;
-        with_current_driver(|driver| {
-            driver.remove_socket(handle);
-        });
+        cleanup_socket_on_owner(
+            self.handle,
+            self.outbound_local_port.take(),
+            self.core_id,
+        );
     }
 }
 
@@ -1677,6 +1599,62 @@ impl std::fmt::Debug for TcpDpdkStream {
             .field("core_id", &self.core_id)
             .field("local_addr", &self.local_addr)
             .field("peer_addr", &self.peer_addr)
+            .field("outbound_local_port", &self.outbound_local_port)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::mem::ManuallyDrop;
+    use std::rc::Rc;
+
+    #[test]
+    fn pending_connect_guard_cleans_handle_and_port_on_drop() {
+        let cleaned = Rc::new(RefCell::new(Vec::new()));
+        let cleaned_by_drop = cleaned.clone();
+        {
+            let _guard = OutboundConnectGuard::new(
+                SocketHandle::default(),
+                50_000,
+                3,
+                move |handle, port, core| {
+                    cleaned_by_drop.borrow_mut().push((handle, port, core));
+                },
+            );
+        }
+        assert_eq!(
+            cleaned.borrow().as_slice(),
+            &[(SocketHandle::default(), 50_000, 3)]
+        );
+    }
+
+    #[test]
+    fn successful_connect_transfers_guard_ownership_without_cleanup() {
+        let cleaned = Rc::new(RefCell::new(false));
+        let cleaned_by_drop = cleaned.clone();
+        let guard = OutboundConnectGuard::new(
+            SocketHandle::default(),
+            50_001,
+            4,
+            move |_, _, _| *cleaned_by_drop.borrow_mut() = true,
+        );
+        let (handle, port) = guard.disarm();
+        assert_eq!(handle, SocketHandle::default());
+        assert_eq!(port, 50_001);
+        assert!(!*cleaned.borrow());
+    }
+
+    #[test]
+    fn accepted_stream_does_not_own_listener_port() {
+        let stream = ManuallyDrop::new(TcpDpdkStream::from_handle(
+            SocketHandle::default(),
+            0,
+            None,
+            None,
+        ));
+        assert!(stream.outbound_local_port.is_none());
     }
 }

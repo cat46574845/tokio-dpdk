@@ -901,8 +901,8 @@ pub(crate) fn run(worker: Arc<Worker>) {
 /// 7. Restore main thread's CPU affinity
 /// 8. Return the result
 ///
-/// This ensures spawned tasks are properly executed alongside the main future,
-/// and that maintenance (including buffer pool replenishment) runs correctly.
+/// This ensures spawned tasks are properly executed alongside the main future
+/// and scheduler maintenance runs correctly.
 pub(crate) fn run_with_future<F: std::future::Future>(
     worker: Arc<Worker>,
     _handle: &crate::runtime::scheduler::Handle,
@@ -1877,9 +1877,6 @@ impl Context {
             }
         }
 
-        // Buffer pool replenishment - inline to avoid hot-path allocation
-        self.replenish_buffer_pool_if_needed();
-
         // Reset LIFO enabled state
         self.reset_lifo_enabled();
 
@@ -1887,22 +1884,6 @@ impl Context {
         // This matches original tokio behavior: defer.wake() is called in park_internal,
         // which is triggered during maintenance (event_interval ticks).
         self.defer.wake();
-    }
-
-    /// Replenish buffer pool if below low watermark.
-    /// Called during maintenance to keep allocation off the hot path.
-    fn replenish_buffer_pool_if_needed(&self) {
-        const REPLENISH_BATCH_SIZE: usize = 16;
-
-        self.worker.driver.with_mut(|driver| {
-            let needs = driver.buffer_pool_needs_replenish();
-            if needs {
-                let replenished = driver.buffer_pool_replenish(REPLENISH_BATCH_SIZE);
-                if replenished > 0 {
-                    super::counters::inc_num_maintenance(); // Track as maintenance work
-                }
-            }
-        });
     }
 
     fn shutdown_core(&self) -> RunResult {

@@ -113,30 +113,6 @@ fn test_ac4_maybe_maintenance_called() {
 }
 
 // ============================================================================
-// AC-5: Buffer replenish called
-// ============================================================================
-
-#[serial_isolation_test::serial_isolation_test]
-#[test]
-fn test_ac5_buffer_replenish_called() {
-    let rt = create_dpdk_runtime();
-
-    rt.block_on(async {
-        let mut handles = Vec::new();
-        for i in 0..500 {
-            let handle = tokio::spawn(async move {
-                let _ = i * 2;
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            let _ = handle.await;
-        }
-    });
-}
-
-// ============================================================================
 // AC-6: CPU affinity during block_on
 // ============================================================================
 
