@@ -42,6 +42,7 @@ use std::io;
 
 pub use crate::runtime::scheduler::dpdk::{
     RawTailHandle, RawTailInput, RawTailParseDisposition, RawTailParserBinding,
+    RawTailParserConfig, RawTailScanStrategy,
 };
 
 /// Identifies a specific DPDK worker thread.
@@ -123,8 +124,9 @@ pub unsafe fn activate_reserved_raw_tail_parser(
     stream: &crate::net::TcpDpdkStream,
     handle: RawTailHandle,
     parser: RawTailParserBinding,
+    config: RawTailParserConfig,
 ) -> io::Result<()> {
-    unsafe { stream.activate_reserved_raw_tail_parser(handle, parser) }
+    unsafe { stream.activate_reserved_raw_tail_parser(handle, parser, config) }
 }
 
 /// Poll the unique receiver for the current driver-side parser publication.

@@ -31,7 +31,7 @@ use smoltcp::wire::{
 
 use super::device::DpdkDevice;
 use super::raw_tail::{
-    RawTailHandle, RawTailParserBinding, RawTailTable, RawTailTuple,
+    RawTailHandle, RawTailParserBinding, RawTailParserConfig, RawTailTable, RawTailTuple,
     RAW_TAIL_CONNECTION_CAP,
 };
 use super::SOCKET_LIFECYCLE_CAPACITY;
@@ -1295,6 +1295,7 @@ impl DpdkDriver {
         raw_tail: RawTailHandle,
         socket_handle: SocketHandle,
         parser: RawTailParserBinding,
+        config: RawTailParserConfig,
     ) -> std::io::Result<()> {
         validate_socket_for_removal(&self.sockets, &self.registered_sockets, socket_handle)
             .map_err(|error| {
@@ -1338,7 +1339,7 @@ impl DpdkDriver {
             endpoint_to_socket_addr(remote)?,
         )?;
         self.raw_tail
-            .activate_parser(raw_tail, actual_tuple, socket_handle, parser)
+            .activate_parser_configured(raw_tail, actual_tuple, socket_handle, parser, config)
     }
 
     pub(crate) fn unregister_raw_tail(&mut self, handle: RawTailHandle) -> std::io::Result<()> {

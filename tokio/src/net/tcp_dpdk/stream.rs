@@ -873,13 +873,14 @@ impl TcpDpdkStream {
         &self,
         handle: RawTailHandle,
         parser: RawTailParserBinding,
+        config: crate::runtime::dpdk::RawTailParserConfig,
     ) -> io::Result<()> {
         // The public unsafe wrapper requires this stream/socket to outlive the
         // raw-tail binding, preventing SocketHandle index reuse before parser
         // removal.
         self.assert_on_correct_worker();
         with_current_driver(|driver| {
-            driver.activate_raw_tail_parser(handle, self.handle, parser)
+            driver.activate_raw_tail_parser(handle, self.handle, parser, config)
         })
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DPDK driver unavailable"))?
     }

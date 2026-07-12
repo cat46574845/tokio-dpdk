@@ -74,6 +74,27 @@ pub struct RawTailInput<'a> {
     pub connection_closed: bool,
 }
 
+/// Packet/TLS framing strategy selected once when a raw-tail connection is activated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawTailScanStrategy {
+    /// Retain the latest packet and locate its newest complete TLS record from the tail.
+    Reverse,
+    /// Follow TLS record boundaries in TCP order and avoid touching payload when the
+    /// next header cannot be present in the packet.
+    ForwardJump,
+}
+
+/// Immutable, per-connection framing inputs derived by the application parser.
+#[derive(Debug, Clone, Copy)]
+pub struct RawTailParserConfig {
+    /// Strategy used for this process run.
+    pub scan_strategy: RawTailScanStrategy,
+    /// Smallest TLS wire record which can carry this connection's application payload.
+    pub tls_record_wire_min: u16,
+    /// TCP position paired with the parser's current inbound TLS sequence.
+    pub tcp_anchor: u32,
+}
+
 /// Whether a synchronous parser published a value for its receiver task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawTailParseDisposition {
@@ -268,6 +289,17 @@ struct TailConn {
     packet_ordinal: u64,
     publication_ready: bool,
     terminal_ready: bool,
+    scan_strategy: RawTailScanStrategy,
+    tls_record_wire_min: u16,
+    next_tls_header_seq: u32,
+    pending_records: Option<SelectedRecordRange>,
+}
+
+#[derive(Clone, Copy)]
+struct SelectedRecordRange {
+    offset: usize,
+    len: usize,
+    count: u16,
 }
 
 impl TailConn {
@@ -415,6 +447,10 @@ impl RawTailTable {
             packet_ordinal: 0,
             publication_ready: false,
             terminal_ready: false,
+            scan_strategy: RawTailScanStrategy::Reverse,
+            tls_record_wire_min: TLS_HEADER_LEN as u16 + TLS_MIN_CIPHERTEXT_LEN as u16,
+            next_tls_header_seq: 0,
+            pending_records: None,
         };
         if slot == self.conns.len() {
             self.conns.push(Some(conn));
@@ -433,12 +469,34 @@ impl RawTailTable {
         Ok(handle)
     }
 
+    #[cfg(test)]
     pub(crate) fn activate_parser(
         &mut self,
         handle: RawTailHandle,
         actual_tuple: RawTailTuple,
         socket_handle: SocketHandle,
         parser: RawTailParserBinding,
+    ) -> io::Result<()> {
+        self.activate_parser_configured(
+            handle,
+            actual_tuple,
+            socket_handle,
+            parser,
+            RawTailParserConfig {
+                scan_strategy: RawTailScanStrategy::Reverse,
+                tls_record_wire_min: (TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN) as u16,
+                tcp_anchor: 0,
+            },
+        )
+    }
+
+    pub(crate) fn activate_parser_configured(
+        &mut self,
+        handle: RawTailHandle,
+        actual_tuple: RawTailTuple,
+        socket_handle: SocketHandle,
+        parser: RawTailParserBinding,
+        config: RawTailParserConfig,
     ) -> io::Result<()> {
         let Some(slot) = self.slot_for_handle(handle) else {
             return Err(io::Error::new(
@@ -477,11 +535,14 @@ impl RawTailTable {
                 ),
             ));
         }
-
         // All fallible validation is complete. Install every activation field
         // together so capture can never observe a partially bound parser.
         conn.socket_handle = Some(socket_handle);
         conn.parser = Some(parser);
+        conn.scan_strategy = config.scan_strategy;
+        conn.tls_record_wire_min = config.tls_record_wire_min;
+        conn.next_tls_header_seq = config.tcp_anchor;
+        conn.pending_records = None;
         self.socket_to_slot[socket_index] = Some(slot);
         self.active_count += 1;
         Ok(())
@@ -571,6 +632,7 @@ impl RawTailTable {
             conn.terminal_ready = false;
             let receiver_waker = conn.receiver_waker.take();
             conn.pending_mbuf = None;
+            conn.pending_records = None;
             (was_active, receiver_waker)
         };
         if was_active {
@@ -618,6 +680,12 @@ impl RawTailTable {
                 return Ok(());
             }
             conn.advance_packet_ordinal();
+            conn.pending_records = match conn.scan_strategy {
+                RawTailScanStrategy::Reverse => None,
+                RawTailScanStrategy::ForwardJump => {
+                    select_forward_tls_records(conn, &mbuf)
+                }
+            };
             let old = replace_latest(&mut conn.pending_mbuf, mbuf);
             let old_was_none = old.is_none();
             drop(old);
@@ -727,12 +795,14 @@ impl RawTailTable {
         let parser = conn
             .parser
             .expect("active raw-tail connection must retain its parser binding");
+        let selected = conn.pending_records.take();
         let parser_issue = Self::dispatch_committed_payload(
             conn,
             parser,
             parsed.tcp_repr.payload,
             tcp_seq,
             connection_closed,
+            selected,
         );
         let processed = ProcessedTail {
             socket_handle,
@@ -750,10 +820,21 @@ impl RawTailTable {
         payload: &[u8],
         tcp_seq: u32,
         connection_closed: bool,
+        selected: Option<SelectedRecordRange>,
     ) -> Option<ParserIssue> {
-        let (records, record_count, record_tcp_seq) = match find_tail_aligned_tls_records(payload) {
+        let tail = match conn.scan_strategy {
+            RawTailScanStrategy::Reverse => {
+                find_tail_aligned_tls_records(payload, usize::from(conn.tls_record_wire_min))
+            }
+            RawTailScanStrategy::ForwardJump => selected.map(|selected| TailAlignedTlsRecords {
+                offset: selected.offset,
+                len: selected.len,
+                record_count: selected.count,
+            }),
+        };
+        let (records, record_count, record_tcp_seq) = match tail {
             Some(tls_tail) => (
-                &payload[tls_tail.offset..],
+                &payload[tls_tail.offset..tls_tail.offset + tls_tail.len],
                 tls_tail.record_count,
                 tcp_seq.wrapping_add(tls_tail.offset as u32),
             ),
@@ -902,6 +983,7 @@ fn parse_selected_tcp(mbuf: &OwnedMbuf) -> Option<ParsedSelectedTcp<'_>> {
 
 struct TailAlignedTlsRecords {
     offset: usize,
+    len: usize,
     record_count: u16,
 }
 
@@ -921,20 +1003,28 @@ fn tls_record_len_at(payload: &[u8], offset: usize) -> Option<usize> {
 
 /// Locate the newest complete TLS 1.3 record ending at this TCP payload. The
 /// common single-record path reads only offset zero. Otherwise search backward
-/// from the minimum legal wire length and stop at the TLS ciphertext maximum;
+/// from this connection's application-derived minimum wire length and stop at
+/// the TLS ciphertext maximum;
 /// a miss never scans an earlier part of a large payload or another mbuf.
-fn find_tail_aligned_tls_records(payload: &[u8]) -> Option<TailAlignedTlsRecords> {
-    const TLS_MIN_WIRE_LEN: usize = TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN;
+fn find_tail_aligned_tls_records(
+    payload: &[u8],
+    per_connection_min_wire_len: usize,
+) -> Option<TailAlignedTlsRecords> {
+    let tls_min_wire_len = per_connection_min_wire_len;
     const TLS_MAX_WIRE_LEN: usize = TLS_HEADER_LEN + TLS_MAX_CIPHERTEXT_LEN;
 
-    if payload.len() < TLS_MIN_WIRE_LEN {
+    if tls_record_len_at(payload, 0) == Some(payload.len()) {
+        return Some(TailAlignedTlsRecords {
+            offset: 0,
+            len: payload.len(),
+            record_count: 1,
+        });
+    }
+    if payload.len() < tls_min_wire_len {
         return None;
     }
-    if tls_record_len_at(payload, 0) == Some(payload.len()) {
-        return Some(TailAlignedTlsRecords { offset: 0, record_count: 1 });
-    }
 
-    let newest_offset = payload.len() - TLS_MIN_WIRE_LEN;
+    let newest_offset = payload.len() - tls_min_wire_len;
     let oldest_offset = payload.len().saturating_sub(TLS_MAX_WIRE_LEN).max(1);
     if oldest_offset > newest_offset {
         return None;
@@ -944,12 +1034,59 @@ fn find_tail_aligned_tls_records(payload: &[u8]) -> Option<TailAlignedTlsRecords
             if offset + record_len == payload.len() {
                 return Some(TailAlignedTlsRecords {
                     offset,
+                    len: record_len,
                     record_count: 1,
                 });
             }
         }
     }
     None
+}
+
+#[inline(always)]
+fn select_forward_tls_records(conn: &mut TailConn, mbuf: &OwnedMbuf) -> Option<SelectedRecordRange> {
+    let parsed = parse_selected_tcp(mbuf)?;
+    if !conn.tuple.matches_ingress(&parsed.ip_repr, &parsed.tcp_repr) {
+        return None;
+    }
+    let packet_seq = parsed.tcp_repr.seq_number.0 as u32;
+    select_forward_tls_records_from_payload(conn, parsed.tcp_repr.payload, packet_seq)
+}
+
+#[inline(always)]
+fn select_forward_tls_records_from_payload(
+    conn: &mut TailConn,
+    payload: &[u8],
+    packet_seq: u32,
+) -> Option<SelectedRecordRange> {
+    let header_offset = conn.next_tls_header_seq.wrapping_sub(packet_seq) as usize;
+    if header_offset >= payload.len() {
+        return None;
+    }
+
+    let mut cursor = header_offset;
+    let mut selected_start = None;
+    let mut selected_end = 0usize;
+    let mut selected_count = 0u16;
+    while let Some(record_len) = tls_record_len_at(payload, cursor) {
+        let record_end = cursor + record_len;
+        conn.next_tls_header_seq = packet_seq.wrapping_add(record_end as u32);
+        if record_end > payload.len() {
+            break;
+        }
+        selected_start.get_or_insert(cursor);
+        selected_end = record_end;
+        selected_count += 1;
+        cursor = record_end;
+        if cursor == payload.len() {
+            break;
+        }
+    }
+    selected_start.map(|offset| SelectedRecordRange {
+        offset,
+        len: selected_end - offset,
+        count: selected_count,
+    })
 }
 
 fn toeplitz_hash(input: &[u8], key: &[u8]) -> u32 {
@@ -1109,7 +1246,7 @@ mod tests {
         let mut payload = vec![0xaa, 0xbb, 0xcc];
         payload.extend_from_slice(&first);
         payload.extend_from_slice(&second);
-        let records = find_tail_aligned_tls_records(&payload)
+        let records = find_tail_aligned_tls_records(&payload, TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN)
             .expect("newest complete TLS record must be found in one payload");
         assert_eq!(records.offset, 3 + first.len());
         assert_eq!(records.record_count, 1);
@@ -1121,7 +1258,7 @@ mod tests {
         let record = tls_record(&vec![0x5a; 845]);
         let mut payload = vec![0xaa; 100 * 1024 - record.len()];
         payload.extend_from_slice(&record);
-        let records = find_tail_aligned_tls_records(&payload)
+        let records = find_tail_aligned_tls_records(&payload, TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN)
             .expect("bounded tail search must find a large coalesced TLS record");
         assert_eq!(records.offset, payload.len() - record.len());
         assert_eq!(records.record_count, 1);
@@ -1131,15 +1268,63 @@ mod tests {
     #[test]
     fn large_non_tls_tail_is_an_accepted_bounded_miss() {
         let payload = vec![0xaa; 100 * 1024];
-        assert!(find_tail_aligned_tls_records(&payload).is_none());
+        assert!(find_tail_aligned_tls_records(&payload, TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN).is_none());
+    }
+
+    #[test]
+    fn reverse_search_uses_the_application_profile_minimum_after_offset_zero() {
+        let record = tls_record(&vec![0x5a; 90]);
+        let mut payload = vec![0xaa; 400];
+        payload.extend_from_slice(&record);
+        assert!(find_tail_aligned_tls_records(&payload, 165).is_none());
+        assert!(find_tail_aligned_tls_records(&record, 165).is_some());
+    }
+
+    #[test]
+    fn forward_jump_tracks_multiple_records_and_skips_to_a_split_records_end() {
+        let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
+        let handle = table.register(tuple(443)).expect("reservation must succeed");
+        let slot = table.slot_for_handle(handle).unwrap();
+        let conn = table.conns[slot].as_mut().unwrap();
+        conn.next_tls_header_seq = 100;
+
+        let first = tls_record(b"first");
+        let second = tls_record(b"second");
+        let mut payload = first.clone();
+        payload.extend_from_slice(&second);
+        let selected = select_forward_tls_records_from_payload(conn, &payload, 100)
+            .expect("two complete records must be selected together");
+        assert_eq!(selected.offset, 0);
+        assert_eq!(selected.len, payload.len());
+        assert_eq!(selected.count, 2);
+        assert_eq!(conn.next_tls_header_seq, 100 + payload.len() as u32);
+
+        let split_start = conn.next_tls_header_seq;
+        let split_wire_len = 205u16;
+        let mut split_prefix = vec![0x17, 0x03, 0x03];
+        split_prefix.extend_from_slice(&(split_wire_len - TLS_HEADER_LEN as u16).to_be_bytes());
+        split_prefix.resize(40, 0x55);
+        assert!(select_forward_tls_records_from_payload(conn, &split_prefix, split_start).is_none());
+        assert_eq!(conn.next_tls_header_seq, split_start + u32::from(split_wire_len));
+
+        let after_split = tls_record(b"after-split");
+        let selected = select_forward_tls_records_from_payload(
+            conn,
+            &after_split,
+            split_start + u32::from(split_wire_len),
+        )
+        .expect("packet beginning at the jumped boundary must be selected");
+        assert_eq!(selected.offset, 0);
+        assert_eq!(selected.len, after_split.len());
+        assert_eq!(selected.count, 1);
     }
 
     #[test]
     fn does_not_assemble_a_tls_record_split_across_tcp_payloads() {
         let first_packet = [0x17, 0x03, 0x03, 0x00, 0x08, 1, 2, 3];
         let second_packet = [4, 5, 6, 7, 8];
-        assert!(find_tail_aligned_tls_records(&first_packet).is_none());
-        assert!(find_tail_aligned_tls_records(&second_packet).is_none());
+        assert!(find_tail_aligned_tls_records(&first_packet, TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN).is_none());
+        assert!(find_tail_aligned_tls_records(&second_packet, TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN).is_none());
     }
 
     #[test]
@@ -1228,6 +1413,7 @@ mod tests {
                 &selected.payload,
                 7,
                 false,
+                None,
             )
             .is_none());
             assert_eq!(&*events.borrow(), &["parser"]);
@@ -1365,7 +1551,7 @@ mod tests {
         conn.receiver_waker = Some(Waker::from(Arc::new(CountWake(wake_count.clone()))));
 
         assert!(matches!(
-            RawTailTable::dispatch_committed_payload(conn, binding, b"not tls", 10, false),
+            RawTailTable::dispatch_committed_payload(conn, binding, b"not tls", 10, false, None),
             Some(ParserIssue::TlsTailNotFound)
         ));
         assert!(conn.publication_ready);
@@ -1379,6 +1565,7 @@ mod tests {
             &record,
             11,
             false,
+            None,
         )
         .is_none());
         assert!(conn.publication_ready);

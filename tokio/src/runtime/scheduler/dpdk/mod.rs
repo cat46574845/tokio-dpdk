@@ -39,6 +39,7 @@ pub(crate) const SOCKET_LIFECYCLE_CAPACITY: usize = 8192;
 
 pub use raw_tail::{
     RawTailHandle, RawTailInput, RawTailParseDisposition, RawTailParserBinding,
+    RawTailParserConfig, RawTailScanStrategy,
 };
 
 // Re-export debug APIs
