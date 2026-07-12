@@ -3,7 +3,7 @@
 //! This module provides `DpdkDevice` which implements `smoltcp::phy::Device`,
 //! allowing DPDK to be used as the network backend for smoltcp's TCP/IP stack.
 
-use std::{io, ptr, ptr::NonNull};
+use std::{io, mem::ManuallyDrop, ptr, ptr::NonNull};
 
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
 use std::fs::{self, File};
@@ -575,6 +575,8 @@ pub(crate) struct DpdkDevice {
     tx_buffer: Vec<*mut ffi::rte_mbuf>,
     /// Strict startup-fixed upper bound for application-owned TX mbufs.
     tx_pending_cap: usize,
+    /// Prepared mbuf reused while paired RX tokens do not emit a response.
+    tx_spare: Option<PreparedTxMbuf>,
     /// Received mbufs pending processing
     rx_pending: Vec<*mut ffi::rte_mbuf>,
     /// Current index into rx_pending
@@ -609,7 +611,7 @@ impl DpdkDevice {
         let rx_burst_size = configured_rx_burst_size();
         let rx_burst_len = rx_burst_size as usize;
 
-        let tailroom_probe = unsafe { OwnedMbuf::try_alloc(mempool) }.ok_or_else(|| {
+        let mut tailroom_probe = unsafe { OwnedMbuf::try_alloc(mempool) }.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 "DPDK mempool has no mbuf available for startup tailroom validation",
@@ -625,7 +627,15 @@ impl DpdkDevice {
                 ),
             ));
         }
-        drop(tailroom_probe);
+        let tx_spare_data = tailroom_probe
+            .append(DEFAULT_MTU)
+            .and_then(|data| NonNull::new(data.as_mut_ptr()))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DPDK startup TX mbuf could not append the validated device MTU",
+                )
+            })?;
 
         Ok(Self {
             port_id,
@@ -634,6 +644,10 @@ impl DpdkDevice {
             raw_tail_rss_key,
             tx_buffer: Vec::with_capacity(queue_descriptors as usize),
             tx_pending_cap: queue_descriptors as usize,
+            tx_spare: Some(PreparedTxMbuf {
+                mbuf: tailroom_probe,
+                data: tx_spare_data,
+            }),
             rx_pending: Vec::with_capacity(rx_burst_len),
             rx_index: 0,
             rx_burst_buf: vec![ptr::null_mut(); rx_burst_len],
@@ -818,6 +832,9 @@ impl DpdkDevice {
             self.error_counters.record_tx_pending_full();
             return None;
         }
+        if let Some(prepared) = self.tx_spare.take() {
+            return Some(prepared);
+        }
         let prepared = prepare_tx_resource(
             unsafe { OwnedMbuf::try_alloc(self.mempool) },
             |mbuf| {
@@ -893,7 +910,17 @@ pub(crate) struct DpdkRxToken {
 /// Transmit token for smoltcp Device trait.
 pub(crate) struct DpdkTxToken<'a> {
     device: &'a mut DpdkDevice,
-    prepared: PreparedTxMbuf,
+    prepared: ManuallyDrop<PreparedTxMbuf>,
+}
+
+impl Drop for DpdkTxToken<'_> {
+    fn drop(&mut self) {
+        // SAFETY: consume suppresses this destructor with ManuallyDrop; an
+        // ordinarily dropped token therefore still owns exactly one mbuf.
+        let prepared = unsafe { ManuallyDrop::take(&mut self.prepared) };
+        debug_assert!(self.device.tx_spare.is_none());
+        self.device.tx_spare = Some(prepared);
+    }
 }
 
 impl smoltcp::phy::RxToken for DpdkRxToken {
@@ -923,17 +950,17 @@ impl<'a> smoltcp::phy::TxToken for DpdkTxToken<'a> {
             len <= DEFAULT_MTU,
             "smoltcp Device capability guarantees TX length does not exceed the validated MTU"
         );
-        let DpdkTxToken {
-            device,
-            mut prepared,
-        } = self;
+        let mut this = ManuallyDrop::new(self);
+        // SAFETY: suppressing DpdkTxToken::drop transfers its sole prepared
+        // mbuf into the TX pending vector on this path.
+        let mut prepared = unsafe { ManuallyDrop::take(&mut this.prepared) };
         prepared.mbuf.shrink_preappended_tx_len(len);
         let data = unsafe { std::slice::from_raw_parts_mut(prepared.data.as_ptr(), len) };
 
         let result = f(data);
 
-        debug_assert!(device.tx_buffer.len() < device.tx_pending_cap);
-        device.tx_buffer.push(prepared.mbuf.into_raw());
+        debug_assert!(this.device.tx_buffer.len() < this.device.tx_pending_cap);
+        this.device.tx_buffer.push(prepared.mbuf.into_raw());
 
         result
     }
@@ -970,7 +997,7 @@ impl Device for DpdkDevice {
             DpdkRxToken { mbuf: rx_mbuf },
             DpdkTxToken {
                 device: self,
-                prepared,
+                prepared: ManuallyDrop::new(prepared),
             },
         ))
     }
@@ -979,7 +1006,7 @@ impl Device for DpdkDevice {
         let prepared = self.try_reserve_tx_mbuf()?;
         Some(DpdkTxToken {
             device: self,
-            prepared,
+            prepared: ManuallyDrop::new(prepared),
         })
     }
 
