@@ -897,7 +897,7 @@ impl DpdkDriver {
         } else {
             0
         };
-        let raw_tail_observed_gateway = self.raw_tail.finish_drain(
+        let (raw_tail_observed_gateway, raw_tail_publication_ready) = self.raw_tail.finish_drain(
             smol_now,
             &mut self.iface,
             &mut self.sockets,
@@ -926,6 +926,115 @@ impl DpdkDriver {
         } else {
             0
         };
+
+        if raw_tail_publication_ready {
+            self.infra_errors_dirty |= self.device.errors_dirty()
+                || self.raw_tail.errors_dirty()
+                || self.gateway_probe_errors.is_dirty();
+            #[cfg(feature = "market-trace")]
+            let infra_error_start_ns = if trace_poll && self.infra_errors_dirty {
+                crate::runtime::market_trace::now_ns()
+            } else {
+                0
+            };
+            if self.infra_errors_dirty {
+                self.report_infra_errors(now);
+            }
+            #[cfg(feature = "market-trace")]
+            if trace_poll {
+                let early_return_ns = crate::runtime::market_trace::now_ns();
+                crate::runtime::market_trace::complete(
+                    poll_start_ns,
+                    early_return_ns.saturating_sub(poll_start_ns),
+                    crate::runtime::market_trace::SPAN_DPDK_DRIVER_POLL,
+                    track_id,
+                    0,
+                );
+                crate::runtime::market_trace::complete(
+                    flush_tx_before_start_ns,
+                    flush_tx_before_dur_ns,
+                    crate::runtime::market_trace::SPAN_DPDK_FLUSH_TX,
+                    track_id,
+                    pack_trace_aux3(
+                        0,
+                        flush_tx_before_stats.total_packets,
+                        flush_tx_before_stats.zero_retries,
+                    ),
+                );
+                if drain_rx_stats.trace_start_ns != 0 {
+                    crate::runtime::market_trace::complete(
+                        drain_rx_stats.trace_start_ns,
+                        drain_rx_stats.trace_dur_ns,
+                        crate::runtime::market_trace::SPAN_DPDK_DRAIN_RX,
+                        track_id,
+                        pack_trace_aux3(
+                            drain_rx_stats.received,
+                            drain_rx_stats.raw_tail_captured,
+                            drain_rx_stats.smoltcp_pending,
+                        ),
+                    );
+                    crate::runtime::market_trace::complete(
+                        drain_rx_stats.trace_start_ns,
+                        drain_rx_stats.rx_burst_dur_ns,
+                        crate::runtime::market_trace::SPAN_DPDK_RX_BURST,
+                        track_id,
+                        pack_trace_aux3(
+                            drain_rx_stats.rx_burst_calls,
+                            drain_rx_stats.received,
+                            0,
+                        ),
+                    );
+                    crate::runtime::market_trace::complete(
+                        drain_rx_stats
+                            .trace_start_ns
+                            .saturating_add(drain_rx_stats.rx_burst_dur_ns),
+                        drain_rx_stats.classify_dur_ns,
+                        crate::runtime::market_trace::SPAN_DPDK_RX_CLASSIFY,
+                        track_id,
+                        pack_trace_aux3(
+                            drain_rx_stats.received,
+                            drain_rx_stats.raw_tail_captured,
+                            drain_rx_stats.smoltcp_pending,
+                        ),
+                    );
+                }
+                crate::runtime::market_trace::complete(
+                    raw_tail_finish_start_ns,
+                    raw_tail_finish_dur_ns,
+                    crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_FINISH,
+                    track_id,
+                    0,
+                );
+                crate::runtime::market_trace::complete(
+                    raw_tail_egress_queue_start_ns,
+                    raw_tail_egress_queue_dur_ns,
+                    crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_EGRESS_QUEUE,
+                    track_id,
+                    self.raw_tail_egress_handles.len() as u64,
+                );
+                if infra_error_start_ns != 0 {
+                    crate::runtime::market_trace::complete(
+                        infra_error_start_ns,
+                        early_return_ns.saturating_sub(infra_error_start_ns),
+                        crate::runtime::market_trace::SPAN_DPDK_INFRA_ERROR_REPORT,
+                        track_id,
+                        0,
+                    );
+                }
+            }
+            #[cfg(feature = "tail-ab")]
+            {
+                let tcp_advance_sum = self.raw_tail.take_poll_tcp_advance_sum();
+                if tcp_advance_sum != 0 {
+                    crate::runtime::dpdk::record_tail_ab(
+                        self.worker_index,
+                        tcp_advance_sum,
+                        now.elapsed().as_nanos() as u64,
+                    );
+                }
+            }
+            return true;
+        }
 
         let has_smoltcp_rx = self.device.has_unprocessed_rx_pending();
 
