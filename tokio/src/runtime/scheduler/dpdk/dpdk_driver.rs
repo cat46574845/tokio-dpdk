@@ -974,7 +974,6 @@ impl DpdkDriver {
             let mut ingress_touched = std::mem::take(&mut self.ingress_touched);
             let mut ingress_touched_bits = std::mem::take(&mut self.ingress_touched_bits);
             ingress_touched.clear();
-            ingress_touched_bits.fill(0);
             loop {
                 let observe_gateway = should_observe_gateway_on_normal_ingress(
                     self.gateway_neighbor_configured,
@@ -1060,6 +1059,7 @@ impl DpdkDriver {
                     }
                     self.queue_egress_at(handle, next_due);
                 }
+                Self::clear_handle_dedup_bit(&mut ingress_touched_bits, handle);
             }
             #[cfg(feature = "market-trace")]
             {
@@ -1397,8 +1397,17 @@ impl DpdkDriver {
             endpoint_to_socket_addr(local)?,
             endpoint_to_socket_addr(remote)?,
         )?;
-        self.raw_tail
-            .activate_parser_configured(raw_tail, actual_tuple, socket_handle, parser, config)
+        self.raw_tail.activate_parser_configured(
+            raw_tail,
+            actual_tuple,
+            socket_handle,
+            parser,
+            config,
+        )?;
+        self.sockets
+            .get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(socket_handle)
+            .prepare_lossy_tail();
+        Ok(())
     }
 
     pub(crate) fn unregister_raw_tail(&mut self, handle: RawTailHandle) -> std::io::Result<()> {
@@ -1465,6 +1474,23 @@ impl DpdkDriver {
             .get_tcp_socket_mut(handle)
             .listen(endpoint)
             .map_err(listen_error_to_io)?;
+        setup
+            .owner_mut()
+            .iface
+            .register_tcp_listener(handle, endpoint)
+            .map_err(|error| {
+                let kind = match error {
+                    TcpFlowCacheError::Full => io::ErrorKind::OutOfMemory,
+                    TcpFlowCacheError::HandleOutOfRange => io::ErrorKind::InvalidData,
+                };
+                io::Error::new(
+                    kind,
+                    format!(
+                        "failed to register TCP listener handle={:?} endpoint={}: {}",
+                        handle, endpoint, error
+                    ),
+                )
+            })?;
         Ok(Some(setup.disarm()))
     }
 
@@ -1591,6 +1617,7 @@ impl DpdkDriver {
             ));
         }
         self.iface.unregister_tcp_flow(handle);
+        self.iface.unregister_tcp_listener(handle);
         self.clear_socket_egress_pending(handle);
         // SocketSet is exclusively borrowed and was validated immediately
         // above, so its panic-only invalid-handle branch is unreachable here.
@@ -1770,6 +1797,12 @@ impl DpdkDriver {
             "deduplicated ingress touched handles cannot exceed fixed socket capacity"
         );
         handles.push(handle);
+    }
+
+    #[inline(always)]
+    fn clear_handle_dedup_bit(bits: &mut [u64], handle: SocketHandle) {
+        let index = handle.index();
+        bits[index / 64] &= !(1u64 << (index % 64));
     }
 
     #[inline(always)]
