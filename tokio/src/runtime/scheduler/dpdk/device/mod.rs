@@ -162,6 +162,12 @@ pub(crate) struct DrainRxStats {
     pub(crate) trace_start_ns: u64,
     #[cfg(feature = "market-trace")]
     pub(crate) trace_dur_ns: u64,
+    #[cfg(feature = "market-trace")]
+    pub(crate) rx_burst_dur_ns: u64,
+    #[cfg(feature = "market-trace")]
+    pub(crate) classify_dur_ns: u64,
+    #[cfg(feature = "market-trace")]
+    pub(crate) rx_burst_calls: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -656,15 +662,17 @@ impl DpdkDevice {
 
     /// Try to receive packets from DPDK.
     pub(crate) fn drain_rx(&mut self, raw_tail: &mut RawTailTable) -> DrainRxStats {
+        #[cfg(feature = "market-trace")]
+        let trace_start_ns = crate::runtime::market_trace::now_ns();
         // Preserve a suffix which could not be consumed because a paired TX
         // token was unavailable. Compaction is a cold backpressure path and
         // prevents already-consumed pointer history from growing indefinitely.
         compact_consumed_prefix(&mut self.rx_pending, &mut self.rx_index);
         let mut stats = DrainRxStats::default();
-        #[cfg(feature = "market-trace")]
-        let mut trace_start_ns = 0u64;
 
         loop {
+            #[cfg(feature = "market-trace")]
+            let rx_burst_start_ns = crate::runtime::market_trace::now_ns();
             let n = unsafe {
                 dpdk_wrappers::rx_burst(
                     self.port_id,
@@ -673,12 +681,17 @@ impl DpdkDevice {
                     self.rx_burst_size,
                 )
             };
+            #[cfg(feature = "market-trace")]
+            {
+                stats.rx_burst_dur_ns = stats.rx_burst_dur_ns.saturating_add(
+                    crate::runtime::market_trace::now_ns().saturating_sub(rx_burst_start_ns),
+                );
+                stats.rx_burst_calls += 1;
+            }
 
             if n > 0 {
                 #[cfg(feature = "market-trace")]
-                if trace_start_ns == 0 {
-                    trace_start_ns = crate::runtime::market_trace::now_ns();
-                }
+                let classify_start_ns = crate::runtime::market_trace::now_ns();
                 stats.received += n as usize;
                 // Classify this NIC burst immediately in its natural order.
                 // In particular, a superseded raw-tail mbuf is freed by
@@ -712,6 +725,12 @@ impl DpdkDevice {
                     self.rx_pending.push(mbuf.into_raw());
                     stats.smoltcp_pending += 1;
                 }
+                #[cfg(feature = "market-trace")]
+                {
+                    stats.classify_dur_ns = stats.classify_dur_ns.saturating_add(
+                        crate::runtime::market_trace::now_ns().saturating_sub(classify_start_ns),
+                    );
+                }
             }
 
             if n == 0 {
@@ -719,7 +738,7 @@ impl DpdkDevice {
             }
         }
         #[cfg(feature = "market-trace")]
-        if trace_start_ns != 0 {
+        {
             stats.trace_start_ns = trace_start_ns;
             stats.trace_dur_ns = crate::runtime::market_trace::now_ns().saturating_sub(trace_start_ns);
         }

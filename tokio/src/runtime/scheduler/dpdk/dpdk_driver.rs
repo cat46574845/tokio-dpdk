@@ -865,26 +865,14 @@ impl DpdkDriver {
         #[cfg(feature = "market-trace")]
         let trace_flush_tx_before = self.device.has_pending_tx();
         #[cfg(feature = "market-trace")]
-        let flush_tx_before_start_ns = if trace_flush_tx_before {
-            crate::runtime::market_trace::now_ns()
-        } else {
-            0
-        };
+        let flush_tx_before_start_ns = crate::runtime::market_trace::now_ns();
         #[cfg(feature = "market-trace")]
-        let flush_tx_before_stats = if trace_flush_tx_before {
-            self.device.flush_tx_with_stats()
-        } else {
-            let _ = self.device.flush_tx();
-            Default::default()
-        };
+        let flush_tx_before_stats = self.device.flush_tx_with_stats();
         #[cfg(not(feature = "market-trace"))]
         let _ = self.device.flush_tx();
         #[cfg(feature = "market-trace")]
-        let flush_tx_before_dur_ns = if trace_flush_tx_before {
-            crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_before_start_ns)
-        } else {
-            0
-        };
+        let flush_tx_before_dur_ns =
+            crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_before_start_ns);
 
         // Drain the hardware RX queue at poll entry until rx_burst returns no
         // packets. The collected mbufs are then processed in NIC arrival order inside
@@ -916,10 +904,22 @@ impl DpdkDriver {
             self.gateway_neighbor_configured,
             &mut self.raw_tail_egress_handles,
         );
+        #[cfg(feature = "market-trace")]
+        let raw_tail_egress_queue_start_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns()
+        } else {
+            0
+        };
         for index in 0..self.raw_tail_egress_handles.len() {
             let handle = self.raw_tail_egress_handles[index];
             self.queue_egress_at(handle, smol_now);
         }
+        #[cfg(feature = "market-trace")]
+        let raw_tail_egress_queue_dur_ns = if trace_poll {
+            crate::runtime::market_trace::now_ns().saturating_sub(raw_tail_egress_queue_start_ns)
+        } else {
+            0
+        };
         #[cfg(feature = "market-trace")]
         let raw_tail_finish_dur_ns = if trace_poll {
             crate::runtime::market_trace::now_ns().saturating_sub(raw_tail_finish_start_ns)
@@ -1133,15 +1133,13 @@ impl DpdkDriver {
         };
         // Flush any new TX packets (e.g., ACKs, SYN-ACK)
         #[cfg(feature = "market-trace")]
-        let trace_flush_tx_after = trace_poll && self.device.has_pending_tx();
-        #[cfg(feature = "market-trace")]
-        let flush_tx_after_start_ns = if trace_flush_tx_after {
+        let flush_tx_after_start_ns = if trace_poll {
             crate::runtime::market_trace::now_ns()
         } else {
             0
         };
         #[cfg(feature = "market-trace")]
-        let flush_tx_after_stats = if trace_flush_tx_after {
+        let flush_tx_after_stats = if trace_poll {
             self.device.flush_tx_with_stats()
         } else {
             let _ = self.device.flush_tx();
@@ -1150,7 +1148,7 @@ impl DpdkDriver {
         #[cfg(not(feature = "market-trace"))]
         let _ = self.device.flush_tx();
         #[cfg(feature = "market-trace")]
-        let flush_tx_after_dur_ns = if trace_flush_tx_after {
+        let flush_tx_after_dur_ns = if trace_poll {
             crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_after_start_ns)
         } else {
             0
@@ -1167,9 +1165,21 @@ impl DpdkDriver {
         self.infra_errors_dirty |= self.device.errors_dirty()
             || self.raw_tail.errors_dirty()
             || self.gateway_probe_errors.is_dirty();
+        #[cfg(feature = "market-trace")]
+        let infra_error_start_ns = if trace_poll && self.infra_errors_dirty {
+            crate::runtime::market_trace::now_ns()
+        } else {
+            0
+        };
         if self.infra_errors_dirty {
             self.report_infra_errors(now);
         }
+        #[cfg(feature = "market-trace")]
+        let infra_error_dur_ns = if infra_error_start_ns != 0 {
+            crate::runtime::market_trace::now_ns().saturating_sub(infra_error_start_ns)
+        } else {
+            0
+        };
         #[cfg(feature = "market-trace")]
         if trace_poll {
             let poll_dur_ns = crate::runtime::market_trace::now_ns().saturating_sub(poll_start_ns);
@@ -1203,6 +1213,30 @@ impl DpdkDriver {
                         drain_rx_stats.smoltcp_pending,
                     ),
                 );
+                crate::runtime::market_trace::complete(
+                    drain_rx_stats.trace_start_ns,
+                    drain_rx_stats.rx_burst_dur_ns,
+                    crate::runtime::market_trace::SPAN_DPDK_RX_BURST,
+                    track_id,
+                    pack_trace_aux3(
+                        drain_rx_stats.rx_burst_calls,
+                        drain_rx_stats.received,
+                        0,
+                    ),
+                );
+                crate::runtime::market_trace::complete(
+                    drain_rx_stats
+                        .trace_start_ns
+                        .saturating_add(drain_rx_stats.rx_burst_dur_ns),
+                    drain_rx_stats.classify_dur_ns,
+                    crate::runtime::market_trace::SPAN_DPDK_RX_CLASSIFY,
+                    track_id,
+                    pack_trace_aux3(
+                        drain_rx_stats.received,
+                        drain_rx_stats.raw_tail_captured,
+                        drain_rx_stats.smoltcp_pending,
+                    ),
+                );
             }
             crate::runtime::market_trace::complete(
                 raw_tail_finish_start_ns,
@@ -1210,6 +1244,13 @@ impl DpdkDriver {
                 crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_FINISH,
                 track_id,
                 0,
+            );
+            crate::runtime::market_trace::complete(
+                raw_tail_egress_queue_start_ns,
+                raw_tail_egress_queue_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_EGRESS_QUEUE,
+                track_id,
+                self.raw_tail_egress_handles.len() as u64,
             );
             crate::runtime::market_trace::complete(
                 smoltcp_poll_start_ns,
@@ -1276,6 +1317,13 @@ impl DpdkDriver {
                     flush_tx_after_stats.total_packets,
                     flush_tx_after_stats.zero_retries,
                 ),
+            );
+            crate::runtime::market_trace::complete(
+                infra_error_start_ns,
+                infra_error_dur_ns,
+                crate::runtime::market_trace::SPAN_DPDK_INFRA_ERROR_REPORT,
+                track_id,
+                0,
             );
         }
         #[cfg(feature = "tail-ab")]

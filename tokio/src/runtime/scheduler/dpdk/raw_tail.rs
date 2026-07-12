@@ -865,10 +865,18 @@ impl RawTailTable {
         now: SmolInstant,
         sockets: &mut SocketSet<'static, LinearBuffer<'static>>,
     ) -> Result<ProcessedTail, PrepareError> {
+        #[cfg(feature = "market-trace")]
+        let track_id = crate::runtime::market_trace::dpdk_track(conn.handle.worker_index);
         let mbuf = conn
             .pending_mbuf
             .take()
             .expect("selected raw-tail slot must own one mbuf");
+        #[cfg(feature = "market-trace")]
+        let packet_parse_scope = crate::runtime::market_trace::scope(
+            crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_PACKET_PARSE,
+            track_id,
+            0,
+        );
         let parsed = parse_selected_tcp(&mbuf).ok_or(PrepareError::PacketParse)?;
         if !conn.tuple.matches_ingress(&parsed.ip_repr, &parsed.tcp_repr) {
             return Err(PrepareError::TupleMismatch);
@@ -879,9 +887,19 @@ impl RawTailTable {
         // remove_socket() detaches raw-tail before removing/recycling this
         // index, so this direct O(1) access remains the activated TCP socket.
         let socket = sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(socket_handle);
+        #[cfg(feature = "market-trace")]
+        drop(packet_parse_scope);
+        #[cfg(feature = "market-trace")]
+        let tcp_commit_scope = crate::runtime::market_trace::scope(
+            crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_TCP_COMMIT,
+            track_id,
+            parsed.tcp_repr.payload.len() as u64,
+        );
         let commit = socket
             .commit_lossy_tail(now, &parsed.tcp_repr)
             .map_err(|_| PrepareError::TcpState)?;
+        #[cfg(feature = "market-trace")]
+        drop(tcp_commit_scope);
 
         let tcp_seq = parsed.tcp_repr.seq_number.0 as u32;
         let connection_closed = commit.closed
@@ -916,6 +934,14 @@ impl RawTailTable {
         connection_closed: bool,
         selected: Option<SelectedRecordRange>,
     ) -> Option<ParserIssue> {
+        #[cfg(feature = "market-trace")]
+        let track_id = crate::runtime::market_trace::dpdk_track(conn.handle.worker_index);
+        #[cfg(feature = "market-trace")]
+        let locate_scope = crate::runtime::market_trace::scope(
+            crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_LOCATE,
+            track_id,
+            payload.len() as u64,
+        );
         let tail = match conn.scan_strategy {
             RawTailScanStrategy::Reverse => {
                 find_tail_aligned_tls_records(payload, usize::from(conn.tls_record_wire_min))
@@ -927,6 +953,8 @@ impl RawTailTable {
                 exact_record_ordinal: Some(selected.first_ordinal),
             }),
         };
+        #[cfg(feature = "market-trace")]
+        drop(locate_scope);
         let (records, record_count, record_tcp_seq) = match tail {
             Some(tls_tail) => (
                 &payload[tls_tail.offset..tls_tail.offset + tls_tail.len],
@@ -950,9 +978,25 @@ impl RawTailTable {
         // SAFETY: the pinned binding contract remains active, and `records`
         // cannot escape this synchronous HRTB call. The selected mbuf remains
         // owned by process_selected_tail until this call returns.
+        #[cfg(feature = "market-trace")]
+        let parser_scope = crate::runtime::market_trace::scope(
+            crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_PARSER,
+            track_id,
+            records.len() as u64,
+        );
         let disposition = unsafe { parser.parse(input) };
+        #[cfg(feature = "market-trace")]
+        drop(parser_scope);
         let disposition = latch_closed_disposition(disposition, connection_closed);
+        #[cfg(feature = "market-trace")]
+        let wake_scope = crate::runtime::market_trace::scope(
+            crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_WAKE,
+            track_id,
+            disposition as u64,
+        );
         conn.latch_parser_disposition(disposition);
+        #[cfg(feature = "market-trace")]
+        drop(wake_scope);
         None
     }
 
