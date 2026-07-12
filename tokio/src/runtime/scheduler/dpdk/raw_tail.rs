@@ -72,6 +72,9 @@ pub struct RawTailInput<'a> {
     pub packet_ordinal: u64,
     /// The selected TCP segment carried FIN/RST or closed smoltcp state.
     pub connection_closed: bool,
+    /// Exact record ordinal from the activation anchor when forward traversal
+    /// observed every intervening header. Reverse selection leaves this empty.
+    pub exact_record_ordinal: Option<u64>,
 }
 
 /// Packet/TLS framing strategy selected once when a raw-tail connection is activated.
@@ -306,6 +309,7 @@ struct TailConn {
     scan_strategy: RawTailScanStrategy,
     tls_record_wire_min: u16,
     next_tls_header_seq: u32,
+    jump_record_ordinal: u64,
     pending_records: Option<SelectedRecordRange>,
     #[cfg(feature = "tail-ab")]
     observed_tcp_end: u32,
@@ -316,6 +320,7 @@ struct SelectedRecordRange {
     offset: usize,
     len: usize,
     count: u16,
+    first_ordinal: u64,
 }
 
 impl TailConn {
@@ -481,6 +486,7 @@ impl RawTailTable {
             scan_strategy: RawTailScanStrategy::Reverse,
             tls_record_wire_min: TLS_HEADER_LEN as u16 + TLS_MIN_CIPHERTEXT_LEN as u16,
             next_tls_header_seq: 0,
+            jump_record_ordinal: 0,
             pending_records: None,
             #[cfg(feature = "tail-ab")]
             observed_tcp_end: 0,
@@ -575,6 +581,7 @@ impl RawTailTable {
         conn.scan_strategy = config.scan_strategy;
         conn.tls_record_wire_min = config.tls_record_wire_min;
         conn.next_tls_header_seq = config.tcp_anchor;
+        conn.jump_record_ordinal = 0;
         conn.pending_records = None;
         #[cfg(feature = "tail-ab")]
         {
@@ -917,6 +924,7 @@ impl RawTailTable {
                 offset: selected.offset,
                 len: selected.len,
                 record_count: selected.count,
+                exact_record_ordinal: Some(selected.first_ordinal),
             }),
         };
         let (records, record_count, record_tcp_seq) = match tail {
@@ -937,6 +945,7 @@ impl RawTailTable {
             record_count,
             packet_ordinal: conn.packet_ordinal,
             connection_closed,
+            exact_record_ordinal: tail.and_then(|tail| tail.exact_record_ordinal),
         };
         // SAFETY: the pinned binding contract remains active, and `records`
         // cannot escape this synchronous HRTB call. The selected mbuf remains
@@ -1068,10 +1077,12 @@ fn parse_selected_tcp(mbuf: &OwnedMbuf) -> Option<ParsedSelectedTcp<'_>> {
     })
 }
 
+#[derive(Clone, Copy)]
 struct TailAlignedTlsRecords {
     offset: usize,
     len: usize,
     record_count: u16,
+    exact_record_ordinal: Option<u64>,
 }
 
 #[inline(always)]
@@ -1105,6 +1116,7 @@ fn find_tail_aligned_tls_records(
             offset: 0,
             len: payload.len(),
             record_count: 1,
+            exact_record_ordinal: None,
         });
     }
     if payload.len() < tls_min_wire_len {
@@ -1123,6 +1135,7 @@ fn find_tail_aligned_tls_records(
                     offset,
                     len: record_len,
                     record_count: 1,
+                    exact_record_ordinal: None,
                 });
             }
         }
@@ -1209,13 +1222,19 @@ fn select_forward_tls_records_from_payload(
     let mut selected_start = None;
     let mut selected_end = 0usize;
     let mut selected_count = 0u16;
+    let mut selected_first_ordinal = 0u64;
     while let Some(record_len) = tls_record_len_at(payload, cursor) {
         let record_end = cursor + record_len;
         conn.next_tls_header_seq = packet_seq.wrapping_add(record_end as u32);
+        let record_ordinal = conn.jump_record_ordinal;
+        conn.jump_record_ordinal = conn.jump_record_ordinal.wrapping_add(1);
         if record_end > payload.len() {
             break;
         }
-        selected_start.get_or_insert(cursor);
+        if selected_start.is_none() {
+            selected_start = Some(cursor);
+            selected_first_ordinal = record_ordinal;
+        }
         selected_end = record_end;
         selected_count += 1;
         cursor = record_end;
@@ -1227,6 +1246,7 @@ fn select_forward_tls_records_from_payload(
         offset,
         len: selected_end - offset,
         count: selected_count,
+        first_ordinal: selected_first_ordinal,
     })
 }
 
@@ -1386,6 +1406,7 @@ mod tests {
                 record_count: 1,
                 packet_ordinal: 3,
                 connection_closed: false,
+                exact_record_ordinal: None,
             })
         };
         assert_eq!(disposition, RawTailParseDisposition::Ready);
@@ -1452,6 +1473,7 @@ mod tests {
         assert_eq!(selected.offset, 0);
         assert_eq!(selected.len, payload.len());
         assert_eq!(selected.count, 2);
+        assert_eq!(selected.first_ordinal, 0);
         assert_eq!(conn.next_tls_header_seq, 100 + payload.len() as u32);
 
         let split_start = conn.next_tls_header_seq;
@@ -1472,6 +1494,7 @@ mod tests {
         assert_eq!(selected.offset, 0);
         assert_eq!(selected.len, after_split.len());
         assert_eq!(selected.count, 1);
+        assert_eq!(selected.first_ordinal, 3);
     }
 
     #[test]
