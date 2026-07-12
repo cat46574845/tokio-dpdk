@@ -340,12 +340,12 @@ impl TailConn {
         u64::from(delta)
     }
 
-    fn latch_parser_disposition(&mut self, disposition: RawTailParseDisposition) -> bool {
+    fn latch_parser_disposition(&mut self, disposition: RawTailParseDisposition) {
         if !matches!(
             disposition,
             RawTailParseDisposition::Ready | RawTailParseDisposition::TerminalReady
         ) {
-            return false;
+            return;
         }
         self.publication_ready = true;
         if disposition == RawTailParseDisposition::TerminalReady {
@@ -354,7 +354,6 @@ impl TailConn {
         if let Some(waker) = self.receiver_waker.as_ref() {
             waker.wake_by_ref();
         }
-        true
     }
 }
 
@@ -382,7 +381,6 @@ struct ProcessedTail {
     socket_handle: SocketHandle,
     gateway_mac: EthernetAddress,
     parser_issue: Option<ParserIssue>,
-    publication_ready: bool,
 }
 
 /// Worker-local raw-tail registry and fixed-capacity selected-mbuf slots.
@@ -804,10 +802,9 @@ impl RawTailTable {
         sockets: &mut SocketSet<'static, LinearBuffer<'static>>,
         gateway_neighbor_configured: bool,
         egress_handles: &mut Vec<SocketHandle>,
-    ) -> (bool, bool) {
+    ) -> bool {
         egress_handles.clear();
         let mut observed_gateway = None;
-        let mut publication_ready = false;
         for pending_index in 0..self.pending_slots.len() {
             let slot = self.pending_slots[pending_index];
             let outcome = {
@@ -829,7 +826,6 @@ impl RawTailTable {
                         }
                         None => {}
                     }
-                    publication_ready |= processed.publication_ready;
                     egress_handles.push(processed.socket_handle);
                 }
                 Err(PrepareError::PacketParse) => {
@@ -861,7 +857,7 @@ impl RawTailTable {
             false
         };
         self.pending_slots.clear();
-        (gateway_observed, publication_ready)
+        gateway_observed
     }
 
     fn process_selected_tail(
@@ -912,7 +908,7 @@ impl RawTailTable {
             .parser
             .expect("active raw-tail connection must retain its parser binding");
         let selected = conn.pending_records.take();
-        let (parser_issue, publication_ready) = Self::dispatch_committed_payload(
+        let parser_issue = Self::dispatch_committed_payload(
             conn,
             parser,
             parsed.tcp_repr.payload,
@@ -924,7 +920,6 @@ impl RawTailTable {
             socket_handle,
             gateway_mac: parsed.eth_src,
             parser_issue,
-            publication_ready,
         };
         drop(parsed);
         drop(mbuf);
@@ -938,7 +933,7 @@ impl RawTailTable {
         tcp_seq: u32,
         connection_closed: bool,
         selected: Option<SelectedRecordRange>,
-    ) -> (Option<ParserIssue>, bool) {
+    ) -> Option<ParserIssue> {
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(conn.handle.worker_index);
         #[cfg(feature = "market-trace")]
@@ -970,10 +965,7 @@ impl RawTailTable {
         };
 
         if records.is_empty() && !connection_closed {
-            return (
-                (!payload.is_empty()).then_some(ParserIssue::TlsTailNotFound),
-                false,
-            );
+            return (!payload.is_empty()).then_some(ParserIssue::TlsTailNotFound);
         }
         let input = RawTailInput {
             tcp_seq: record_tcp_seq,
@@ -1002,10 +994,10 @@ impl RawTailTable {
             track_id,
             disposition as u64,
         );
-        let publication_ready = conn.latch_parser_disposition(disposition);
+        conn.latch_parser_disposition(disposition);
         #[cfg(feature = "market-trace")]
         drop(wake_scope);
-        (None, publication_ready)
+        None
     }
 
     pub(crate) fn poll_publication_ready(
@@ -1637,17 +1629,15 @@ mod tests {
         let committed_socket = {
             let conn = table.conns[slot].as_mut().unwrap();
             let parser = conn.parser.unwrap();
-            assert!(matches!(
-                RawTailTable::dispatch_committed_payload(
-                    conn,
-                    parser,
-                    &selected.payload,
-                    7,
-                    false,
-                    None,
-                ),
-                (None, true)
-            ));
+            assert!(RawTailTable::dispatch_committed_payload(
+                conn,
+                parser,
+                &selected.payload,
+                7,
+                false,
+                None,
+            )
+            .is_none());
             assert_eq!(&*events.borrow(), &["parser"]);
             conn.socket_handle.unwrap()
         };
@@ -1791,24 +1781,22 @@ mod tests {
                 false,
                 None,
             ),
-            (Some(ParserIssue::TlsTailNotFound), false)
+            Some(ParserIssue::TlsTailNotFound)
         ));
         assert!(conn.publication_ready);
         assert_eq!(probe.calls, 0);
         assert_eq!(wake_count.load(Ordering::Relaxed), 0);
 
         let record = tls_record(b"new but not publishable");
-        assert!(matches!(
-            RawTailTable::dispatch_committed_payload(
-                conn,
-                binding,
-                &record,
-                11,
-                false,
-                None,
-            ),
-            (None, false)
-        ));
+        assert!(RawTailTable::dispatch_committed_payload(
+            conn,
+            binding,
+            &record,
+            11,
+            false,
+            None,
+        )
+        .is_none());
         assert!(conn.publication_ready);
         assert_eq!(probe.calls, 1);
         assert_eq!(wake_count.load(Ordering::Relaxed), 0);
