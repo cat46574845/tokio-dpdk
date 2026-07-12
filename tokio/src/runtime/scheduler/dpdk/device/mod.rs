@@ -25,9 +25,6 @@ use super::raw_tail::{RawTailTable, RAW_TAIL_REQUIRED_RSS_HF};
 /// Default packets requested per rx_burst call.
 const RX_BURST_SIZE_DEFAULT: u16 = 256;
 
-/// Strict upper bound for application-owned mbufs awaiting one TX burst.
-const TX_PENDING_CAP: usize = 32;
-
 /// Default MTU (Maximum Transmission Unit)
 const DEFAULT_MTU: usize = 1500;
 
@@ -576,6 +573,8 @@ pub(crate) struct DpdkDevice {
     raw_tail_rss_key: Box<[u8]>,
     /// Pending transmit mbufs (buffered for batching)
     tx_buffer: Vec<*mut ffi::rte_mbuf>,
+    /// Strict startup-fixed upper bound for application-owned TX mbufs.
+    tx_pending_cap: usize,
     /// Received mbufs pending processing
     rx_pending: Vec<*mut ffi::rte_mbuf>,
     /// Current index into rx_pending
@@ -604,6 +603,7 @@ impl DpdkDevice {
         port_id: u16,
         queue_id: u16,
         mempool: *mut ffi::rte_mempool,
+        queue_descriptors: u16,
     ) -> io::Result<Self> {
         let raw_tail_rss_key = load_actual_rss_key(port_id)?;
         let rx_burst_size = configured_rx_burst_size();
@@ -632,7 +632,8 @@ impl DpdkDevice {
             queue_id,
             mempool,
             raw_tail_rss_key,
-            tx_buffer: Vec::with_capacity(TX_PENDING_CAP),
+            tx_buffer: Vec::with_capacity(queue_descriptors as usize),
+            tx_pending_cap: queue_descriptors as usize,
             rx_pending: Vec::with_capacity(rx_burst_len),
             rx_index: 0,
             rx_burst_buf: vec![ptr::null_mut(); rx_burst_len],
@@ -766,7 +767,7 @@ impl DpdkDevice {
         let total = self.tx_buffer.len();
         stats.total_packets = total;
         stats.burst_calls = 1;
-        // TX_PENDING_CAP is strictly below u16::MAX.
+        // The fixed pending capacity comes from the queue's u16 descriptor count.
         let sent = unsafe {
             dpdk_wrappers::tx_burst(
                 self.port_id,
@@ -813,7 +814,7 @@ impl DpdkDevice {
 
     #[inline(always)]
     fn try_reserve_tx_mbuf(&mut self) -> Option<PreparedTxMbuf> {
-        if self.tx_buffer.len() >= TX_PENDING_CAP {
+        if self.tx_buffer.len() >= self.tx_pending_cap {
             self.error_counters.record_tx_pending_full();
             return None;
         }
@@ -931,7 +932,7 @@ impl<'a> smoltcp::phy::TxToken for DpdkTxToken<'a> {
 
         let result = f(data);
 
-        debug_assert!(device.tx_buffer.len() < TX_PENDING_CAP);
+        debug_assert!(device.tx_buffer.len() < device.tx_pending_cap);
         device.tx_buffer.push(prepared.mbuf.into_raw());
 
         result

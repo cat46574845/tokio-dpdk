@@ -400,7 +400,14 @@ pub(crate) fn initialize_dpdk_from_plan(
         })?;
 
         // Create DpdkDevice with specific queue_id
-        let dpdk_device = unsafe { DpdkDevice::new(port_id, allocation.queue_id, mempool) }?;
+        let dpdk_device = unsafe {
+            DpdkDevice::new(
+                port_id,
+                allocation.queue_id,
+                mempool,
+                queue_descriptors,
+            )
+        }?;
 
         workers.push(InitializedWorker {
             device: dpdk_device,
