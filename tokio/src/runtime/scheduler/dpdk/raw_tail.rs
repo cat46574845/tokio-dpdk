@@ -307,7 +307,7 @@ struct TailConn {
 struct SelectedRecordRange {
     offset: usize,
     len: usize,
-    first_ordinal: u64,
+    exact_record_ordinal: Option<u64>,
 }
 
 impl TailConn {
@@ -693,7 +693,7 @@ impl RawTailTable {
         if self.active_count == 0 {
             return Err(mbuf);
         }
-        // This is the only packet access before selection: NIC RSS metadata.
+        // NIC RSS metadata is the first packet access before tail selection.
         let Some(rss_hash) = mbuf.rss_hash() else {
             return Err(mbuf);
         };
@@ -716,31 +716,14 @@ impl RawTailTable {
                 return Ok(());
             }
             conn.advance_packet_ordinal();
-            let jump_view = match conn.scan_strategy {
-                RawTailScanStrategy::ForwardJump => parse_jump_tcp_view(&mbuf),
-                RawTailScanStrategy::Reverse => {
-                    #[cfg(feature = "tail-ab")]
-                    {
-                        parse_jump_tcp_view(&mbuf)
-                    }
-                    #[cfg(not(feature = "tail-ab"))]
-                    {
-                        None
-                    }
-                }
-            };
+            let jump_view = parse_jump_tcp_view(&mbuf);
             let header_in_payload = jump_view.as_ref().is_some_and(|view| {
                 (conn.next_tls_header_seq.wrapping_sub(view.tcp_seq) as usize)
                     < view.payload.len()
             });
-            #[cfg(not(feature = "tail-ab"))]
-            let tuple_needed = header_in_payload;
-            #[cfg(feature = "tail-ab")]
-            let tuple_needed = true;
-            let tuple_matches = tuple_needed
-                && jump_view
-                    .as_ref()
-                    .is_some_and(|view| jump_view_matches_tuple(&conn.tuple, view));
+            let tuple_matches = jump_view
+                .as_ref()
+                .is_some_and(|view| jump_view_matches_tuple(&conn.tuple, view));
             #[cfg(feature = "tail-ab")]
             if tuple_matches {
                 let view = jump_view
@@ -749,21 +732,51 @@ impl RawTailTable {
                 let tcp_end = view.tcp_seq.wrapping_add(view.payload.len() as u32);
                 tcp_advance = conn.observe_tcp_end(tcp_end);
             }
-            conn.pending_records = match conn.scan_strategy {
+            #[cfg(feature = "market-trace")]
+            let locate_scope = crate::runtime::market_trace::scope(
+                crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_LOCATE,
+                crate::runtime::market_trace::dpdk_track(conn.handle.worker_index),
+                jump_view.as_ref().map_or(0, |view| view.payload.len()) as u64,
+            );
+            let selected = match conn.scan_strategy {
+                RawTailScanStrategy::Reverse if tuple_matches => jump_view
+                    .as_ref()
+                    .and_then(|view| {
+                        find_tail_aligned_tls_records(
+                            view.payload,
+                            usize::from(conn.tls_record_wire_min),
+                        )
+                    })
+                    .map(|selected| SelectedRecordRange {
+                        offset: selected.offset,
+                        len: selected.len,
+                        exact_record_ordinal: selected.exact_record_ordinal,
+                    }),
                 RawTailScanStrategy::Reverse => None,
                 RawTailScanStrategy::ForwardJump if header_in_payload && tuple_matches => {
-                    jump_view.and_then(|view| {
+                    jump_view.as_ref().and_then(|view| {
                         select_forward_tls_records_from_payload(conn, view.payload, view.tcp_seq)
                     })
                 }
                 RawTailScanStrategy::ForwardJump => None,
             };
-            let old = replace_latest(&mut conn.pending_mbuf, mbuf);
-            let old_was_none = old.is_none();
-            drop(old);
-            old_was_none
+            #[cfg(feature = "market-trace")]
+            drop(locate_scope);
+            let connection_closed = tuple_matches
+                && jump_view
+                    .as_ref()
+                    .is_some_and(|view| view.tcp[13] & 0x05 != 0);
+            if selected.is_none() && !connection_closed {
+                None
+            } else {
+                conn.pending_records = selected;
+                let old = replace_latest(&mut conn.pending_mbuf, mbuf);
+                let old_was_none = old.is_none();
+                drop(old);
+                Some(old_was_none)
+            }
         };
-        if old_was_none {
+        if old_was_none == Some(true) {
             self.pending_slots.push(slot);
         }
         #[cfg(feature = "tail-ab")]
@@ -929,26 +942,13 @@ impl RawTailTable {
         connection_closed: bool,
         selected: Option<SelectedRecordRange>,
     ) -> Option<ParserIssue> {
+        let tail = selected.map(|selected| TailAlignedTlsRecords {
+            offset: selected.offset,
+            len: selected.len,
+            exact_record_ordinal: selected.exact_record_ordinal,
+        });
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(conn.handle.worker_index);
-        #[cfg(feature = "market-trace")]
-        let locate_scope = crate::runtime::market_trace::scope(
-            crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_LOCATE,
-            track_id,
-            payload.len() as u64,
-        );
-        let tail = match conn.scan_strategy {
-            RawTailScanStrategy::Reverse => {
-                find_tail_aligned_tls_records(payload, usize::from(conn.tls_record_wire_min))
-            }
-            RawTailScanStrategy::ForwardJump => selected.map(|selected| TailAlignedTlsRecords {
-                offset: selected.offset,
-                len: selected.len,
-                exact_record_ordinal: Some(selected.first_ordinal),
-            }),
-        };
-        #[cfg(feature = "market-trace")]
-        drop(locate_scope);
         let (records, record_tcp_seq) = match tail {
             Some(tls_tail) => (
                 &payload[tls_tail.offset..tls_tail.offset + tls_tail.len],
@@ -1212,8 +1212,8 @@ struct JumpTcpView<'a> {
 }
 
 /// Read only the fixed L2/L3/L4 fields required to decide whether the next
-/// tracked record header can occur in this packet. ACK/window/flags/options
-/// remain untouched here; the selected drain tail is fully parsed once later.
+/// tracked record header can occur in this packet. Only FIN/RST is read from
+/// the TCP flags; ACK/window/options remain untouched until full tail parsing.
 #[inline(always)]
 fn parse_jump_tcp_view(mbuf: &OwnedMbuf) -> Option<JumpTcpView<'_>> {
     parse_jump_tcp_frame(mbuf.data()?)
@@ -1286,7 +1286,7 @@ fn select_forward_tls_records_from_payload(
             selected = Some(SelectedRecordRange {
                 offset: cursor,
                 len: record_len,
-                first_ordinal: record_ordinal,
+                exact_record_ordinal: Some(record_ordinal),
             });
         }
         cursor = record_end;
@@ -1542,7 +1542,7 @@ mod tests {
             .expect("the newest complete application record must be selected");
         assert_eq!(selected.offset, first.len());
         assert_eq!(selected.len, second.len());
-        assert_eq!(selected.first_ordinal, 1);
+        assert_eq!(selected.exact_record_ordinal, Some(1));
         assert_eq!(conn.next_tls_header_seq, 100 + payload.len() as u32);
 
         let split_start = conn.next_tls_header_seq;
@@ -1562,7 +1562,7 @@ mod tests {
         .expect("packet beginning at the jumped boundary must be selected");
         assert_eq!(selected.offset, 0);
         assert_eq!(selected.len, after_split.len());
-        assert_eq!(selected.first_ordinal, 3);
+        assert_eq!(selected.exact_record_ordinal, Some(3));
     }
 
     #[test]
@@ -1583,7 +1583,7 @@ mod tests {
             .expect("market record between controls must be selected");
         assert_eq!(selected.offset, control.len());
         assert_eq!(selected.len, market.len());
-        assert_eq!(selected.first_ordinal, 1);
+        assert_eq!(selected.exact_record_ordinal, Some(1));
         assert_eq!(conn.jump_record_ordinal, 3);
         assert_eq!(conn.next_tls_header_seq, 100 + payload.len() as u32);
 
@@ -1685,13 +1685,22 @@ mod tests {
         let committed_socket = {
             let conn = table.conns[slot].as_mut().unwrap();
             let parser = conn.parser.unwrap();
+            let selected_range = find_tail_aligned_tls_records(
+                &selected.payload,
+                TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN,
+            )
+            .map(|selected| SelectedRecordRange {
+                offset: selected.offset,
+                len: selected.len,
+                exact_record_ordinal: selected.exact_record_ordinal,
+            });
             assert!(RawTailTable::dispatch_committed_payload(
                 conn,
                 parser,
                 &selected.payload,
                 7,
                 false,
-                None,
+                selected_range,
             )
             .is_none());
             assert_eq!(&*events.borrow(), &["parser"]);
@@ -1878,13 +1887,22 @@ mod tests {
         assert_eq!(wake_count.load(Ordering::Relaxed), 0);
 
         let record = tls_record(b"new but not publishable");
+        let selected = find_tail_aligned_tls_records(
+            &record,
+            TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN,
+        )
+        .map(|selected| SelectedRecordRange {
+            offset: selected.offset,
+            len: selected.len,
+            exact_record_ordinal: selected.exact_record_ordinal,
+        });
         assert!(RawTailTable::dispatch_committed_payload(
             conn,
             binding,
             &record,
             11,
             false,
-            None,
+            selected,
         )
         .is_none());
         assert!(conn.publication_ready);
