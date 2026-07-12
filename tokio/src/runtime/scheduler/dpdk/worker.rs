@@ -1480,16 +1480,12 @@ impl Context {
             #[cfg(feature = "market-trace")]
             let sched_detail = crate::runtime::market_trace::sched_detail_enabled();
             #[cfg(feature = "market-trace")]
-            let poll_driver_outer_start_ns = if sched_detail {
-                crate::runtime::market_trace::now_ns()
-            } else {
-                0
-            };
+            let poll_driver_outer_start_ns = crate::runtime::market_trace::now_ns();
             let active = driver.poll(now);
             #[cfg(not(feature = "market-trace"))]
             let _ = active;
             #[cfg(feature = "market-trace")]
-            if sched_detail && active {
+            if active {
                 let poll_driver_outer_dur_ns = crate::runtime::market_trace::now_ns()
                     .saturating_sub(poll_driver_outer_start_ns);
                 crate::runtime::market_trace::complete(
