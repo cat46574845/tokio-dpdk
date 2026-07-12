@@ -169,6 +169,20 @@ impl RawTailTuple {
             && tcp.dst_port == self.local_port
     }
 
+    #[inline(always)]
+    fn matches_ingress_fields(
+        &self,
+        remote_ip: Ipv4Addr,
+        local_ip: Ipv4Addr,
+        remote_port: u16,
+        local_port: u16,
+    ) -> bool {
+        self.remote_ip == remote_ip
+            && self.local_ip == local_ip
+            && self.remote_port == remote_port
+            && self.local_port == local_port
+    }
+
     pub(crate) fn rss_hash(&self, rss_key: &[u8]) -> u32 {
         let mut tuple = [0u8; 12];
         tuple[..4].copy_from_slice(&self.remote_ip.octets());
@@ -293,6 +307,8 @@ struct TailConn {
     tls_record_wire_min: u16,
     next_tls_header_seq: u32,
     pending_records: Option<SelectedRecordRange>,
+    #[cfg(feature = "tail-ab")]
+    observed_tcp_end: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -306,6 +322,17 @@ impl TailConn {
     #[inline(always)]
     fn advance_packet_ordinal(&mut self) {
         self.packet_ordinal = self.packet_ordinal.wrapping_add(1);
+    }
+
+    #[cfg(feature = "tail-ab")]
+    #[inline(always)]
+    fn observe_tcp_end(&mut self, tcp_end: u32) -> u64 {
+        let delta = tcp_end.wrapping_sub(self.observed_tcp_end);
+        if delta == 0 || delta >= (1u32 << 31) {
+            return 0;
+        }
+        self.observed_tcp_end = tcp_end;
+        u64::from(delta)
     }
 
     fn latch_parser_disposition(&mut self, disposition: RawTailParseDisposition) {
@@ -364,6 +391,8 @@ pub(crate) struct RawTailTable {
     active_count: usize,
     errors: RawTailErrorCounters,
     errors_dirty: bool,
+    #[cfg(feature = "tail-ab")]
+    poll_tcp_advance_sum: u64,
 }
 
 // SAFETY: DpdkDriver transfers this table only as part of its process-lifetime
@@ -388,6 +417,8 @@ impl RawTailTable {
             active_count: 0,
             errors: RawTailErrorCounters::default(),
             errors_dirty: false,
+            #[cfg(feature = "tail-ab")]
+            poll_tcp_advance_sum: 0,
         }
     }
 
@@ -451,6 +482,8 @@ impl RawTailTable {
             tls_record_wire_min: TLS_HEADER_LEN as u16 + TLS_MIN_CIPHERTEXT_LEN as u16,
             next_tls_header_seq: 0,
             pending_records: None,
+            #[cfg(feature = "tail-ab")]
+            observed_tcp_end: 0,
         };
         if slot == self.conns.len() {
             self.conns.push(Some(conn));
@@ -543,6 +576,10 @@ impl RawTailTable {
         conn.tls_record_wire_min = config.tls_record_wire_min;
         conn.next_tls_header_seq = config.tcp_anchor;
         conn.pending_records = None;
+        #[cfg(feature = "tail-ab")]
+        {
+            conn.observed_tcp_end = config.tcp_anchor;
+        }
         self.socket_to_slot[socket_index] = Some(slot);
         self.active_count += 1;
         Ok(())
@@ -666,6 +703,8 @@ impl RawTailTable {
         let Some(slot) = self.rss_to_slot.get(rss_hash) else {
             return Err(mbuf);
         };
+        #[cfg(feature = "tail-ab")]
+        let mut tcp_advance = 0u64;
         let old_was_none = {
             let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
                 return Err(mbuf);
@@ -680,11 +719,47 @@ impl RawTailTable {
                 return Ok(());
             }
             conn.advance_packet_ordinal();
+            let jump_view = match conn.scan_strategy {
+                RawTailScanStrategy::ForwardJump => parse_jump_tcp_view(&mbuf),
+                RawTailScanStrategy::Reverse => {
+                    #[cfg(feature = "tail-ab")]
+                    {
+                        parse_jump_tcp_view(&mbuf)
+                    }
+                    #[cfg(not(feature = "tail-ab"))]
+                    {
+                        None
+                    }
+                }
+            };
+            let header_in_payload = jump_view.as_ref().is_some_and(|view| {
+                (conn.next_tls_header_seq.wrapping_sub(view.tcp_seq) as usize)
+                    < view.payload.len()
+            });
+            #[cfg(not(feature = "tail-ab"))]
+            let tuple_needed = header_in_payload;
+            #[cfg(feature = "tail-ab")]
+            let tuple_needed = true;
+            let tuple_matches = tuple_needed
+                && jump_view
+                    .as_ref()
+                    .is_some_and(|view| jump_view_matches_tuple(&conn.tuple, view));
+            #[cfg(feature = "tail-ab")]
+            if tuple_matches {
+                let view = jump_view
+                    .as_ref()
+                    .expect("matched jump view must remain available in this RX iteration");
+                let tcp_end = view.tcp_seq.wrapping_add(view.payload.len() as u32);
+                tcp_advance = conn.observe_tcp_end(tcp_end);
+            }
             conn.pending_records = match conn.scan_strategy {
                 RawTailScanStrategy::Reverse => None,
-                RawTailScanStrategy::ForwardJump => {
-                    select_forward_tls_records(conn, &mbuf)
+                RawTailScanStrategy::ForwardJump if header_in_payload && tuple_matches => {
+                    jump_view.and_then(|view| {
+                        select_forward_tls_records_from_payload(conn, view.payload, view.tcp_seq)
+                    })
                 }
+                RawTailScanStrategy::ForwardJump => None,
             };
             let old = replace_latest(&mut conn.pending_mbuf, mbuf);
             let old_was_none = old.is_none();
@@ -694,7 +769,19 @@ impl RawTailTable {
         if old_was_none {
             self.pending_slots.push(slot);
         }
+        #[cfg(feature = "tail-ab")]
+        {
+            self.poll_tcp_advance_sum += tcp_advance;
+        }
         Ok(())
+    }
+
+    #[cfg(feature = "tail-ab")]
+    #[inline(always)]
+    pub(crate) fn take_poll_tcp_advance_sum(&mut self) -> u64 {
+        let total = self.poll_tcp_advance_sum;
+        self.poll_tcp_advance_sum = 0;
+        total
     }
 
     /// Commit every selected TCP tail and synchronously invoke its parser while
@@ -1044,13 +1131,67 @@ fn find_tail_aligned_tls_records(
 }
 
 #[inline(always)]
-fn select_forward_tls_records(conn: &mut TailConn, mbuf: &OwnedMbuf) -> Option<SelectedRecordRange> {
-    let parsed = parse_selected_tcp(mbuf)?;
-    if !conn.tuple.matches_ingress(&parsed.ip_repr, &parsed.tcp_repr) {
+fn jump_view_matches_tuple(tuple: &RawTailTuple, view: &JumpTcpView<'_>) -> bool {
+    tuple.matches_ingress_fields(
+        Ipv4Addr::new(view.ip[12], view.ip[13], view.ip[14], view.ip[15]),
+        Ipv4Addr::new(view.ip[16], view.ip[17], view.ip[18], view.ip[19]),
+        u16::from_be_bytes([view.tcp[0], view.tcp[1]]),
+        u16::from_be_bytes([view.tcp[2], view.tcp[3]]),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct JumpTcpView<'a> {
+    ip: &'a [u8],
+    tcp: &'a [u8],
+    tcp_seq: u32,
+    payload: &'a [u8],
+}
+
+/// Read only the fixed L2/L3/L4 fields required to decide whether the next
+/// tracked record header can occur in this packet. ACK/window/flags/options
+/// remain untouched here; the selected drain tail is fully parsed once later.
+#[inline(always)]
+fn parse_jump_tcp_view(mbuf: &OwnedMbuf) -> Option<JumpTcpView<'_>> {
+    const ETHERNET_HEADER_LEN: usize = 14;
+    const IPV4_ETHERTYPE: u16 = 0x0800;
+    const TCP_PROTOCOL: u8 = 6;
+    const MIN_IPV4_HEADER_LEN: usize = 20;
+    const MIN_TCP_HEADER_LEN: usize = 20;
+
+    let frame = mbuf.data()?;
+    if frame.len() < ETHERNET_HEADER_LEN + MIN_IPV4_HEADER_LEN {
         return None;
     }
-    let packet_seq = parsed.tcp_repr.seq_number.0 as u32;
-    select_forward_tls_records_from_payload(conn, parsed.tcp_repr.payload, packet_seq)
+    if u16::from_be_bytes([frame[12], frame[13]]) != IPV4_ETHERTYPE {
+        return None;
+    }
+    let ip = &frame[ETHERNET_HEADER_LEN..];
+    if ip[0] >> 4 != 4 {
+        return None;
+    }
+    let ip_header_len = usize::from(ip[0] & 0x0f) * 4;
+    if ip_header_len < MIN_IPV4_HEADER_LEN || ip.len() < ip_header_len + MIN_TCP_HEADER_LEN {
+        return None;
+    }
+    let ip_total_len = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+    if ip_total_len < ip_header_len + MIN_TCP_HEADER_LEN || ip_total_len > ip.len() {
+        return None;
+    }
+    if ip[9] != TCP_PROTOCOL {
+        return None;
+    }
+    let tcp = &ip[ip_header_len..ip_total_len];
+    let tcp_header_len = usize::from(tcp[12] >> 4) * 4;
+    if tcp_header_len < MIN_TCP_HEADER_LEN || tcp_header_len > tcp.len() {
+        return None;
+    }
+    Some(JumpTcpView {
+        ip,
+        tcp,
+        tcp_seq: u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
+        payload: &tcp[tcp_header_len..],
+    })
 }
 
 #[inline(always)]
@@ -1217,6 +1358,20 @@ mod tests {
         assert_eq!(conn.packet_ordinal, u64::MAX);
         conn.advance_packet_ordinal();
         assert_eq!(conn.packet_ordinal, 0);
+    }
+
+    #[cfg(feature = "tail-ab")]
+    #[test]
+    fn tcp_end_state_counts_only_forward_sequence_advance() {
+        let mut table = RawTailTable::new(test_owner(0), &RAW_TAIL_RSS_KEY);
+        let handle = table.register(tuple(443)).expect("reservation must succeed");
+        let slot = table.slot_for_handle(handle).unwrap();
+        let conn = table.conns[slot].as_mut().unwrap();
+        conn.observed_tcp_end = 100;
+        assert_eq!(conn.observe_tcp_end(140), 40);
+        assert_eq!(conn.observe_tcp_end(120), 0);
+        assert_eq!(conn.observe_tcp_end(140), 0);
+        assert_eq!(conn.observe_tcp_end(175), 35);
     }
 
     #[test]
@@ -1551,7 +1706,14 @@ mod tests {
         conn.receiver_waker = Some(Waker::from(Arc::new(CountWake(wake_count.clone()))));
 
         assert!(matches!(
-            RawTailTable::dispatch_committed_payload(conn, binding, b"not tls", 10, false, None),
+            RawTailTable::dispatch_committed_payload(
+                conn,
+                binding,
+                b"not tls",
+                10,
+                false,
+                None,
+            ),
             Some(ParserIssue::TlsTailNotFound)
         ));
         assert!(conn.publication_ready);

@@ -40,6 +40,26 @@ use crate::task::JoinHandle;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::io;
 
+#[cfg(feature = "tail-ab")]
+type TailAbHook = fn(usize, u64, u64);
+#[cfg(feature = "tail-ab")]
+static TAIL_AB_HOOK: std::sync::OnceLock<TailAbHook> = std::sync::OnceLock::new();
+
+/// Install the fixed A/B sample sink before the runtime starts polling.
+#[cfg(feature = "tail-ab")]
+pub fn set_tail_ab_hook(hook: TailAbHook) -> Result<(), TailAbHook> {
+    TAIL_AB_HOOK.set(hook)
+}
+
+#[cfg(feature = "tail-ab")]
+#[inline(always)]
+pub(crate) fn record_tail_ab(worker_index: usize, tcp_advance_sum: u64, driver_ns: u64) {
+    let hook = TAIL_AB_HOOK
+        .get()
+        .expect("tail_ab hook must be installed before DPDK polling starts");
+    hook(worker_index, tcp_advance_sum, driver_ns);
+}
+
 pub use crate::runtime::scheduler::dpdk::{
     RawTailHandle, RawTailInput, RawTailParseDisposition, RawTailParserBinding,
     RawTailParserConfig, RawTailScanStrategy,

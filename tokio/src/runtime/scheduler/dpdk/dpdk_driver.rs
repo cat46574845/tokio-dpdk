@@ -1278,6 +1278,17 @@ impl DpdkDriver {
                 ),
             );
         }
+        #[cfg(feature = "tail-ab")]
+        {
+            let tcp_advance_sum = self.raw_tail.take_poll_tcp_advance_sum();
+            if tcp_advance_sum != 0 {
+                crate::runtime::dpdk::record_tail_ab(
+                    self.worker_index,
+                    tcp_advance_sum,
+                    now.elapsed().as_nanos() as u64,
+                );
+            }
+        }
         active
     }
 
