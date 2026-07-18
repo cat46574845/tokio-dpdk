@@ -18,6 +18,7 @@ const RAW_TAIL_RSS_MAP_CAP: usize = RAW_TAIL_CONNECTION_CAP * 4;
 const TLS_HEADER_LEN: usize = 5;
 const TLS_MIN_CIPHERTEXT_LEN: usize = 17;
 const TLS_MAX_CIPHERTEXT_LEN: usize = 16_640;
+const TLS_MAX_WIRE_LEN: usize = TLS_HEADER_LEN + TLS_MAX_CIPHERTEXT_LEN;
 pub(crate) const RAW_TAIL_REQUIRED_RSS_HF: u64 = 1u64 << 4;
 
 pub(crate) const RAW_TAIL_RSS_KEY: [u8; 40] = [
@@ -289,7 +290,7 @@ struct TailConn {
     rss_hash: u32,
     socket_handle: Option<SocketHandle>,
     parser: Option<RawTailParserBinding>,
-    pending_mbuf: Option<OwnedMbuf>,
+    pending_mbufs: Vec<OwnedMbuf>,
     receiver_waker: Option<Waker>,
     packet_ordinal: u64,
     publication_ready: bool,
@@ -299,14 +300,27 @@ struct TailConn {
     next_tls_header_seq: u32,
     jump_record_ordinal: u64,
     pending_records: Option<SelectedRecordRange>,
+    pending_split: Option<PendingSplitRecord>,
+    completed_split: Option<PendingSplitRecord>,
+    connection_closed: bool,
+    terminal_mbuf_index: Option<usize>,
     #[cfg(feature = "tail-ab")]
     observed_tcp_end: u32,
 }
 
 #[derive(Clone, Copy)]
 struct SelectedRecordRange {
+    mbuf_index: usize,
     offset: usize,
     len: usize,
+    tcp_seq: u32,
+    exact_record_ordinal: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingSplitRecord {
+    len: usize,
+    tcp_seq: u32,
     exact_record_ordinal: Option<u64>,
 }
 
@@ -371,6 +385,38 @@ struct ProcessedTail {
     socket_handle: SocketHandle,
     gateway_mac: EthernetAddress,
     parser_issue: Option<ParserIssue>,
+}
+
+enum PreparedRecord {
+    Direct(SelectedRecordRange),
+    Scratch {
+        mbuf_index: usize,
+        tcp_seq: u32,
+        len: usize,
+        exact_record_ordinal: Option<u64>,
+    },
+}
+
+impl PreparedRecord {
+    fn mbuf_index(&self) -> usize {
+        match self {
+            Self::Direct(selected) => selected.mbuf_index,
+            Self::Scratch { mbuf_index, .. } => *mbuf_index,
+        }
+    }
+
+    fn tcp_seq(&self) -> u32 {
+        match self {
+            Self::Direct(selected) => selected.tcp_seq,
+            Self::Scratch { tcp_seq, .. } => *tcp_seq,
+        }
+    }
+}
+
+struct AssembledRecord {
+    mbuf_index: usize,
+    tcp_seq: u32,
+    len: usize,
 }
 
 /// Worker-local raw-tail registry and fixed-capacity selected-mbuf slots.
@@ -468,7 +514,7 @@ impl RawTailTable {
             rss_hash,
             socket_handle: None,
             parser: None,
-            pending_mbuf: None,
+            pending_mbufs: Vec::with_capacity(16),
             receiver_waker: None,
             packet_ordinal: 0,
             publication_ready: false,
@@ -478,6 +524,10 @@ impl RawTailTable {
             next_tls_header_seq: 0,
             jump_record_ordinal: 0,
             pending_records: None,
+            pending_split: None,
+            completed_split: None,
+            connection_closed: false,
+            terminal_mbuf_index: None,
             #[cfg(feature = "tail-ab")]
             observed_tcp_end: 0,
         };
@@ -573,6 +623,10 @@ impl RawTailTable {
         conn.next_tls_header_seq = config.tcp_anchor;
         conn.jump_record_ordinal = 0;
         conn.pending_records = None;
+        conn.pending_split = None;
+        conn.completed_split = None;
+        conn.connection_closed = false;
+        conn.terminal_mbuf_index = None;
         #[cfg(feature = "tail-ab")]
         {
             conn.observed_tcp_end = config.tcp_anchor;
@@ -665,8 +719,12 @@ impl RawTailTable {
             conn.publication_ready = false;
             conn.terminal_ready = false;
             let receiver_waker = conn.receiver_waker.take();
-            conn.pending_mbuf = None;
+            conn.pending_mbufs.clear();
             conn.pending_records = None;
+            conn.pending_split = None;
+            conn.completed_split = None;
+            conn.connection_closed = false;
+            conn.terminal_mbuf_index = None;
             (was_active, receiver_waker)
         };
         if was_active {
@@ -702,7 +760,7 @@ impl RawTailTable {
         };
         #[cfg(feature = "tail-ab")]
         let mut tcp_advance = 0u64;
-        let old_was_none = {
+        let first_for_flow = {
             let Some(conn) = self.conns.get_mut(slot).and_then(|conn| conn.as_mut()) else {
                 return Err(mbuf);
             };
@@ -738,6 +796,7 @@ impl RawTailTable {
                 crate::runtime::market_trace::dpdk_track(conn.handle.worker_index),
                 jump_view.as_ref().map_or(0, |view| view.payload.len()) as u64,
             );
+            let mbuf_index = conn.pending_mbufs.len();
             let selected = match conn.scan_strategy {
                 RawTailScanStrategy::Reverse if tuple_matches => jump_view
                     .as_ref()
@@ -746,37 +805,58 @@ impl RawTailTable {
                             view.payload,
                             usize::from(conn.tls_record_wire_min),
                         )
-                    })
-                    .map(|selected| SelectedRecordRange {
-                        offset: selected.offset,
-                        len: selected.len,
-                        exact_record_ordinal: selected.exact_record_ordinal,
+                        .map(|selected| SelectedRecordRange {
+                            mbuf_index,
+                            offset: selected.offset,
+                            len: selected.len,
+                            tcp_seq: view.tcp_seq.wrapping_add(selected.offset as u32),
+                            exact_record_ordinal: selected.exact_record_ordinal,
+                        })
                     }),
                 RawTailScanStrategy::Reverse => None,
                 RawTailScanStrategy::ForwardJump if header_in_payload && tuple_matches => {
                     jump_view.as_ref().and_then(|view| {
-                        select_forward_tls_records_from_payload(conn, view.payload, view.tcp_seq)
+                        select_forward_tls_records_from_payload(
+                            conn,
+                            view.payload,
+                            view.tcp_seq,
+                            mbuf_index,
+                        )
                     })
                 }
                 RawTailScanStrategy::ForwardJump => None,
             };
+            if conn.scan_strategy == RawTailScanStrategy::Reverse && tuple_matches {
+                let view = jump_view
+                    .as_ref()
+                    .expect("matched jump view must remain available in this RX iteration");
+                observe_reverse_split(conn, view.payload, view.tcp_seq);
+            }
             #[cfg(feature = "market-trace")]
             drop(locate_scope);
             let connection_closed = tuple_matches
                 && jump_view
                     .as_ref()
                     .is_some_and(|view| view.tcp[13] & 0x05 != 0);
-            if selected.is_none() && !connection_closed {
-                None
-            } else {
-                conn.pending_records = selected;
-                let old = replace_latest(&mut conn.pending_mbuf, mbuf);
-                let old_was_none = old.is_none();
-                drop(old);
-                Some(old_was_none)
+            let has_payload = tuple_matches
+                && jump_view
+                    .as_ref()
+                    .is_some_and(|view| !view.payload.is_empty());
+            if !has_payload && !connection_closed {
+                return Ok(());
             }
+            let first_for_flow = conn.pending_mbufs.is_empty();
+            conn.pending_mbufs.push(mbuf);
+            if let Some(selected) = selected {
+                conn.pending_records = Some(selected);
+            }
+            if connection_closed {
+                conn.connection_closed = true;
+                conn.terminal_mbuf_index = Some(mbuf_index);
+            }
+            first_for_flow
         };
-        if old_was_none == Some(true) {
+        if first_for_flow {
             self.pending_slots.push(slot);
         }
         #[cfg(feature = "tail-ab")]
@@ -808,16 +888,17 @@ impl RawTailTable {
     ) -> bool {
         egress_handles.clear();
         let mut observed_gateway = None;
+        let mut scratch = [0u8; TLS_MAX_WIRE_LEN];
         for pending_index in 0..self.pending_slots.len() {
             let slot = self.pending_slots[pending_index];
             let outcome = {
                 let conn = self.conns[slot]
                     .as_mut()
                     .expect("pending raw-tail slot must contain a connection");
-                Self::process_selected_tail(conn, now, sockets)
+                Self::process_selected_tail(conn, now, sockets, &mut scratch)
             };
             match outcome {
-                Ok(processed) => {
+                Ok(Some(processed)) => {
                     if observed_gateway.is_none() {
                         observed_gateway = Some(processed.gateway_mac);
                     }
@@ -831,6 +912,7 @@ impl RawTailTable {
                     }
                     egress_handles.push(processed.socket_handle);
                 }
+                Ok(None) => {}
                 Err(PrepareError::PacketParse) => {
                     self.errors.packet_parse_failed =
                         self.errors.packet_parse_failed.saturating_add(1);
@@ -867,13 +949,30 @@ impl RawTailTable {
         conn: &mut TailConn,
         now: SmolInstant,
         sockets: &mut SocketSet<'static, LinearBuffer<'static>>,
-    ) -> Result<ProcessedTail, PrepareError> {
+        scratch: &mut [u8; TLS_MAX_WIRE_LEN],
+    ) -> Result<Option<ProcessedTail>, PrepareError> {
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(conn.handle.worker_index);
-        let mbuf = conn
-            .pending_mbuf
-            .take()
-            .expect("selected raw-tail slot must own one mbuf");
+        let mbufs = std::mem::take(&mut conn.pending_mbufs);
+        let selected = conn.pending_records.take();
+        let pending_split = conn.pending_split.take();
+        let completed_split = conn.completed_split.take();
+        let connection_closed = std::mem::take(&mut conn.connection_closed);
+        let terminal_mbuf_index = conn.terminal_mbuf_index.take();
+
+        let prepared =
+            select_prepared_record(selected, completed_split, pending_split, &mbufs, scratch);
+        let mbuf_index = prepared
+            .as_ref()
+            .map(PreparedRecord::mbuf_index)
+            .or(terminal_mbuf_index);
+        let Some(mbuf_index) = mbuf_index else {
+            let mut mbufs = mbufs;
+            mbufs.clear();
+            conn.pending_mbufs = mbufs;
+            return Ok(None);
+        };
+        let mbuf = &mbufs[mbuf_index];
         #[cfg(feature = "market-trace")]
         let packet_parse_scope = crate::runtime::market_trace::scope(
             crate::runtime::market_trace::SPAN_DPDK_RAW_TAIL_PACKET_PARSE,
@@ -910,62 +1009,74 @@ impl RawTailTable {
         drop(tcp_commit_scope);
 
         let tcp_seq = parsed.tcp_repr.seq_number.0 as u32;
-        let connection_closed = commit.closed
+        let connection_closed = connection_closed
+            || commit.closed
             || matches!(parsed.tcp_repr.control, TcpControl::Fin | TcpControl::Rst);
         let parser = conn
             .parser
             .expect("active raw-tail connection must retain its parser binding");
-        let selected = conn.pending_records.take();
-        let parser_issue = Self::dispatch_committed_payload(
-            conn,
-            parser,
-            parsed.tcp_repr.payload,
-            tcp_seq,
-            connection_closed,
-            selected,
-        );
+        let parser_issue = match prepared {
+            Some(PreparedRecord::Direct(selected)) => Self::dispatch_committed_records(
+                conn,
+                parser,
+                &parsed.tcp_repr.payload[selected.offset..selected.offset + selected.len],
+                selected.tcp_seq,
+                connection_closed,
+                selected.exact_record_ordinal,
+            ),
+            Some(PreparedRecord::Scratch {
+                tcp_seq,
+                len,
+                exact_record_ordinal,
+                ..
+            }) => Self::dispatch_committed_records(
+                conn,
+                parser,
+                &scratch[..len],
+                tcp_seq,
+                connection_closed,
+                exact_record_ordinal,
+            ),
+            None => Self::dispatch_committed_records(
+                conn,
+                parser,
+                &[],
+                tcp_seq,
+                connection_closed,
+                None,
+            ),
+        };
         let processed = ProcessedTail {
             socket_handle,
             gateway_mac: parsed.eth_src,
             parser_issue,
         };
         drop(parsed);
-        drop(mbuf);
-        Ok(processed)
+        let mut mbufs = mbufs;
+        mbufs.clear();
+        conn.pending_mbufs = mbufs;
+        Ok(Some(processed))
     }
 
-    fn dispatch_committed_payload(
+    fn dispatch_committed_records(
         conn: &mut TailConn,
         parser: RawTailParserBinding,
-        payload: &[u8],
+        records: &[u8],
         tcp_seq: u32,
         connection_closed: bool,
-        selected: Option<SelectedRecordRange>,
+        exact_record_ordinal: Option<u64>,
     ) -> Option<ParserIssue> {
-        let tail = selected.map(|selected| TailAlignedTlsRecords {
-            offset: selected.offset,
-            len: selected.len,
-            exact_record_ordinal: selected.exact_record_ordinal,
-        });
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(conn.handle.worker_index);
-        let (records, record_tcp_seq) = match tail {
-            Some(tls_tail) => (
-                &payload[tls_tail.offset..tls_tail.offset + tls_tail.len],
-                tcp_seq.wrapping_add(tls_tail.offset as u32),
-            ),
-            None => (&payload[payload.len()..], tcp_seq),
-        };
-
         if records.is_empty() && !connection_closed {
-            return (!payload.is_empty()).then_some(ParserIssue::TlsTailNotFound);
+            return Some(ParserIssue::TlsTailNotFound);
         }
         let input = RawTailInput {
-            tcp_seq: record_tcp_seq,
+            tcp_seq,
             records,
             packet_ordinal: conn.packet_ordinal,
             connection_closed,
-            exact_record_ordinal: tail.and_then(|tail| tail.exact_record_ordinal),
+            exact_record_ordinal,
         };
         // SAFETY: the pinned binding contract remains active, and `records`
         // cannot escape this synchronous HRTB call. The selected mbuf remains
@@ -1033,7 +1144,7 @@ impl RawTailTable {
     pub(crate) fn release_pending_mbufs_for_shutdown(&mut self) {
         self.pending_slots.clear();
         for conn in self.conns.iter_mut().flatten() {
-            drop(conn.pending_mbuf.take());
+            conn.pending_mbufs.clear();
         }
     }
 
@@ -1055,6 +1166,7 @@ impl RawTailTable {
 }
 
 #[inline(always)]
+#[cfg(test)]
 fn replace_latest<T>(slot: &mut Option<T>, latest: T) -> Option<T> {
     std::mem::replace(slot, Some(latest))
 }
@@ -1261,15 +1373,138 @@ fn parse_jump_tcp_frame(frame: &[u8]) -> Option<JumpTcpView<'_>> {
     })
 }
 
+fn select_prepared_record(
+    selected: Option<SelectedRecordRange>,
+    completed_split: Option<PendingSplitRecord>,
+    pending_split: Option<PendingSplitRecord>,
+    mbufs: &[OwnedMbuf],
+    scratch: &mut [u8; TLS_MAX_WIRE_LEN],
+) -> Option<PreparedRecord> {
+    let direct = selected.map(PreparedRecord::Direct);
+    let mut splits = [completed_split, pending_split];
+    for _ in 0..splits.len() {
+        let newest_index = match (splits[0], splits[1]) {
+            (Some(first), Some(second)) => usize::from(
+                second.tcp_seq.wrapping_sub(first.tcp_seq) as i32 >= 0,
+            ),
+            (Some(_), None) => 0,
+            (None, Some(_)) => 1,
+            (None, None) => break,
+        };
+        let split = splits[newest_index]
+            .take()
+            .expect("selected split slot must remain populated");
+        if direct
+            .as_ref()
+            .is_some_and(|record| record.tcp_seq().wrapping_sub(split.tcp_seq) as i32 > 0)
+        {
+            return direct;
+        }
+        let Some(assembled) = assemble_split_record(mbufs, split, scratch) else {
+            continue;
+        };
+        return Some(PreparedRecord::Scratch {
+            mbuf_index: assembled.mbuf_index,
+            tcp_seq: assembled.tcp_seq,
+            len: assembled.len,
+            exact_record_ordinal: split.exact_record_ordinal,
+        });
+    }
+    direct
+}
+
+fn assemble_split_record(
+    mbufs: &[OwnedMbuf],
+    split: PendingSplitRecord,
+    scratch: &mut [u8; TLS_MAX_WIRE_LEN],
+) -> Option<AssembledRecord> {
+    scratch[..split.len].fill(0);
+    let mut assembled_end = 0usize;
+    let mut mbuf_index = None;
+    for (index, mbuf) in mbufs.iter().enumerate() {
+        let view = parse_jump_tcp_view(mbuf)?;
+        let relative = view.tcp_seq.wrapping_sub(split.tcp_seq) as i32 as i64;
+        let source_start = relative.saturating_neg().max(0) as usize;
+        if source_start >= view.payload.len() {
+            continue;
+        }
+        let target_start = relative.max(0) as usize;
+        if target_start >= split.len {
+            continue;
+        }
+        let take = (view.payload.len() - source_start).min(split.len - target_start);
+        scratch[target_start..target_start + take]
+            .copy_from_slice(&view.payload[source_start..source_start + take]);
+        assembled_end = assembled_end.max(target_start + take);
+        mbuf_index = Some(index);
+    }
+    if assembled_end != split.len {
+        return None;
+    }
+    Some(AssembledRecord {
+        mbuf_index: mbuf_index?,
+        tcp_seq: split.tcp_seq,
+        len: split.len,
+    })
+}
+
+fn latest_incomplete_tls_start(payload: &[u8]) -> Option<usize> {
+    let mut search_end = payload.len();
+    while search_end != 0 {
+        let found = unsafe { libc::memrchr(payload.as_ptr().cast(), 0x17, search_end) };
+        if found.is_null() {
+            return None;
+        }
+        let offset = unsafe { found.cast::<u8>().offset_from(payload.as_ptr()) as usize };
+        if tls_record_len_at(payload, offset).is_some_and(|len| offset + len > payload.len()) {
+            return Some(offset);
+        }
+        search_end = offset;
+    }
+    None
+}
+
+fn observe_reverse_split(
+    conn: &mut TailConn,
+    payload: &[u8],
+    packet_seq: u32,
+) {
+    if conn.pending_split.is_some_and(|split| {
+        packet_seq
+            .wrapping_add(payload.len() as u32)
+            .wrapping_sub(split.tcp_seq) as i32
+            >= split.len as i32
+    }) {
+        conn.completed_split = conn.pending_split.take();
+    }
+    let Some(offset) = latest_incomplete_tls_start(payload) else {
+        return;
+    };
+    let len = tls_record_len_at(payload, offset)
+        .expect("incomplete TLS start must retain its parsed record length");
+    if len >= usize::from(conn.tls_record_wire_min) {
+        conn.pending_split = Some(PendingSplitRecord {
+            len,
+            tcp_seq: packet_seq.wrapping_add(offset as u32),
+            exact_record_ordinal: None,
+        });
+    }
+}
+
 #[inline(always)]
 fn select_forward_tls_records_from_payload(
     conn: &mut TailConn,
     payload: &[u8],
     packet_seq: u32,
+    mbuf_index: usize,
 ) -> Option<SelectedRecordRange> {
     let header_offset = conn.next_tls_header_seq.wrapping_sub(packet_seq) as usize;
     if header_offset >= payload.len() {
         return None;
+    }
+
+    if let Some(completed) = conn.pending_split.take() {
+        conn.completed_split = Some(completed);
     }
 
     let mut cursor = header_offset;
@@ -1280,12 +1515,21 @@ fn select_forward_tls_records_from_payload(
         let record_ordinal = conn.jump_record_ordinal;
         conn.jump_record_ordinal = conn.jump_record_ordinal.wrapping_add(1);
         if record_end > payload.len() {
+            if record_len >= usize::from(conn.tls_record_wire_min) {
+                conn.pending_split = Some(PendingSplitRecord {
+                    len: record_len,
+                    tcp_seq: packet_seq.wrapping_add(cursor as u32),
+                    exact_record_ordinal: Some(record_ordinal),
+                });
+            }
             break;
         }
         if record_len >= usize::from(conn.tls_record_wire_min) {
             selected = Some(SelectedRecordRange {
+                mbuf_index,
                 offset: cursor,
                 len: record_len,
+                tcp_seq: packet_seq.wrapping_add(cursor as u32),
                 exact_record_ordinal: Some(record_ordinal),
             });
         }
@@ -1538,7 +1782,7 @@ mod tests {
         let second = tls_record(b"second");
         let mut payload = first.clone();
         payload.extend_from_slice(&second);
-        let selected = select_forward_tls_records_from_payload(conn, &payload, 100)
+        let selected = select_forward_tls_records_from_payload(conn, &payload, 100, 0)
             .expect("the newest complete application record must be selected");
         assert_eq!(selected.offset, first.len());
         assert_eq!(selected.len, second.len());
@@ -1550,7 +1794,7 @@ mod tests {
         let mut split_prefix = vec![0x17, 0x03, 0x03];
         split_prefix.extend_from_slice(&(split_wire_len - TLS_HEADER_LEN as u16).to_be_bytes());
         split_prefix.resize(40, 0x55);
-        assert!(select_forward_tls_records_from_payload(conn, &split_prefix, split_start).is_none());
+        assert!(select_forward_tls_records_from_payload(conn, &split_prefix, split_start, 1).is_none());
         assert_eq!(conn.next_tls_header_seq, split_start + u32::from(split_wire_len));
 
         let after_split = tls_record(b"after-split");
@@ -1558,6 +1802,7 @@ mod tests {
             conn,
             &after_split,
             split_start + u32::from(split_wire_len),
+            2,
         )
         .expect("packet beginning at the jumped boundary must be selected");
         assert_eq!(selected.offset, 0);
@@ -1579,7 +1824,7 @@ mod tests {
         let mut payload = control.clone();
         payload.extend_from_slice(&market);
         payload.extend_from_slice(&control);
-        let selected = select_forward_tls_records_from_payload(conn, &payload, 100)
+        let selected = select_forward_tls_records_from_payload(conn, &payload, 100, 0)
             .expect("market record between controls must be selected");
         assert_eq!(selected.offset, control.len());
         assert_eq!(selected.len, market.len());
@@ -1592,6 +1837,7 @@ mod tests {
             conn,
             &controls_only,
             conn.next_tls_header_seq,
+            1,
         )
         .is_none());
         assert_eq!(conn.jump_record_ordinal, 5);
@@ -1685,22 +1931,13 @@ mod tests {
         let committed_socket = {
             let conn = table.conns[slot].as_mut().unwrap();
             let parser = conn.parser.unwrap();
-            let selected_range = find_tail_aligned_tls_records(
-                &selected.payload,
-                TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN,
-            )
-            .map(|selected| SelectedRecordRange {
-                offset: selected.offset,
-                len: selected.len,
-                exact_record_ordinal: selected.exact_record_ordinal,
-            });
-            assert!(RawTailTable::dispatch_committed_payload(
+            assert!(RawTailTable::dispatch_committed_records(
                 conn,
                 parser,
                 &selected.payload,
                 7,
                 false,
-                selected_range,
+                None,
             )
             .is_none());
             assert_eq!(&*events.borrow(), &["parser"]);
@@ -1872,10 +2109,10 @@ mod tests {
         conn.receiver_waker = Some(Waker::from(Arc::new(CountWake(wake_count.clone()))));
 
         assert!(matches!(
-            RawTailTable::dispatch_committed_payload(
+            RawTailTable::dispatch_committed_records(
                 conn,
                 binding,
-                b"not tls",
+                &[],
                 10,
                 false,
                 None,
@@ -1887,22 +2124,13 @@ mod tests {
         assert_eq!(wake_count.load(Ordering::Relaxed), 0);
 
         let record = tls_record(b"new but not publishable");
-        let selected = find_tail_aligned_tls_records(
-            &record,
-            TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN,
-        )
-        .map(|selected| SelectedRecordRange {
-            offset: selected.offset,
-            len: selected.len,
-            exact_record_ordinal: selected.exact_record_ordinal,
-        });
-        assert!(RawTailTable::dispatch_committed_payload(
+        assert!(RawTailTable::dispatch_committed_records(
             conn,
             binding,
             &record,
             11,
             false,
-            selected,
+            None,
         )
         .is_none());
         assert!(conn.publication_ready);
