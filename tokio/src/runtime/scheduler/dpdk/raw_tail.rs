@@ -303,7 +303,6 @@ struct TailConn {
     pending_split: Option<PendingSplitRecord>,
     completed_split: Option<PendingSplitRecord>,
     connection_closed: bool,
-    terminal_mbuf_index: Option<usize>,
     #[cfg(feature = "tail-ab")]
     observed_tcp_end: u32,
 }
@@ -390,7 +389,6 @@ struct ProcessedTail {
 enum PreparedRecord {
     Direct(SelectedRecordRange),
     Scratch {
-        mbuf_index: usize,
         tcp_seq: u32,
         len: usize,
         exact_record_ordinal: Option<u64>,
@@ -398,13 +396,6 @@ enum PreparedRecord {
 }
 
 impl PreparedRecord {
-    fn mbuf_index(&self) -> usize {
-        match self {
-            Self::Direct(selected) => selected.mbuf_index,
-            Self::Scratch { mbuf_index, .. } => *mbuf_index,
-        }
-    }
-
     fn tcp_seq(&self) -> u32 {
         match self {
             Self::Direct(selected) => selected.tcp_seq,
@@ -414,7 +405,6 @@ impl PreparedRecord {
 }
 
 struct AssembledRecord {
-    mbuf_index: usize,
     tcp_seq: u32,
     len: usize,
 }
@@ -527,7 +517,6 @@ impl RawTailTable {
             pending_split: None,
             completed_split: None,
             connection_closed: false,
-            terminal_mbuf_index: None,
             #[cfg(feature = "tail-ab")]
             observed_tcp_end: 0,
         };
@@ -626,7 +615,6 @@ impl RawTailTable {
         conn.pending_split = None;
         conn.completed_split = None;
         conn.connection_closed = false;
-        conn.terminal_mbuf_index = None;
         #[cfg(feature = "tail-ab")]
         {
             conn.observed_tcp_end = config.tcp_anchor;
@@ -724,7 +712,6 @@ impl RawTailTable {
             conn.pending_split = None;
             conn.completed_split = None;
             conn.connection_closed = false;
-            conn.terminal_mbuf_index = None;
             (was_active, receiver_waker)
         };
         if was_active {
@@ -834,17 +821,12 @@ impl RawTailTable {
             }
             #[cfg(feature = "market-trace")]
             drop(locate_scope);
-            let connection_closed = tuple_matches
-                && jump_view
-                    .as_ref()
-                    .is_some_and(|view| view.tcp[13] & 0x05 != 0);
-            let has_payload = tuple_matches
-                && jump_view
-                    .as_ref()
-                    .is_some_and(|view| !view.payload.is_empty());
-            if !has_payload && !connection_closed {
-                return Ok(());
+            if !tuple_matches {
+                return Err(mbuf);
             }
+            let connection_closed = jump_view
+                .as_ref()
+                .is_some_and(|view| view.tcp[13] & 0x05 != 0);
             let first_for_flow = conn.pending_mbufs.is_empty();
             conn.pending_mbufs.push(mbuf);
             if let Some(selected) = selected {
@@ -852,7 +834,6 @@ impl RawTailTable {
             }
             if connection_closed {
                 conn.connection_closed = true;
-                conn.terminal_mbuf_index = Some(mbuf_index);
             }
             first_for_flow
         };
@@ -874,10 +855,11 @@ impl RawTailTable {
         total
     }
 
-    /// Commit every selected TCP tail and synchronously invoke its parser while
-    /// the selected mbuf is still owned locally. The returned socket handles
-    /// are handed to the driver's existing shared egress scheduler only after
-    /// each parser has returned and its mbuf has been released.
+    /// Commit every flow's latest TCP packet and synchronously invoke its parser
+    /// for any selected TLS record while the poll's mbufs are still owned
+    /// locally. The returned socket handles are handed to the driver's existing
+    /// shared egress scheduler only after each parser has returned and its mbufs
+    /// have been released.
     pub(crate) fn finish_drain(
         &mut self,
         now: SmolInstant,
@@ -898,7 +880,7 @@ impl RawTailTable {
                 Self::process_selected_tail(conn, now, sockets, &mut scratch)
             };
             match outcome {
-                Ok(Some(processed)) => {
+                Ok(processed) => {
                     if observed_gateway.is_none() {
                         observed_gateway = Some(processed.gateway_mac);
                     }
@@ -912,7 +894,6 @@ impl RawTailTable {
                     }
                     egress_handles.push(processed.socket_handle);
                 }
-                Ok(None) => {}
                 Err(PrepareError::PacketParse) => {
                     self.errors.packet_parse_failed =
                         self.errors.packet_parse_failed.saturating_add(1);
@@ -950,7 +931,7 @@ impl RawTailTable {
         now: SmolInstant,
         sockets: &mut SocketSet<'static, LinearBuffer<'static>>,
         scratch: &mut [u8; TLS_MAX_WIRE_LEN],
-    ) -> Result<Option<ProcessedTail>, PrepareError> {
+    ) -> Result<ProcessedTail, PrepareError> {
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(conn.handle.worker_index);
         let mbufs = std::mem::take(&mut conn.pending_mbufs);
@@ -958,20 +939,13 @@ impl RawTailTable {
         let pending_split = conn.pending_split.take();
         let completed_split = conn.completed_split.take();
         let connection_closed = std::mem::take(&mut conn.connection_closed);
-        let terminal_mbuf_index = conn.terminal_mbuf_index.take();
 
         let prepared =
             select_prepared_record(selected, completed_split, pending_split, &mbufs, scratch);
-        let mbuf_index = prepared
-            .as_ref()
-            .map(PreparedRecord::mbuf_index)
-            .or(terminal_mbuf_index);
-        let Some(mbuf_index) = mbuf_index else {
-            let mut mbufs = mbufs;
-            mbufs.clear();
-            conn.pending_mbufs = mbufs;
-            return Ok(None);
-        };
+        let mbuf_index = mbufs
+            .len()
+            .checked_sub(1)
+            .expect("pending raw-tail flow must retain its latest TCP packet");
         let mbuf = &mbufs[mbuf_index];
         #[cfg(feature = "market-trace")]
         let packet_parse_scope = crate::runtime::market_trace::scope(
@@ -1016,14 +990,28 @@ impl RawTailTable {
             .parser
             .expect("active raw-tail connection must retain its parser binding");
         let parser_issue = match prepared {
-            Some(PreparedRecord::Direct(selected)) => Self::dispatch_committed_records(
-                conn,
-                parser,
-                &parsed.tcp_repr.payload[selected.offset..selected.offset + selected.len],
-                selected.tcp_seq,
-                connection_closed,
-                selected.exact_record_ordinal,
-            ),
+            Some(PreparedRecord::Direct(selected)) if selected.mbuf_index == mbuf_index => {
+                Self::dispatch_committed_records(
+                    conn,
+                    parser,
+                    &parsed.tcp_repr.payload[selected.offset..selected.offset + selected.len],
+                    selected.tcp_seq,
+                    connection_closed,
+                    selected.exact_record_ordinal,
+                )
+            }
+            Some(PreparedRecord::Direct(selected)) => {
+                let selected_view = parse_jump_tcp_view(&mbufs[selected.mbuf_index])
+                    .ok_or(PrepareError::PacketParse)?;
+                Self::dispatch_committed_records(
+                    conn,
+                    parser,
+                    &selected_view.payload[selected.offset..selected.offset + selected.len],
+                    selected.tcp_seq,
+                    connection_closed,
+                    selected.exact_record_ordinal,
+                )
+            }
             Some(PreparedRecord::Scratch {
                 tcp_seq,
                 len,
@@ -1037,14 +1025,15 @@ impl RawTailTable {
                 connection_closed,
                 exact_record_ordinal,
             ),
-            None => Self::dispatch_committed_records(
+            None if connection_closed => Self::dispatch_committed_records(
                 conn,
                 parser,
                 &[],
                 tcp_seq,
-                connection_closed,
+                true,
                 None,
             ),
+            None => None,
         };
         let processed = ProcessedTail {
             socket_handle,
@@ -1055,7 +1044,7 @@ impl RawTailTable {
         let mut mbufs = mbufs;
         mbufs.clear();
         conn.pending_mbufs = mbufs;
-        Ok(Some(processed))
+        Ok(processed)
     }
 
     fn dispatch_committed_records(
@@ -1404,7 +1393,6 @@ fn select_prepared_record(
             continue;
         };
         return Some(PreparedRecord::Scratch {
-            mbuf_index: assembled.mbuf_index,
             tcp_seq: assembled.tcp_seq,
             len: assembled.len,
             exact_record_ordinal: split.exact_record_ordinal,
@@ -1420,8 +1408,7 @@ fn assemble_split_record(
 ) -> Option<AssembledRecord> {
     scratch[..split.len].fill(0);
     let mut assembled_end = 0usize;
-    let mut mbuf_index = None;
-    for (index, mbuf) in mbufs.iter().enumerate() {
+    for mbuf in mbufs {
         let view = parse_jump_tcp_view(mbuf)?;
         let relative = view.tcp_seq.wrapping_sub(split.tcp_seq) as i32 as i64;
         let source_start = relative.saturating_neg().max(0) as usize;
@@ -1436,13 +1423,11 @@ fn assemble_split_record(
         scratch[target_start..target_start + take]
             .copy_from_slice(&view.payload[source_start..source_start + take]);
         assembled_end = assembled_end.max(target_start + take);
-        mbuf_index = Some(index);
     }
     if assembled_end != split.len {
         return None;
     }
     Some(AssembledRecord {
-        mbuf_index: mbuf_index?,
         tcp_seq: split.tcp_seq,
         len: split.len,
     })
