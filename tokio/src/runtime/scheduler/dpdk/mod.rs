@@ -41,6 +41,8 @@ pub use raw_tail::{
     RawTailHandle, RawTailInput, RawTailParseDisposition, RawTailParserBinding,
     RawTailParserConfig, RawTailScanStrategy,
 };
+#[cfg(feature = "dpdk-rx-cost-probe")]
+pub use dpdk_driver::DpdkRxCostStats;
 
 // Re-export debug APIs
 pub use worker::{current_tick, current_exec_count, current_scheduler_stats, DpdkSchedulerStats};

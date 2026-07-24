@@ -93,6 +93,8 @@ dpdk-raw-mbuf-capture = ["dpdk"]
 tail-ab = ["dpdk"]
 # DPDK scheduler debugging - enables detailed timing measurements
 dpdk-debug = ["dpdk"]
+# Active-RX-only generic stack cost samples.
+dpdk-rx-cost-probe = ["dpdk"]
 # Current-thread scheduler load probe for production latency experiments.
 sched-probe = []
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.

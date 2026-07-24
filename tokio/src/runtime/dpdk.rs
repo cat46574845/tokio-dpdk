@@ -64,6 +64,26 @@ pub use crate::runtime::scheduler::dpdk::{
     RawTailHandle, RawTailInput, RawTailParseDisposition, RawTailParserBinding,
     RawTailParserConfig, RawTailScanStrategy,
 };
+#[cfg(feature = "dpdk-rx-cost-probe")]
+pub use crate::runtime::scheduler::dpdk::DpdkRxCostStats;
+
+#[cfg(feature = "dpdk-rx-cost-probe")]
+/// Clear active-RX cost samples on the current DPDK worker.
+pub fn reset_rx_cost_probe() -> io::Result<()> {
+    crate::runtime::scheduler::dpdk::worker::with_current_driver(|driver| {
+        driver.reset_rx_cost_probe();
+    })
+    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DPDK driver unavailable"))
+}
+
+#[cfg(feature = "dpdk-rx-cost-probe")]
+/// Consume active-RX cost samples from the current DPDK worker.
+pub fn take_rx_cost_probe_stats() -> io::Result<DpdkRxCostStats> {
+    crate::runtime::scheduler::dpdk::worker::with_current_driver(|driver| {
+        driver.take_rx_cost_probe_stats()
+    })
+    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DPDK driver unavailable"))
+}
 
 /// Identifies a specific DPDK worker thread.
 ///

@@ -54,10 +54,168 @@ const TCP_EPHEMERAL_PORT_COUNT: u16 = 16384;
 const GATEWAY_SOFT_STALE_AFTER: SmolDuration = SmolDuration::from_secs(300);
 const INFRA_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const PENDING_EGRESS_NONE: usize = usize::MAX;
+#[cfg(feature = "dpdk-rx-cost-probe")]
+const DPDK_RX_COST_SAMPLE_CAPACITY: usize = 4_194_304;
 #[cfg(feature = "market-trace")]
 const TRACE_AUX_FIELD_BITS: u64 = 21;
 #[cfg(feature = "market-trace")]
 const TRACE_AUX_FIELD_MASK: u64 = (1u64 << TRACE_AUX_FIELD_BITS) - 1;
+
+#[cfg(feature = "dpdk-rx-cost-probe")]
+#[derive(Clone, Copy)]
+struct DpdkRxCostSample {
+    duration_ns: u64,
+    packets: u32,
+}
+
+#[cfg(feature = "dpdk-rx-cost-probe")]
+struct DpdkRxCostProbe {
+    samples: Vec<DpdkRxCostSample>,
+    overflow_active_polls: u64,
+    overflow_packets: u64,
+    overflow_duration_ns: u64,
+}
+
+#[cfg(feature = "dpdk-rx-cost-probe")]
+#[derive(Clone, Debug)]
+/// Aggregate generic-stack cost for driver polls which received packets.
+pub struct DpdkRxCostStats {
+    /// Driver polls which received at least one packet.
+    pub active_polls: u64,
+    /// Packets received by the sampled active polls.
+    pub received_packets: u64,
+    /// Sum of complete active driver-poll durations.
+    pub total_duration_ns: u64,
+    /// Total active driver-poll duration divided by received packets.
+    pub average_ns_per_packet: u64,
+    /// Median per-poll duration divided by that poll's packet count.
+    pub poll_ns_per_packet_p50: u64,
+    /// P99 per-poll duration divided by that poll's packet count.
+    pub poll_ns_per_packet_p99: u64,
+    /// P99.9 per-poll duration divided by that poll's packet count.
+    pub poll_ns_per_packet_p999: u64,
+    /// Maximum per-poll duration divided by that poll's packet count.
+    pub poll_ns_per_packet_max: u64,
+    /// Median packet count among active polls.
+    pub packets_per_poll_p50: u32,
+    /// P99 packet count among active polls.
+    pub packets_per_poll_p99: u32,
+    /// Maximum packet count among active polls.
+    pub packets_per_poll_max: u32,
+    /// Active polls beyond the fixed sample storage capacity.
+    pub overflow_active_polls: u64,
+}
+
+#[cfg(feature = "dpdk-rx-cost-probe")]
+impl DpdkRxCostProbe {
+    fn new() -> Self {
+        Self {
+            samples: Vec::with_capacity(DPDK_RX_COST_SAMPLE_CAPACITY),
+            overflow_active_polls: 0,
+            overflow_packets: 0,
+            overflow_duration_ns: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.samples.clear();
+        self.overflow_active_polls = 0;
+        self.overflow_packets = 0;
+        self.overflow_duration_ns = 0;
+    }
+
+    #[inline(always)]
+    fn record(&mut self, packets: usize, duration: Duration) {
+        if packets == 0 {
+            return;
+        }
+        let duration_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
+        if self.samples.len() < self.samples.capacity() {
+            self.samples.push(DpdkRxCostSample {
+                duration_ns,
+                packets: packets.min(u32::MAX as usize) as u32,
+            });
+        } else {
+            self.overflow_active_polls = self.overflow_active_polls.saturating_add(1);
+            self.overflow_packets = self.overflow_packets.saturating_add(packets as u64);
+            self.overflow_duration_ns =
+                self.overflow_duration_ns.saturating_add(duration_ns);
+        }
+    }
+
+    fn take_stats(&mut self) -> DpdkRxCostStats {
+        let mut samples = std::mem::take(&mut self.samples);
+        let sampled_packets = samples.iter().fold(0u64, |sum, sample| {
+            sum.saturating_add(u64::from(sample.packets))
+        });
+        let sampled_duration_ns = samples.iter().fold(0u64, |sum, sample| {
+            sum.saturating_add(sample.duration_ns)
+        });
+        let active_polls = (samples.len() as u64).saturating_add(self.overflow_active_polls);
+        let received_packets = sampled_packets.saturating_add(self.overflow_packets);
+        let total_duration_ns = sampled_duration_ns.saturating_add(self.overflow_duration_ns);
+
+        samples.sort_unstable_by_key(|sample| {
+            sample.duration_ns / u64::from(sample.packets.max(1))
+        });
+        let ns_per_packet = |numerator, denominator| {
+            percentile_sample(&samples, numerator, denominator)
+                .map(|sample| sample.duration_ns / u64::from(sample.packets.max(1)))
+                .unwrap_or(0)
+        };
+        let poll_ns_per_packet_p50 = ns_per_packet(50, 100);
+        let poll_ns_per_packet_p99 = ns_per_packet(99, 100);
+        let poll_ns_per_packet_p999 = ns_per_packet(999, 1000);
+        let poll_ns_per_packet_max = samples
+            .last()
+            .map(|sample| sample.duration_ns / u64::from(sample.packets.max(1)))
+            .unwrap_or(0);
+
+        samples.sort_unstable_by_key(|sample| sample.packets);
+        let packets_per_poll = |numerator, denominator| {
+            percentile_sample(&samples, numerator, denominator)
+                .map(|sample| sample.packets)
+                .unwrap_or(0)
+        };
+        let stats = DpdkRxCostStats {
+            active_polls,
+            received_packets,
+            total_duration_ns,
+            average_ns_per_packet: if received_packets == 0 {
+                0
+            } else {
+                total_duration_ns / received_packets
+            },
+            poll_ns_per_packet_p50,
+            poll_ns_per_packet_p99,
+            poll_ns_per_packet_p999,
+            poll_ns_per_packet_max,
+            packets_per_poll_p50: packets_per_poll(50, 100),
+            packets_per_poll_p99: packets_per_poll(99, 100),
+            packets_per_poll_max: samples.last().map(|sample| sample.packets).unwrap_or(0),
+            overflow_active_polls: self.overflow_active_polls,
+        };
+        drop(samples);
+        self.samples = Vec::with_capacity(DPDK_RX_COST_SAMPLE_CAPACITY);
+        self.overflow_active_polls = 0;
+        self.overflow_packets = 0;
+        self.overflow_duration_ns = 0;
+        stats
+    }
+}
+
+#[cfg(feature = "dpdk-rx-cost-probe")]
+fn percentile_sample(
+    samples: &[DpdkRxCostSample],
+    numerator: usize,
+    denominator: usize,
+) -> Option<&DpdkRxCostSample> {
+    if samples.is_empty() {
+        return None;
+    }
+    let index = (samples.len() - 1).saturating_mul(numerator) / denominator;
+    samples.get(index)
+}
 
 #[cfg(feature = "market-trace")]
 #[inline(always)]
@@ -751,6 +909,8 @@ pub(crate) struct DpdkDriver {
     infra_errors_dirty: bool,
     /// Last cold-path aggregated infrastructure ERROR report.
     last_infra_error_log: Option<Instant>,
+    #[cfg(feature = "dpdk-rx-cost-probe")]
+    rx_cost_probe: DpdkRxCostProbe,
 }
 
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
@@ -870,6 +1030,8 @@ impl DpdkDriver {
             gateway_probe_errors: GatewayProbeErrorCounters::default(),
             infra_errors_dirty: false,
             last_infra_error_log: None,
+            #[cfg(feature = "dpdk-rx-cost-probe")]
+            rx_cost_probe: DpdkRxCostProbe::new(),
         }
     }
 
@@ -1361,7 +1523,20 @@ impl DpdkDriver {
                 );
             }
         }
+        #[cfg(feature = "dpdk-rx-cost-probe")]
+        self.rx_cost_probe
+            .record(drain_rx_stats.received, now.elapsed());
         active
+    }
+
+    #[cfg(feature = "dpdk-rx-cost-probe")]
+    pub(crate) fn reset_rx_cost_probe(&mut self) {
+        self.rx_cost_probe.reset();
+    }
+
+    #[cfg(feature = "dpdk-rx-cost-probe")]
+    pub(crate) fn take_rx_cost_probe_stats(&mut self) -> DpdkRxCostStats {
+        self.rx_cost_probe.take_stats()
     }
 
     pub(crate) fn reserve_raw_tail(
