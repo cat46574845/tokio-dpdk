@@ -1230,6 +1230,21 @@ impl Builder {
         self
     }
 
+    /// Sets the number of TCP RX/TX buffer pairs allocated at each DPDK worker's startup.
+    ///
+    /// Each pair contains the fixed 512 KiB RX buffer and 64 KiB TX buffer.
+    /// Additional pairs are allocated when a connection is created, up to the
+    /// runtime's fixed connection capacity. Default: 256.
+    #[cfg(feature = "dpdk")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dpdk")))]
+    pub fn dpdk_tcp_buffer_preallocated_connections(&mut self, count: usize) -> &mut Self {
+        if let Some(ref mut dpdk_builder) = self.dpdk_builder {
+            *dpdk_builder = std::mem::take(dpdk_builder)
+                .tcp_buffer_preallocated_connections(count);
+        }
+        self
+    }
+
     /// Sets the number of scheduler ticks after which the scheduler will poll the global
     /// task queue.
     ///

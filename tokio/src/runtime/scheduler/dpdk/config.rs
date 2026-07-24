@@ -7,6 +7,10 @@
 
 use std::io;
 
+use super::SOCKET_LIFECYCLE_CAPACITY;
+
+const DEFAULT_TCP_BUFFER_PREALLOCATED_CONNECTIONS: usize = 256;
+
 /// Builder for DPDK runtime configuration.
 ///
 /// # Example
@@ -48,6 +52,12 @@ pub(crate) struct DpdkBuilder {
 
     /// Number of RX/TX queue descriptors per queue. Default: 128.
     queue_descriptors: Option<u16>,
+
+    /// Number of TCP RX/TX buffer pairs allocated at worker startup.
+    ///
+    /// Additional pairs are allocated when a connection is created, up to the
+    /// fixed socket lifecycle capacity.
+    tcp_buffer_preallocated_connections: Option<usize>,
 }
 
 impl Default for DpdkBuilder {
@@ -58,6 +68,7 @@ impl Default for DpdkBuilder {
             mempool_size: None,
             cache_size: None,
             queue_descriptors: None,
+            tcp_buffer_preallocated_connections: None,
         }
     }
 }
@@ -122,6 +133,12 @@ impl DpdkBuilder {
         self
     }
 
+    /// Set the number of TCP buffer pairs allocated at worker startup.
+    pub(crate) fn tcp_buffer_preallocated_connections(mut self, count: usize) -> Self {
+        self.tcp_buffer_preallocated_connections = Some(count);
+        self
+    }
+
     /// Get the extra EAL arguments.
     pub(crate) fn get_eal_args(&self) -> &[String] {
         &self.extra_eal_args
@@ -147,10 +164,22 @@ impl DpdkBuilder {
         self.queue_descriptors.unwrap_or(128)
     }
 
+    /// Get the number of TCP buffer pairs allocated at worker startup.
+    pub(crate) fn get_tcp_buffer_preallocated_connections(&self) -> usize {
+        self.tcp_buffer_preallocated_connections
+            .unwrap_or(DEFAULT_TCP_BUFFER_PREALLOCATED_CONNECTIONS)
+    }
+
     /// Validate the configuration.
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
-        // PCI addresses can be empty (means "use all available devices")
-        // No further validation needed - env.json validation happens at build time
+        let preallocated = self.get_tcp_buffer_preallocated_connections();
+        if preallocated > SOCKET_LIFECYCLE_CAPACITY {
+            return Err(ConfigError {
+                message: format!(
+                    "TCP buffer preallocated connection count {preallocated} exceeds socket capacity {SOCKET_LIFECYCLE_CAPACITY}"
+                ),
+            });
+        }
         Ok(())
     }
 }

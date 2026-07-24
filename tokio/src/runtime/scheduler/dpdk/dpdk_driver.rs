@@ -268,9 +268,10 @@ impl GatewayProbeErrorCounters {
 // TcpBufferPool - Pre-allocated buffer management
 // =============================================================================
 
-/// Pre-allocated buffer pool for TCP socket buffers.
+/// Buffer pool for TCP socket buffers.
 ///
-/// Provides zero-allocation socket creation by reusing a fixed startup pool.
+/// Reuses buffers after socket teardown. A configurable prefix is allocated at
+/// startup; the remainder is allocated only when a new socket needs it.
 pub(crate) struct TcpBufferPool {
     /// Free RX buffers available for allocation
     rx_free: Vec<Vec<u8>>,
@@ -278,6 +279,8 @@ pub(crate) struct TcpBufferPool {
     tx_free: Vec<Vec<u8>>,
     /// Maximum pool capacity
     capacity: usize,
+    /// Total pairs allocated, including pairs checked out by live sockets.
+    allocated_pairs: usize,
     /// Required RX buffer size
     rx_buffer_size: usize,
     /// Required TX buffer size
@@ -366,19 +369,30 @@ impl TcpBufferPool {
     /// Create a new buffer pool with pre-allocated buffers.
     ///
     /// # Arguments
-    /// * `capacity` - Number of connection buffer pairs to pre-allocate
+    /// * `capacity` - Maximum number of connection buffer pairs
+    /// * `preallocated` - Number of pairs allocated at startup
     /// * `rx_size` - Size of each RX buffer
     /// * `tx_size` - Size of each TX buffer
-    pub(crate) fn new(capacity: usize, rx_size: usize, tx_size: usize) -> Self {
+    pub(crate) fn new(
+        capacity: usize,
+        preallocated: usize,
+        rx_size: usize,
+        tx_size: usize,
+    ) -> Self {
+        debug_assert!(preallocated <= capacity);
+        // The pointer arrays are cheap and stay fully reserved so returning an
+        // on-demand pair never allocates. Only the large byte buffers follow
+        // the configured startup count.
         let mut rx_free = Vec::with_capacity(capacity);
         let mut tx_free = Vec::with_capacity(capacity);
         let mut waiter_slots = Vec::with_capacity(capacity);
         let mut waiter_free = Vec::with_capacity(capacity);
 
-        // Pre-allocate all buffers at startup
-        for index in 0..capacity {
+        for _ in 0..preallocated {
             rx_free.push(vec![0u8; rx_size]);
             tx_free.push(vec![0u8; tx_size]);
+        }
+        for index in 0..capacity {
             waiter_slots.push(TcpBufferWaiterSlot {
                 generation: 0,
                 allocated: false,
@@ -391,6 +405,7 @@ impl TcpBufferPool {
             rx_free,
             tx_free,
             capacity,
+            allocated_pairs: preallocated,
             rx_buffer_size: rx_size,
             tx_buffer_size: tx_size,
             waiter_slots,
@@ -400,9 +415,10 @@ impl TcpBufferPool {
     }
 
     /// Create with default settings.
-    pub(crate) fn with_defaults() -> Self {
+    pub(crate) fn with_defaults(preallocated: usize) -> Self {
         Self::new(
             SOCKET_LIFECYCLE_CAPACITY,
+            preallocated,
             TCP_RX_BUFFER_SIZE,
             TCP_TX_BUFFER_SIZE,
         )
@@ -412,12 +428,19 @@ impl TcpBufferPool {
     ///
     /// Returns `None` if pool is exhausted.
     pub(crate) fn acquire(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-        if self.rx_free.is_empty() || self.tx_free.is_empty() {
+        if !self.rx_free.is_empty() && !self.tx_free.is_empty() {
+            let rx = self.rx_free.pop()?;
+            let tx = self.tx_free.pop()?;
+            return Some((rx, tx));
+        }
+        if self.rx_free.len() != self.tx_free.len() || self.allocated_pairs >= self.capacity {
             return None;
         }
-        let rx = self.rx_free.pop()?;
-        let tx = self.tx_free.pop()?;
-        Some((rx, tx))
+        self.allocated_pairs += 1;
+        Some((
+            vec![0u8; self.rx_buffer_size],
+            vec![0u8; self.tx_buffer_size],
+        ))
     }
 
     /// Number of available buffer pairs.
@@ -762,6 +785,7 @@ impl DpdkDriver {
         addresses: Vec<IpCidr>,
         gateway_v4: Option<Ipv4Address>,
         gateway_v6: Option<Ipv6Address>,
+        tcp_buffer_preallocated_connections: usize,
     ) -> Self {
         let start_time = Instant::now();
         let now = SmolInstant::from_millis(0);
@@ -832,7 +856,7 @@ impl DpdkDriver {
             sockets,
             start_time,
             registered_sockets: HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
-            buffer_pool: TcpBufferPool::with_defaults(),
+            buffer_pool: TcpBufferPool::with_defaults(tcp_buffer_preallocated_connections),
             active_tcp_flows: HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
             tcp_flow_by_handle: vec![None; SOCKET_LIFECYCLE_CAPACITY].into_boxed_slice(),
             bound_listeners: HashSet::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
@@ -2710,7 +2734,7 @@ mod tests {
 
     #[test]
     fn removed_tcp_socket_reuses_original_buffer_pointers() {
-        let mut pool = TcpBufferPool::new(1, 64, 32);
+        let mut pool = TcpBufferPool::new(1, 1, 64, 32);
         let (rx, tx) = pool.acquire().expect("startup pool must contain one pair");
         let rx_ptr = rx.as_ptr();
         let tx_ptr = tx.as_ptr();
@@ -2728,7 +2752,7 @@ mod tests {
 
     #[test]
     fn removing_non_tcp_socket_does_not_touch_tcp_pool() {
-        let mut pool = TcpBufferPool::new(1, 64, 32);
+        let mut pool = TcpBufferPool::new(1, 1, 64, 32);
         let rx = smoltcp::socket::udp::PacketBuffer::new(
             vec![smoltcp::socket::udp::PacketMetadata::EMPTY],
             vec![0; 32],
@@ -2764,7 +2788,7 @@ mod tests {
 
     #[test]
     fn fixed_pool_reports_exhaustion_and_rejects_invalid_release() {
-        let mut pool = TcpBufferPool::new(1, 64, 32);
+        let mut pool = TcpBufferPool::new(1, 1, 64, 32);
         assert_eq!(
             pool.release(vec![0; 64], vec![0; 32]),
             Err(TcpBufferPoolReleaseError::Full { capacity: 1 })
@@ -2785,7 +2809,7 @@ mod tests {
 
     #[test]
     fn fixed_pool_release_wakes_every_registered_listener_without_allocating() {
-        let mut pool = TcpBufferPool::new(2, 64, 32);
+        let mut pool = TcpBufferPool::new(2, 2, 64, 32);
         let (rx, tx) = pool.acquire().expect("one buffer pair must be checked out");
         let first = pool
             .allocate_listener_waiter()

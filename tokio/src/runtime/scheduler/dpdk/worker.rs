@@ -628,6 +628,7 @@ pub(super) fn create(
     blocking_spawner: blocking::Spawner,
     seed_generator: RngSeedGenerator,
     config: Config,
+    tcp_buffer_preallocated_connections: usize,
     thread_name: crate::runtime::builder::ThreadNameFn,
     thread_stack_size: Option<usize>,
     after_start: Option<crate::runtime::Callback>,
@@ -673,6 +674,7 @@ pub(super) fn create(
             worker.addresses,
             worker.gateway_v4,
             worker.gateway_v6,
+            tcp_buffer_preallocated_connections,
         );
         drivers.push(driver);
         core_ids.push(worker.core_id);

@@ -278,6 +278,7 @@ impl Dpdk {
             blocking_spawner,
             seed_generator,
             config,
+            dpdk_builder.get_tcp_buffer_preallocated_connections(),
             thread_name,
             thread_stack_size,
             after_start,
