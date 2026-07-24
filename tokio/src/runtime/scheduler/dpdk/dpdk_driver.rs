@@ -70,6 +70,7 @@ struct DpdkRxCostSample {
 
 #[cfg(feature = "dpdk-rx-cost-probe")]
 struct DpdkRxCostProbe {
+    enabled: bool,
     samples: Vec<DpdkRxCostSample>,
     overflow_active_polls: u64,
     overflow_packets: u64,
@@ -110,7 +111,8 @@ pub struct DpdkRxCostStats {
 impl DpdkRxCostProbe {
     fn new() -> Self {
         Self {
-            samples: Vec::with_capacity(DPDK_RX_COST_SAMPLE_CAPACITY),
+            enabled: false,
+            samples: Vec::new(),
             overflow_active_polls: 0,
             overflow_packets: 0,
             overflow_duration_ns: 0,
@@ -118,7 +120,8 @@ impl DpdkRxCostProbe {
     }
 
     fn reset(&mut self) {
-        self.samples.clear();
+        self.enabled = true;
+        self.samples = Vec::with_capacity(DPDK_RX_COST_SAMPLE_CAPACITY);
         self.overflow_active_polls = 0;
         self.overflow_packets = 0;
         self.overflow_duration_ns = 0;
@@ -126,7 +129,7 @@ impl DpdkRxCostProbe {
 
     #[inline(always)]
     fn record(&mut self, packets: usize, duration: Duration) {
-        if packets == 0 {
+        if !self.enabled || packets == 0 {
             return;
         }
         let duration_ns = duration.as_nanos().min(u64::MAX as u128) as u64;
@@ -144,6 +147,7 @@ impl DpdkRxCostProbe {
     }
 
     fn take_stats(&mut self) -> DpdkRxCostStats {
+        self.enabled = false;
         let mut samples = std::mem::take(&mut self.samples);
         let sampled_packets = samples.iter().fold(0u64, |sum, sample| {
             sum.saturating_add(u64::from(sample.packets))
@@ -196,7 +200,7 @@ impl DpdkRxCostProbe {
             overflow_active_polls: self.overflow_active_polls,
         };
         drop(samples);
-        self.samples = Vec::with_capacity(DPDK_RX_COST_SAMPLE_CAPACITY);
+        self.samples = Vec::new();
         self.overflow_active_polls = 0;
         self.overflow_packets = 0;
         self.overflow_duration_ns = 0;
@@ -1524,8 +1528,10 @@ impl DpdkDriver {
             }
         }
         #[cfg(feature = "dpdk-rx-cost-probe")]
-        self.rx_cost_probe
-            .record(drain_rx_stats.received, now.elapsed());
+        if self.rx_cost_probe.enabled {
+            self.rx_cost_probe
+                .record(drain_rx_stats.received, now.elapsed());
+        }
         active
     }
 
