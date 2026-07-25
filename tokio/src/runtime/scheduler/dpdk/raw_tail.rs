@@ -298,6 +298,9 @@ struct TailConn {
     tls_record_wire_min: u16,
     next_tls_header_seq: u32,
     jump_record_ordinal: u64,
+    // A boundary scan recovers TCP framing but cannot recover skipped TLS
+    // ordinals. Keep using predictor-based authentication after that point.
+    jump_record_ordinal_exact: bool,
     pending_records: Option<SelectedRecordRange>,
     pending_split: Option<PendingSplitRecord>,
     completed_split: Option<PendingSplitRecord>,
@@ -494,6 +497,7 @@ impl RawTailTable {
             tls_record_wire_min: TLS_HEADER_LEN as u16 + TLS_MIN_CIPHERTEXT_LEN as u16,
             next_tls_header_seq: 0,
             jump_record_ordinal: 0,
+            jump_record_ordinal_exact: true,
             pending_records: None,
             pending_split: None,
             completed_split: None,
@@ -592,6 +596,7 @@ impl RawTailTable {
         conn.tls_record_wire_min = config.tls_record_wire_min;
         conn.next_tls_header_seq = config.tcp_anchor;
         conn.jump_record_ordinal = 0;
+        conn.jump_record_ordinal_exact = true;
         conn.pending_records = None;
         conn.pending_split = None;
         conn.completed_split = None;
@@ -756,6 +761,9 @@ impl RawTailTable {
                 (conn.next_tls_header_seq.wrapping_sub(view.tcp_seq) as usize)
                     < view.payload.len()
             });
+            let header_before_payload = jump_view.as_ref().is_some_and(|view| {
+                view.tcp_seq.wrapping_sub(conn.next_tls_header_seq) as i32 > 0
+            });
             #[cfg(feature = "tail-ab")]
             if tuple_matches {
                 let view = jump_view
@@ -791,6 +799,16 @@ impl RawTailTable {
                 RawTailScanStrategy::ForwardJump if header_in_payload && tuple_matches => {
                     jump_view.as_ref().and_then(|view| {
                         select_forward_tls_records_from_payload(
+                            conn,
+                            view.payload,
+                            view.tcp_seq,
+                            mbuf_index,
+                        )
+                    })
+                }
+                RawTailScanStrategy::ForwardJump if header_before_payload && tuple_matches => {
+                    jump_view.as_ref().and_then(|view| {
+                        resync_forward_tls_records_from_payload(
                             conn,
                             view.payload,
                             view.tcp_seq,
@@ -1438,7 +1456,7 @@ fn begin_pending_header(
     payload: &[u8],
     packet_seq: u32,
     offset: usize,
-    exact_record_ordinal: u64,
+    exact_record_ordinal: Option<u64>,
 ) {
     let tcp_seq = packet_seq.wrapping_add(offset as u32);
     if conn
@@ -1453,7 +1471,7 @@ fn begin_pending_header(
     conn.pending_split = Some(PendingSplitRecord {
         len: None,
         tcp_seq,
-        exact_record_ordinal: Some(exact_record_ordinal),
+        exact_record_ordinal,
         bytes,
     });
 }
@@ -1514,7 +1532,13 @@ fn select_forward_tls_records_from_payload(
         if payload.len() - cursor < TLS_HEADER_LEN {
             let record_ordinal = conn.jump_record_ordinal;
             conn.jump_record_ordinal = conn.jump_record_ordinal.wrapping_add(1);
-            begin_pending_header(conn, payload, packet_seq, cursor, record_ordinal);
+            begin_pending_header(
+                conn,
+                payload,
+                packet_seq,
+                cursor,
+                conn.jump_record_ordinal_exact.then_some(record_ordinal),
+            );
             break;
         }
         let Some(record_len) = tls_record_len_at(payload, cursor) else {
@@ -1532,7 +1556,7 @@ fn select_forward_tls_records_from_payload(
                     packet_seq,
                     cursor,
                     record_len,
-                    Some(record_ordinal),
+                    conn.jump_record_ordinal_exact.then_some(record_ordinal),
                 );
             }
             break;
@@ -1543,7 +1567,7 @@ fn select_forward_tls_records_from_payload(
                 offset: cursor,
                 len: record_len,
                 tcp_seq: packet_seq.wrapping_add(cursor as u32),
-                exact_record_ordinal: Some(record_ordinal),
+                exact_record_ordinal: conn.jump_record_ordinal_exact.then_some(record_ordinal),
             });
         }
         cursor = record_end;
@@ -1552,6 +1576,39 @@ fn select_forward_tls_records_from_payload(
         }
     }
     selected
+}
+
+fn resync_forward_tls_records_from_payload(
+    conn: &mut TailConn,
+    payload: &[u8],
+    packet_seq: u32,
+    mbuf_index: usize,
+) -> Option<SelectedRecordRange> {
+    let minimum = usize::from(conn.tls_record_wire_min);
+    let mut search_end = payload.len();
+    while search_end != 0 {
+        let found = unsafe { libc::memrchr(payload.as_ptr().cast(), 0x17, search_end) };
+        if found.is_null() {
+            return None;
+        }
+        let offset = unsafe { found.cast::<u8>().offset_from(payload.as_ptr()) as usize };
+        if tls_record_len_at(payload, offset)
+            .is_some_and(|len| len >= minimum && offset + len <= payload.len())
+        {
+            conn.pending_split = None;
+            conn.completed_split = None;
+            conn.next_tls_header_seq = packet_seq.wrapping_add(offset as u32);
+            conn.jump_record_ordinal_exact = false;
+            return select_forward_tls_records_from_payload(
+                conn,
+                payload,
+                packet_seq,
+                mbuf_index,
+            );
+        }
+        search_end = offset;
+    }
+    None
 }
 
 fn toeplitz_hash(input: &[u8], key: &[u8]) -> u32 {
