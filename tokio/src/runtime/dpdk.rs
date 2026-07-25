@@ -62,7 +62,7 @@ pub(crate) fn record_tail_ab(worker_index: usize, tcp_advance_sum: u64, driver_n
 
 pub use crate::runtime::scheduler::dpdk::{
     RawTailHandle, RawTailInput, RawTailParseDisposition, RawTailParserBinding,
-    RawTailParserConfig, RawTailScanStrategy,
+    RawTailParserConfig, RawTailScanStrategy, RawTailSequenceAnchor,
 };
 #[cfg(feature = "dpdk-rx-cost-probe")]
 pub use crate::runtime::scheduler::dpdk::DpdkRxCostStats;

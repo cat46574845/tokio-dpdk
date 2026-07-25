@@ -39,7 +39,7 @@ pub(crate) const SOCKET_LIFECYCLE_CAPACITY: usize = 8192;
 
 pub use raw_tail::{
     RawTailHandle, RawTailInput, RawTailParseDisposition, RawTailParserBinding,
-    RawTailParserConfig, RawTailScanStrategy,
+    RawTailParserConfig, RawTailScanStrategy, RawTailSequenceAnchor,
 };
 #[cfg(feature = "dpdk-rx-cost-probe")]
 pub use dpdk_driver::DpdkRxCostStats;

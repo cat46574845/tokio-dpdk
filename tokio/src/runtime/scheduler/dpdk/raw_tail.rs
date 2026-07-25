@@ -68,9 +68,41 @@ pub struct RawTailInput<'a> {
     pub packet_ordinal: u64,
     /// The selected TCP segment carried FIN/RST or closed smoltcp state.
     pub connection_closed: bool,
-    /// Exact record ordinal from the activation anchor when forward traversal
-    /// observed every intervening header. Reverse selection leaves this empty.
+    /// Exact record ordinal from the current ForwardJump base. A simultaneous
+    /// `sequence_anchor` tells the parser how to authenticate that new base.
+    /// Reverse selection leaves this empty.
     pub exact_record_ordinal: Option<u64>,
+    /// Sequence source for authenticating a newly established ForwardJump
+    /// ordinal base. Empty on the steady exact path.
+    pub sequence_anchor: Option<RawTailSequenceAnchor>,
+}
+
+/// Sequence source used to authenticate the first record after ForwardJump
+/// establishes a new exact driver ordinal base.
+#[derive(Debug, Clone, Copy)]
+pub enum RawTailSequenceAnchor {
+    /// The application predictor owns the last authenticated sequence base.
+    Predictor,
+    /// The old driver framing base still has an exact application mapping.
+    Exact {
+        /// TCP sequence of the next TLS header before the gap.
+        tcp_seq: u32,
+        /// Exact ordinal of that next TLS record from the old activation base.
+        record_ordinal: u64,
+    },
+}
+
+impl RawTailSequenceAnchor {
+    /// Return the exact driver base when the old framing remained continuous.
+    pub fn exact(self) -> Option<(u32, u64)> {
+        match self {
+            Self::Predictor => None,
+            Self::Exact {
+                tcp_seq,
+                record_ordinal,
+            } => Some((tcp_seq, record_ordinal)),
+        }
+    }
 }
 
 /// Packet/TLS framing strategy selected once when a raw-tail connection is activated.
@@ -301,9 +333,10 @@ struct TailConn {
     tls_record_wire_min: u16,
     next_tls_header_seq: u32,
     jump_record_ordinal: u64,
-    // A boundary scan recovers TCP framing but cannot recover skipped TLS
-    // ordinals. Keep using predictor-based authentication after that point.
+    // False while the application is authenticating the first ordinal base
+    // after activation loss or a boundary resynchronization.
     jump_record_ordinal_exact: bool,
+    sequence_rebase_anchor: Option<RawTailSequenceAnchor>,
     pending_records: Option<SelectedRecordRange>,
     pending_split: Option<PendingSplitRecord>,
     completed_split: Option<PendingSplitRecord>,
@@ -319,12 +352,14 @@ struct SelectedRecordRange {
     len: usize,
     tcp_seq: u32,
     exact_record_ordinal: Option<u64>,
+    sequence_anchor: Option<RawTailSequenceAnchor>,
 }
 
 struct PendingSplitRecord {
     len: Option<usize>,
     tcp_seq: u32,
     exact_record_ordinal: Option<u64>,
+    sequence_anchor: Option<RawTailSequenceAnchor>,
     bytes: Vec<u8>,
 }
 
@@ -501,6 +536,7 @@ impl RawTailTable {
             next_tls_header_seq: 0,
             jump_record_ordinal: 0,
             jump_record_ordinal_exact: true,
+            sequence_rebase_anchor: None,
             pending_records: None,
             pending_split: None,
             completed_split: None,
@@ -601,6 +637,9 @@ impl RawTailTable {
         conn.next_tls_header_seq = config.tcp_anchor;
         conn.jump_record_ordinal = 0;
         conn.jump_record_ordinal_exact = config.record_ordinal_exact;
+        conn.sequence_rebase_anchor = (config.scan_strategy == RawTailScanStrategy::ForwardJump
+            && !config.record_ordinal_exact)
+            .then_some(RawTailSequenceAnchor::Predictor);
         conn.pending_records = None;
         conn.pending_split = None;
         conn.completed_split = None;
@@ -701,6 +740,7 @@ impl RawTailTable {
             conn.pending_records = None;
             conn.pending_split = None;
             conn.completed_split = None;
+            conn.sequence_rebase_anchor = None;
             conn.connection_closed = false;
             (was_active, receiver_waker)
         };
@@ -761,13 +801,6 @@ impl RawTailTable {
                     .expect("matched jump view must remain available in this RX iteration");
                 continue_pending_split(conn, view.payload, view.tcp_seq);
             }
-            let header_in_payload = jump_view.as_ref().is_some_and(|view| {
-                (conn.next_tls_header_seq.wrapping_sub(view.tcp_seq) as usize)
-                    < view.payload.len()
-            });
-            let header_before_payload = jump_view.as_ref().is_some_and(|view| {
-                view.tcp_seq.wrapping_sub(conn.next_tls_header_seq) as i32 > 0
-            });
             #[cfg(feature = "tail-ab")]
             if tuple_matches {
                 let view = jump_view
@@ -797,27 +830,31 @@ impl RawTailTable {
                             len: selected.len,
                             tcp_seq: view.tcp_seq.wrapping_add(selected.offset as u32),
                             exact_record_ordinal: selected.exact_record_ordinal,
+                            sequence_anchor: None,
                         })
                     }),
                 RawTailScanStrategy::Reverse => None,
-                RawTailScanStrategy::ForwardJump if header_in_payload && tuple_matches => {
+                RawTailScanStrategy::ForwardJump if tuple_matches => {
                     jump_view.as_ref().and_then(|view| {
-                        select_forward_tls_records_from_payload(
-                            conn,
-                            view.payload,
-                            view.tcp_seq,
-                            mbuf_index,
-                        )
-                    })
-                }
-                RawTailScanStrategy::ForwardJump if header_before_payload && tuple_matches => {
-                    jump_view.as_ref().and_then(|view| {
-                        resync_forward_tls_records_from_payload(
-                            conn,
-                            view.payload,
-                            view.tcp_seq,
-                            mbuf_index,
-                        )
+                        let header_offset =
+                            conn.next_tls_header_seq.wrapping_sub(view.tcp_seq) as usize;
+                        if header_offset < view.payload.len() {
+                            return select_forward_tls_records_from_payload(
+                                conn,
+                                view.payload,
+                                view.tcp_seq,
+                                mbuf_index,
+                            );
+                        }
+                        if view.tcp_seq.wrapping_sub(conn.next_tls_header_seq) as i32 > 0 {
+                            return resync_forward_tls_records_from_payload(
+                                conn,
+                                view.payload,
+                                view.tcp_seq,
+                                mbuf_index,
+                            );
+                        }
+                        None
                     })
                 }
                 RawTailScanStrategy::ForwardJump => None,
@@ -1003,6 +1040,7 @@ impl RawTailTable {
                     selected.tcp_seq,
                     connection_closed,
                     selected.exact_record_ordinal,
+                    selected.sequence_anchor,
                 )
             }
             Some(PreparedRecord::Direct(selected)) => {
@@ -1015,6 +1053,7 @@ impl RawTailTable {
                     selected.tcp_seq,
                     connection_closed,
                     selected.exact_record_ordinal,
+                    selected.sequence_anchor,
                 )
             }
             Some(PreparedRecord::Split(split)) => Self::dispatch_committed_records(
@@ -1024,6 +1063,7 @@ impl RawTailTable {
                 split.tcp_seq,
                 connection_closed,
                 split.exact_record_ordinal,
+                split.sequence_anchor,
             ),
             None if connection_closed => Self::dispatch_committed_records(
                 conn,
@@ -1031,6 +1071,7 @@ impl RawTailTable {
                 &[],
                 tcp_seq,
                 true,
+                None,
                 None,
             ),
             None => None,
@@ -1054,6 +1095,7 @@ impl RawTailTable {
         tcp_seq: u32,
         connection_closed: bool,
         exact_record_ordinal: Option<u64>,
+        sequence_anchor: Option<RawTailSequenceAnchor>,
     ) -> Option<ParserIssue> {
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(conn.handle.worker_index);
@@ -1066,6 +1108,7 @@ impl RawTailTable {
             packet_ordinal: conn.packet_ordinal,
             connection_closed,
             exact_record_ordinal,
+            sequence_anchor,
         };
         // SAFETY: the pinned binding contract remains active, and `records`
         // cannot escape this synchronous HRTB call. The selected mbuf remains
@@ -1077,6 +1120,13 @@ impl RawTailTable {
             records.len() as u64,
         );
         let disposition = unsafe { parser.parse(input) };
+        if sequence_anchor.is_some() && disposition == RawTailParseDisposition::Ready {
+            conn.jump_record_ordinal_exact = true;
+            conn.sequence_rebase_anchor = None;
+            if let Some(pending) = conn.pending_split.as_mut() {
+                pending.sequence_anchor = None;
+            }
+        }
         #[cfg(feature = "market-trace")]
         drop(parser_scope);
         let disposition = latch_closed_disposition(disposition, connection_closed);
@@ -1407,6 +1457,7 @@ fn continue_pending_split(conn: &mut TailConn, payload: &[u8], packet_seq: u32) 
         };
         split.len = Some(len);
         split.bytes.reserve_exact(len - split.bytes.len());
+        conn.jump_record_ordinal = conn.jump_record_ordinal.wrapping_add(1);
         conn.next_tls_header_seq = split.tcp_seq.wrapping_add(len as u32);
     }
     let len = split
@@ -1451,6 +1502,7 @@ fn begin_pending_split(
         len: Some(len),
         tcp_seq,
         exact_record_ordinal,
+        sequence_anchor: conn.sequence_rebase_anchor,
         bytes,
     });
 }
@@ -1476,6 +1528,7 @@ fn begin_pending_header(
         len: None,
         tcp_seq,
         exact_record_ordinal,
+        sequence_anchor: conn.sequence_rebase_anchor,
         bytes,
     });
 }
@@ -1535,13 +1588,13 @@ fn select_forward_tls_records_from_payload(
     loop {
         if payload.len() - cursor < TLS_HEADER_LEN {
             let record_ordinal = conn.jump_record_ordinal;
-            conn.jump_record_ordinal = conn.jump_record_ordinal.wrapping_add(1);
             begin_pending_header(
                 conn,
                 payload,
                 packet_seq,
                 cursor,
-                conn.jump_record_ordinal_exact.then_some(record_ordinal),
+                (conn.jump_record_ordinal_exact || conn.sequence_rebase_anchor.is_some())
+                    .then_some(record_ordinal),
             );
             break;
         }
@@ -1560,7 +1613,8 @@ fn select_forward_tls_records_from_payload(
                     packet_seq,
                     cursor,
                     record_len,
-                    conn.jump_record_ordinal_exact.then_some(record_ordinal),
+                    (conn.jump_record_ordinal_exact || conn.sequence_rebase_anchor.is_some())
+                        .then_some(record_ordinal),
                 );
             }
             break;
@@ -1571,7 +1625,10 @@ fn select_forward_tls_records_from_payload(
                 offset: cursor,
                 len: record_len,
                 tcp_seq: packet_seq.wrapping_add(cursor as u32),
-                exact_record_ordinal: conn.jump_record_ordinal_exact.then_some(record_ordinal),
+                exact_record_ordinal:
+                    (conn.jump_record_ordinal_exact || conn.sequence_rebase_anchor.is_some())
+                        .then_some(record_ordinal),
+                sequence_anchor: conn.sequence_rebase_anchor,
             });
         }
         cursor = record_end;
@@ -1588,6 +1645,14 @@ fn resync_forward_tls_records_from_payload(
     packet_seq: u32,
     mbuf_index: usize,
 ) -> Option<SelectedRecordRange> {
+    let sequence_anchor = if conn.jump_record_ordinal_exact {
+        RawTailSequenceAnchor::Exact {
+            tcp_seq: conn.next_tls_header_seq,
+            record_ordinal: conn.jump_record_ordinal,
+        }
+    } else {
+        RawTailSequenceAnchor::Predictor
+    };
     let minimum = usize::from(conn.tls_record_wire_min);
     let mut search_end = payload.len();
     while search_end != 0 {
@@ -1602,13 +1667,19 @@ fn resync_forward_tls_records_from_payload(
             conn.pending_split = None;
             conn.completed_split = None;
             conn.next_tls_header_seq = packet_seq.wrapping_add(offset as u32);
+            conn.jump_record_ordinal = 0;
             conn.jump_record_ordinal_exact = false;
-            return select_forward_tls_records_from_payload(
+            conn.sequence_rebase_anchor = Some(sequence_anchor);
+            let mut selected = select_forward_tls_records_from_payload(
                 conn,
                 payload,
                 packet_seq,
                 mbuf_index,
             );
+            if let Some(selected) = selected.as_mut() {
+                selected.sequence_anchor = Some(sequence_anchor);
+            }
+            return selected;
         }
         search_end = offset;
     }
@@ -1771,6 +1842,7 @@ mod tests {
                 packet_ordinal: 3,
                 connection_closed: false,
                 exact_record_ordinal: None,
+                sequence_anchor: None,
             })
         };
         assert_eq!(disposition, RawTailParseDisposition::Ready);
@@ -2012,6 +2084,7 @@ mod tests {
                 7,
                 false,
                 None,
+                None,
             )
             .is_none());
             assert_eq!(&*events.borrow(), &["parser"]);
@@ -2190,6 +2263,7 @@ mod tests {
                 10,
                 false,
                 None,
+                None,
             ),
             Some(ParserIssue::TlsTailNotFound)
         ));
@@ -2204,6 +2278,7 @@ mod tests {
             &record,
             11,
             false,
+            None,
             None,
         )
         .is_none());
