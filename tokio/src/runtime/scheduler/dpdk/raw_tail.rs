@@ -90,8 +90,11 @@ pub struct RawTailParserConfig {
     pub scan_strategy: RawTailScanStrategy,
     /// Smallest TLS wire record which can carry this connection's application payload.
     pub tls_record_wire_min: u16,
-    /// TCP position paired with the parser's current inbound TLS sequence.
+    /// First TCP position retained when inbound ownership moves to raw-tail.
     pub tcp_anchor: u32,
+    /// Whether no discarded activation bytes can hide TLS record ordinals
+    /// between the parser's sequence state and `tcp_anchor`.
+    pub record_ordinal_exact: bool,
 }
 
 /// Whether a synchronous parser published a value for its receiver task.
@@ -539,6 +542,7 @@ impl RawTailTable {
                 scan_strategy: RawTailScanStrategy::Reverse,
                 tls_record_wire_min: (TLS_HEADER_LEN + TLS_MIN_CIPHERTEXT_LEN) as u16,
                 tcp_anchor: 0,
+                record_ordinal_exact: false,
             },
         )
     }
@@ -596,7 +600,7 @@ impl RawTailTable {
         conn.tls_record_wire_min = config.tls_record_wire_min;
         conn.next_tls_header_seq = config.tcp_anchor;
         conn.jump_record_ordinal = 0;
-        conn.jump_record_ordinal_exact = true;
+        conn.jump_record_ordinal_exact = config.record_ordinal_exact;
         conn.pending_records = None;
         conn.pending_split = None;
         conn.completed_split = None;
