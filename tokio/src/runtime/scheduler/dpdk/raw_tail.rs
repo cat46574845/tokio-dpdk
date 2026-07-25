@@ -316,7 +316,7 @@ struct SelectedRecordRange {
 }
 
 struct PendingSplitRecord {
-    len: usize,
+    len: Option<usize>,
     tcp_seq: u32,
     exact_record_ordinal: Option<u64>,
     bytes: Vec<u8>,
@@ -743,10 +743,6 @@ impl RawTailTable {
             }
             conn.advance_packet_ordinal();
             let jump_view = parse_jump_tcp_view(&mbuf);
-            let header_in_payload = jump_view.as_ref().is_some_and(|view| {
-                (conn.next_tls_header_seq.wrapping_sub(view.tcp_seq) as usize)
-                    < view.payload.len()
-            });
             let tuple_matches = jump_view
                 .as_ref()
                 .is_some_and(|view| jump_view_matches_tuple(&conn.tuple, view));
@@ -756,6 +752,10 @@ impl RawTailTable {
                     .expect("matched jump view must remain available in this RX iteration");
                 continue_pending_split(conn, view.payload, view.tcp_seq);
             }
+            let header_in_payload = jump_view.as_ref().is_some_and(|view| {
+                (conn.next_tls_header_seq.wrapping_sub(view.tcp_seq) as usize)
+                    < view.payload.len()
+            });
             #[cfg(feature = "tail-ab")]
             if tuple_matches {
                 let view = jump_view
@@ -1369,12 +1369,32 @@ fn continue_pending_split(conn: &mut TailConn, payload: &[u8], packet_seq: u32) 
         conn.pending_split = Some(split);
         return;
     }
-    let source_start = expected_seq.wrapping_sub(packet_seq) as usize;
-    let take = (payload.len() - source_start).min(split.len - split.bytes.len());
+    let mut source_start = expected_seq.wrapping_sub(packet_seq) as usize;
+    if split.len.is_none() {
+        let take = (payload.len() - source_start).min(TLS_HEADER_LEN - split.bytes.len());
+        split
+            .bytes
+            .extend_from_slice(&payload[source_start..source_start + take]);
+        source_start += take;
+        if split.bytes.len() < TLS_HEADER_LEN {
+            conn.pending_split = Some(split);
+            return;
+        }
+        let Some(len) = tls_record_len_at(&split.bytes, 0) else {
+            return;
+        };
+        split.len = Some(len);
+        split.bytes.reserve_exact(len - split.bytes.len());
+        conn.next_tls_header_seq = split.tcp_seq.wrapping_add(len as u32);
+    }
+    let len = split
+        .len
+        .expect("completed TLS header must provide its record length");
+    let take = (payload.len() - source_start).min(len - split.bytes.len());
     split
         .bytes
         .extend_from_slice(&payload[source_start..source_start + take]);
-    if split.bytes.len() == split.len {
+    if split.bytes.len() == len {
         let replace_completed = match conn.completed_split.as_ref() {
             Some(completed) => split.tcp_seq.wrapping_sub(completed.tcp_seq) as i32 >= 0,
             None => true,
@@ -1406,9 +1426,34 @@ fn begin_pending_split(
     let mut bytes = Vec::with_capacity(len);
     bytes.extend_from_slice(&payload[offset..]);
     conn.pending_split = Some(PendingSplitRecord {
-        len,
+        len: Some(len),
         tcp_seq,
         exact_record_ordinal,
+        bytes,
+    });
+}
+
+fn begin_pending_header(
+    conn: &mut TailConn,
+    payload: &[u8],
+    packet_seq: u32,
+    offset: usize,
+    exact_record_ordinal: u64,
+) {
+    let tcp_seq = packet_seq.wrapping_add(offset as u32);
+    if conn
+        .pending_split
+        .as_ref()
+        .is_some_and(|pending| tcp_seq.wrapping_sub(pending.tcp_seq) as i32 <= 0)
+    {
+        return;
+    }
+    let mut bytes = Vec::with_capacity(TLS_HEADER_LEN);
+    bytes.extend_from_slice(&payload[offset..]);
+    conn.pending_split = Some(PendingSplitRecord {
+        len: None,
+        tcp_seq,
+        exact_record_ordinal: Some(exact_record_ordinal),
         bytes,
     });
 }
@@ -1465,7 +1510,16 @@ fn select_forward_tls_records_from_payload(
 
     let mut cursor = header_offset;
     let mut selected = None;
-    while let Some(record_len) = tls_record_len_at(payload, cursor) {
+    loop {
+        if payload.len() - cursor < TLS_HEADER_LEN {
+            let record_ordinal = conn.jump_record_ordinal;
+            conn.jump_record_ordinal = conn.jump_record_ordinal.wrapping_add(1);
+            begin_pending_header(conn, payload, packet_seq, cursor, record_ordinal);
+            break;
+        }
+        let Some(record_len) = tls_record_len_at(payload, cursor) else {
+            break;
+        };
         let record_end = cursor + record_len;
         conn.next_tls_header_seq = packet_seq.wrapping_add(record_end as u32);
         let record_ordinal = conn.jump_record_ordinal;
