@@ -1121,6 +1121,32 @@ pub(crate) fn run_with_future<F: std::future::Future>(
 
 thread_local! {
     static CURRENT: std::cell::Cell<*const ()> = const { std::cell::Cell::new(std::ptr::null()) };
+    /// Run once per event-loop iteration that saw no network activity (`set_idle_hook`).
+    static IDLE_HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+}
+
+/// Installs the calling worker thread's idle hook; returns `hook` when this thread is not a DPDK worker or
+/// already has one.
+pub(crate) fn set_idle_hook(hook: Box<dyn FnMut()>) -> Result<(), Box<dyn FnMut()>> {
+    if current_worker_index().is_none() {
+        return Err(hook);
+    }
+    IDLE_HOOK.with(|slot| match slot.try_borrow_mut() {
+        Ok(mut slot) if slot.is_none() => {
+            *slot = Some(hook);
+            Ok(())
+        }
+        // Installed already, or called from inside the hook.
+        _ => Err(hook),
+    })
+}
+
+fn run_idle_hook() {
+    IDLE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 }
 
 /// Get current context if on a worker thread
@@ -1310,7 +1336,7 @@ impl Context {
             debug::record_poll_driver_start();
 
             // Poll DPDK network stack (receive packets, process TCP/IP, wake socket tasks)
-            self.poll_dpdk_driver();
+            let network_active = self.poll_dpdk_driver();
             #[cfg(feature = "market-trace")]
             if crate::runtime::market_trace::sched_detail_enabled() {
                 self.trace_queue_depths();
@@ -1455,6 +1481,11 @@ impl Context {
             #[cfg(feature = "market-trace")]
             drop(_maintenance_trace);
 
+            // An iteration in which the network driver saw nothing gives the idle hook its turn.
+            if !network_active {
+                run_idle_hook();
+            }
+
             // Debug: record tick end
             #[cfg(feature = "dpdk-debug")]
             debug::record_tick_end();
@@ -1467,7 +1498,9 @@ impl Context {
     /// 1. Receive packets from DPDK
     /// 2. Process them through smoltcp TCP/IP stack
     /// 3. Wake async tasks waiting on socket readiness
-    fn poll_dpdk_driver(&self) {
+    ///
+    /// Returns whether the driver saw network activity.
+    fn poll_dpdk_driver(&self) -> bool {
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(self.worker.index);
 
@@ -1475,7 +1508,7 @@ impl Context {
             // Gateway ARP and retained RX/TX work remain driver-owned even
             // when no socket is currently registered.
             if !driver.has_poll_work() {
-                return;
+                return false;
             }
             // Poll with current time
             let now = Instant::now();
@@ -1484,8 +1517,6 @@ impl Context {
             #[cfg(feature = "market-trace")]
             let poll_driver_outer_start_ns = crate::runtime::market_trace::now_ns();
             let active = driver.poll(now);
-            #[cfg(not(feature = "market-trace"))]
-            let _ = active;
             #[cfg(feature = "market-trace")]
             if active {
                 let poll_driver_outer_dur_ns = crate::runtime::market_trace::now_ns()
@@ -1508,7 +1539,8 @@ impl Context {
                     0,
                 );
             }
-        });
+            active
+        }) == Some(true)
     }
 
     #[cfg(feature = "market-trace")]

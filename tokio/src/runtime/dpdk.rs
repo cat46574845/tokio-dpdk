@@ -115,6 +115,14 @@ impl std::fmt::Display for WorkerId {
 // Query APIs
 // ============================================================================
 
+/// Runs `hook` on the calling worker thread once in every event-loop iteration in which the network
+/// driver saw no activity, after the iteration's tasks and the `block_on` future. A packet that arrives
+/// meanwhile waits until the hook returns, so it should be short. Returns `hook` when the calling thread
+/// is not a DPDK worker or already has an idle hook.
+pub fn set_idle_hook(hook: Box<dyn FnMut()>) -> Result<(), Box<dyn FnMut()>> {
+    crate::runtime::scheduler::dpdk::worker::set_idle_hook(hook)
+}
+
 /// Returns the [`WorkerId`] of the current DPDK worker thread.
 ///
 /// # Panics
