@@ -97,7 +97,30 @@ pub(crate) fn init_eal(args: &[String]) -> io::Result<()> {
 
     let mut c_ptrs: Vec<*mut i8> = c_args.iter().map(|s| s.as_ptr() as *mut i8).collect();
 
+    // rte_eal_init pins the calling thread to the main lcore. Threads the runtime spawns from this thread
+    // afterwards (the I/O thread) would inherit that core and preempt worker 0 on it, so the caller keeps
+    // its own affinity; block_on still moves the caller onto worker 0's core while it runs.
+    #[cfg(target_os = "linux")]
+    let caller_affinity = unsafe {
+        let mut set = std::mem::zeroed::<libc::cpu_set_t>();
+        let rc = libc::pthread_getaffinity_np(libc::pthread_self(), std::mem::size_of::<libc::cpu_set_t>(), &mut set);
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        set
+    };
+
     let ret = unsafe { ffi::rte_eal_init(c_ptrs.len() as i32, c_ptrs.as_mut_ptr()) };
+
+    #[cfg(target_os = "linux")]
+    {
+        let rc = unsafe {
+            libc::pthread_setaffinity_np(libc::pthread_self(), std::mem::size_of::<libc::cpu_set_t>(), &caller_affinity)
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+    }
 
     if ret < 0 {
         return Err(io::Error::new(
