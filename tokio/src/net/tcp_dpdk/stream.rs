@@ -998,6 +998,17 @@ impl TcpDpdkStream {
         self.flush_std()
     }
 
+    /// Idle warming of this connection's send path with nothing sent: `data` is copied into the socket
+    /// buffer space the next write would fill, without enqueueing any of it, and the next transmit mbuf
+    /// is prepared and touched. A latency-sensitive caller runs it while idle so that its next write finds
+    /// this socket's buffer and the transmit path in cache.
+    pub fn warm_write(&self, data: &[u8]) -> io::Result<()> {
+        self.assert_on_correct_worker();
+        let handle = self.handle;
+        with_current_driver(|driver| driver.warm_socket_send(handle, data))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "DPDK driver unavailable for warm_write"))
+    }
+
     /// Tries to read data into multiple buffers (vectored I/O).
     ///
     /// smoltcp doesn't support native vectored I/O, so we iterate over buffers.

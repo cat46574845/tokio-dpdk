@@ -827,6 +827,24 @@ impl DpdkDevice {
     }
 
     #[inline(always)]
+    /// Idle warming of the transmit path: keeps the next transmit's mbuf prepared in `tx_spare` and
+    /// touches its header area, so a send after a quiet spell takes a cached mbuf without a mempool
+    /// allocation. Only while no transmit is pending; an exhausted mempool is counted as for a send.
+    pub(crate) fn warm_tx(&mut self) {
+        if !self.tx_buffer.is_empty() {
+            return;
+        }
+        if self.tx_spare.is_none() {
+            self.tx_spare = self.try_reserve_tx_mbuf();
+        }
+        if let Some(prepared) = &self.tx_spare {
+            // Ethernet, IPv4 and TCP headers and the start of the payload: what a segment writes first.
+            // SAFETY: a prepared mbuf's data holds DEFAULT_MTU writable bytes, more than 128, and is not
+            // shared until a transmit consumes it.
+            unsafe { std::ptr::write_bytes(prepared.data.as_ptr(), 0, 128) };
+        }
+    }
+
     fn try_reserve_tx_mbuf(&mut self) -> Option<PreparedTxMbuf> {
         if self.tx_buffer.len() >= self.tx_pending_cap {
             self.error_counters.record_tx_pending_full();

@@ -20,7 +20,7 @@ use smoltcp::iface::{
     PollEgressHandleResult, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
     TcpFlowCacheError,
 };
-use smoltcp::socket::tcp::Socket as TcpSocket;
+use smoltcp::socket::tcp::{Socket as TcpSocket, State as TcpState};
 use smoltcp::socket::Socket as SmolSocket;
 use smoltcp::storage::LinearBuffer;
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
@@ -1807,9 +1807,19 @@ impl DpdkDriver {
         self.sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle)
     }
 
-    /// Remove a socket from the socket set and return its buffers to the pool.
+    /// Remove a socket from the socket set and return its buffers to the pool. A connection the peer
+    /// may still hold is aborted first and its RST sent: without it the peer keeps the connection, and a
+    /// new connection from the same local address and port waits a SYN retransmission (about 1 s on
+    /// Binance) for the peer's challenge ACK to be answered.
     pub(crate) fn remove_socket(&mut self, handle: SocketHandle) -> io::Result<()> {
         validate_socket_for_removal(&self.sockets, &self.registered_sockets, handle)?;
+        let socket = self.sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle);
+        if !matches!(socket.state(), TcpState::Closed | TcpState::Listen | TcpState::TimeWait) {
+            socket.abort();
+            if let Err(error) = self.flush_socket_egress(handle) {
+                eprintln!("[tokio-dpdk] WARN RST of removed socket handle={:?} not sent: {}", handle, error);
+            }
+        }
 
         // Invalidate any non-owning raw-tail parser/socket capabilities before
         // SocketSet can recycle this numeric handle for another connection.
@@ -1857,6 +1867,21 @@ impl DpdkDriver {
             || self.device.errors_dirty()
             || self.raw_tail.errors_dirty()
             || self.gateway_probe_errors.is_dirty()
+    }
+
+    /// Idle warming of a socket's send path with nothing queued: `data` is copied into the space the
+    /// next send would fill and none of it is enqueued, then the next transmit mbuf is prepared.
+    pub(crate) fn warm_socket_send(&mut self, handle: SocketHandle, data: &[u8]) {
+        let socket = self.get_tcp_socket_mut(handle);
+        if socket.can_send() {
+            // A send of zero bytes changes nothing (smoltcp's send_impl acts only on a non-zero size).
+            let _ = socket.send(|space| {
+                let len = data.len().min(space.len());
+                space[..len].copy_from_slice(&data[..len]);
+                (0, ())
+            });
+        }
+        self.device.warm_tx();
     }
 
     #[inline(always)]
