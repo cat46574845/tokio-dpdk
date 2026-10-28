@@ -116,11 +116,24 @@ impl std::fmt::Display for WorkerId {
 // ============================================================================
 
 /// Runs `hook` on the calling worker thread once in every event-loop iteration in which the network
-/// driver saw no activity, after the iteration's tasks and the `block_on` future. A packet that arrives
-/// meanwhile waits until the hook returns, so it should be short. Returns `hook` when the calling thread
-/// is not a DPDK worker or already has an idle hook.
+/// driver saw no activity, after the iteration's tasks and the `block_on` future (with a drain hook, not in
+/// an iteration that ran it or found new data at its end). A packet that arrives meanwhile waits until the
+/// hook returns, so it should be short. Returns `hook` when the calling thread is not a DPDK worker or
+/// already has an idle hook.
 pub fn set_idle_hook(hook: Box<dyn FnMut()>) -> Result<(), Box<dyn FnMut()>> {
     crate::runtime::scheduler::dpdk::worker::set_idle_hook(hook)
+}
+
+/// Runs `hook` on the calling worker thread once everything received has been handed to its tasks
+/// ("drained"): at the end of an event-loop iteration, after work since the last call (network activity,
+/// tasks run, or the `block_on` future woken), when no task is queued, the `block_on` future did not wake
+/// itself during its poll, and a further poll of the network driver finds nothing new. When that poll does
+/// find something, the next iteration processes it (without polling the driver again at its start) and
+/// the check repeats. While data keeps arriving faster than the tasks process it, the hook waits. The idle
+/// hook does not run in an iteration that ran this hook or found new data at its end. Returns `hook` when
+/// the calling thread is not a DPDK worker or already has a drain hook.
+pub fn set_drain_hook(hook: Box<dyn FnMut()>) -> Result<(), Box<dyn FnMut()>> {
+    crate::runtime::scheduler::dpdk::worker::set_drain_hook(hook)
 }
 
 /// Returns the [`WorkerId`] of the current DPDK worker thread.

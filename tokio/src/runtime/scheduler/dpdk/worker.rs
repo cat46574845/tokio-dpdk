@@ -1123,6 +1123,8 @@ thread_local! {
     static CURRENT: std::cell::Cell<*const ()> = const { std::cell::Cell::new(std::ptr::null()) };
     /// Run once per event-loop iteration that saw no network activity (`set_idle_hook`).
     static IDLE_HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    /// Run once everything received has been handed to its tasks (`set_drain_hook`).
+    static DRAIN_HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
 }
 
 /// Installs the calling worker thread's idle hook; returns `hook` when this thread is not a DPDK worker or
@@ -1143,6 +1145,34 @@ pub(crate) fn set_idle_hook(hook: Box<dyn FnMut()>) -> Result<(), Box<dyn FnMut(
 
 fn run_idle_hook() {
     IDLE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+/// Installs the calling worker thread's drain hook; returns `hook` when this thread is not a DPDK worker or
+/// already has one.
+pub(crate) fn set_drain_hook(hook: Box<dyn FnMut()>) -> Result<(), Box<dyn FnMut()>> {
+    if current_worker_index().is_none() {
+        return Err(hook);
+    }
+    DRAIN_HOOK.with(|slot| match slot.try_borrow_mut() {
+        Ok(mut slot) if slot.is_none() => {
+            *slot = Some(hook);
+            Ok(())
+        }
+        // Installed already, or called from inside the hook.
+        _ => Err(hook),
+    })
+}
+
+fn drain_hook_installed() -> bool {
+    DRAIN_HOOK.with(|slot| slot.try_borrow().map_or(true, |slot| slot.is_some()))
+}
+
+fn run_drain_hook() {
+    DRAIN_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().as_mut() {
             hook();
         }
@@ -1260,6 +1290,11 @@ impl Context {
 
         // Track LIFO poll count to prevent starvation
         let mut lifo_polls = 0usize;
+        // The drain check's driver poll at the end of the previous iteration, which this iteration
+        // processes instead of polling the driver again (`set_drain_hook`).
+        let mut carried_network: Option<bool> = None;
+        // Work since the drain hook last ran.
+        let mut drain_work = false;
 
         loop {
             // Check if runtime is shutting down (handle-level check)
@@ -1336,7 +1371,10 @@ impl Context {
             debug::record_poll_driver_start();
 
             // Poll DPDK network stack (receive packets, process TCP/IP, wake socket tasks)
-            let network_active = self.poll_dpdk_driver();
+            let network_active = match carried_network.take() {
+                Some(active) => active,
+                None => self.poll_dpdk_driver(),
+            };
             #[cfg(feature = "market-trace")]
             if crate::runtime::market_trace::sched_detail_enabled() {
                 self.trace_queue_depths();
@@ -1424,6 +1462,7 @@ impl Context {
             if let Some(core) = self.core.borrow_mut().as_mut() {
                 core.stats.end_processing_scheduled_tasks();
             }
+            drain_work |= network_active || tasks_in_batch > 0;
             #[cfg(feature = "market-trace")]
             if crate::runtime::market_trace::sched_detail_enabled() {
                 self.trace_queue_depths();
@@ -1432,10 +1471,14 @@ impl Context {
             // Poll block_on future if present (unified event loop design)
             // This allows the block_on future to be polled alongside spawned tasks
             // and DPDK network processing, with full maintenance support.
+            let mut block_on_rewoken = false;
             {
                 let mut state_opt = self.block_on_state.borrow_mut();
                 if let Some(ref mut state) = *state_opt {
                     if !state.completed {
+                        // A wake since the last poll is work for the drain check; a wake during this
+                        // poll means the future has more to run.
+                        drain_work |= self.worker.handle.reset_woken();
                         // Use real waker from Handle to ensure spawned tasks can wake
                         let waker = Handle::waker_ref(&self.worker.handle);
                         let mut cx = std::task::Context::from_waker(&waker);
@@ -1454,6 +1497,7 @@ impl Context {
                         let poll_result = crate::task::coop::budget(|| {
                             (state.poll_fn)(&mut cx)
                         });
+                        block_on_rewoken = self.worker.handle.is_woken();
                         if poll_result.is_ready() {
                             state.completed = true;
                             // Signal shutdown to exit the loop
@@ -1481,8 +1525,26 @@ impl Context {
             #[cfg(feature = "market-trace")]
             drop(_maintenance_trace);
 
-            // An iteration in which the network driver saw nothing gives the idle hook its turn.
-            if !network_active {
+            // Drained: nothing queued, the block_on future did not wake itself, and a further driver poll
+            // finds nothing new. New data goes to the next iteration first, which skips its own poll.
+            let mut drained = false;
+            if drain_work && drain_hook_installed() {
+                let queued = self.core.borrow().as_ref()
+                    .is_some_and(|core| core.has_tasks() || !core.local_overflow.is_empty());
+                if !block_on_rewoken && !queued {
+                    if self.poll_dpdk_driver() {
+                        carried_network = Some(true);
+                    } else {
+                        drain_work = false;
+                        drained = true;
+                        run_drain_hook();
+                    }
+                }
+            }
+
+            // An iteration in which the network driver saw nothing gives the idle hook its turn, unless the
+            // drain hook ran in it or new data waits.
+            if !network_active && !drained && carried_network.is_none() {
                 run_idle_hook();
             }
 

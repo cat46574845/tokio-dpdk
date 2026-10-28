@@ -718,18 +718,19 @@ impl Wake for Handle {
 }
 
 impl Handle {
-    /// Creates a waker reference for the block_on future.
-    /// Sets woken to true initially to ensure the future is polled at least once.
+    /// Creates a waker reference for the block_on future. The event loop polls that future in every
+    /// iteration; a wake only records itself in `woken` for the drain check (`set_drain_hook`).
     pub(crate) fn waker_ref(me: &Arc<Self>) -> WakerRef<'_> {
-        // Set woken to true when entering block_on, ensure outer future
-        // be polled for the first time when entering loop
-        me.shared.woken.store(true, Ordering::Release);
         waker_ref(me)
     }
 
     /// Reset woken to false and return original value.
-    #[allow(dead_code)] // Reserved for future use
     pub(crate) fn reset_woken(&self) -> bool {
         self.shared.woken.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether the block_on future was woken since the last `reset_woken`.
+    pub(crate) fn is_woken(&self) -> bool {
+        self.shared.woken.load(Ordering::Acquire)
     }
 }
