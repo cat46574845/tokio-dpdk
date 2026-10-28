@@ -1525,10 +1525,13 @@ impl Context {
             #[cfg(feature = "market-trace")]
             drop(_maintenance_trace);
 
+            // An iteration in which the network driver saw nothing gives the idle hook its turn, unless work
+            // waits for the drain hook or ran it in this iteration.
+            let mut idle = !network_active;
             // Drained: nothing queued, the block_on future did not wake itself, and a further driver poll
             // finds nothing new. New data goes to the next iteration first, which skips its own poll.
-            let mut drained = false;
             if drain_work && drain_hook_installed() {
+                idle = false;
                 let queued = self.core.borrow().as_ref()
                     .is_some_and(|core| core.has_tasks() || !core.local_overflow.is_empty());
                 if !block_on_rewoken && !queued {
@@ -1536,15 +1539,11 @@ impl Context {
                         carried_network = Some(true);
                     } else {
                         drain_work = false;
-                        drained = true;
                         run_drain_hook();
                     }
                 }
             }
-
-            // An iteration in which the network driver saw nothing gives the idle hook its turn, unless the
-            // drain hook ran in it or new data waits.
-            if !network_active && !drained && carried_network.is_none() {
+            if idle {
                 run_idle_hook();
             }
 
