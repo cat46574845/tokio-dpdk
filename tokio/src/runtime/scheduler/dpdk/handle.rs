@@ -718,8 +718,8 @@ impl Wake for Handle {
 }
 
 impl Handle {
-    /// Creates a waker reference for the block_on future. The event loop polls that future in every
-    /// iteration; a wake only records itself in `woken` for the drain check (`set_drain_hook`).
+    /// Creates a waker reference for the block_on future. The event loop polls that future only after
+    /// a wake records itself in `woken`, which also counts as work for the drain check (`set_drain_hook`).
     pub(crate) fn waker_ref(me: &Arc<Self>) -> WakerRef<'_> {
         waker_ref(me)
     }

@@ -1035,6 +1035,8 @@ pub(crate) fn run_with_future<F: std::future::Future>(
         poll_fn: poll_fn_static,
         completed: false,
     };
+    // The event loop polls the future only after a wake: the first poll is owed now.
+    worker.handle.shared.woken.store(true, Ordering::Release);
 
     // Track the returned core for respawn
     let returned_core: std::cell::RefCell<Option<Box<Core>>> = std::cell::RefCell::new(None);
@@ -1468,17 +1470,17 @@ impl Context {
                 self.trace_queue_depths();
             }
 
-            // Poll block_on future if present (unified event loop design)
-            // This allows the block_on future to be polled alongside spawned tasks
-            // and DPDK network processing, with full maintenance support.
+            // Poll the block_on future if present, alongside spawned tasks and DPDK network processing,
+            // only after a wake (as tokio's current_thread scheduler does): an iteration without one
+            // registers no waker and polls no LocalSet.
             let mut block_on_rewoken = false;
             {
                 let mut state_opt = self.block_on_state.borrow_mut();
                 if let Some(ref mut state) = *state_opt {
-                    if !state.completed {
+                    if !state.completed && self.worker.handle.reset_woken() {
                         // A wake since the last poll is work for the drain check; a wake during this
                         // poll means the future has more to run.
-                        drain_work |= self.worker.handle.reset_woken();
+                        drain_work = true;
                         // Use real waker from Handle to ensure spawned tasks can wake
                         let waker = Handle::waker_ref(&self.worker.handle);
                         let mut cx = std::task::Context::from_waker(&waker);
