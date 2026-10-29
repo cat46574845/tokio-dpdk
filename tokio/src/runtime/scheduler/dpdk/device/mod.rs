@@ -40,7 +40,7 @@ pub(crate) const RAW_MBUF_CAPTURE_MEMPOOL_SIZE: u32 = 2_097_151;
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
 const RAW_MBUF_CAPTURE_DIR_ENV: &str = "TOKIO_DPDK_RAW_MBUF_CAPTURE_DIR";
 
-/// Bytes of pre-touched memory per worker for the transmitted frames (a copy each, with its send time): the
+/// Bytes of pre-touched memory per worker for the transmitted frames (a copy each, with its send times): the
 /// frames past it are counted and not kept.
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
 const TX_CAPTURE_BYTES_ENV: &str = "TOKIO_DPDK_TX_CAPTURE_BYTES";
@@ -100,8 +100,12 @@ struct RawMbufCapture {
     output_file: File,
     port_id: u16,
     queue_id: u16,
-    /// Transmitted frames, each as u64 CLOCK_REALTIME ns when smoltcp finished writing it, u16 length, the frame.
+    /// Transmitted frames, each as u64 CLOCK_REALTIME ns when smoltcp finished writing it, u64 CLOCK_REALTIME ns
+    /// right before the rte_eth_tx_burst call that handed it to the NIC (0: never handed over), u16 length, the frame.
     tx: Vec<u8>,
+    /// For each frame now in the device's TX pending vector, in its order: where its hand-over time goes in `tx`
+    /// (None: not kept).
+    tx_pending: Vec<Option<usize>>,
     tx_frames: u64,
     tx_dropped: u64,
     tx_output: PathBuf,
@@ -109,12 +113,12 @@ struct RawMbufCapture {
 
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
 impl RawMbufCapture {
-    fn new(port_id: u16, queue_id: u16) -> io::Result<Self> {
+    fn new(port_id: u16, queue_id: u16, queue_descriptors: u16) -> io::Result<Self> {
         let output_dir = raw_mbuf_capture_output_dir()?;
         let output = output_dir.join(format!("rx-port{}-queue{}.mbuf", port_id, queue_id));
         let output_file = File::create(&output)?;
         let tx_output = output_dir.join(format!("tx-port{}-queue{}.frames", port_id, queue_id));
-        let mut tx = Vec::with_capacity(tx_capture_bytes()?);
+        let mut tx: Vec<u8> = Vec::with_capacity(tx_capture_bytes()?);
         for index in (0..tx.capacity()).step_by(4096) {
             unsafe { ptr::write_volatile(tx.as_mut_ptr().add(index), 0u8) };
         }
@@ -132,6 +136,7 @@ impl RawMbufCapture {
             port_id,
             queue_id,
             tx,
+            tx_pending: Vec::with_capacity(queue_descriptors as usize),
             tx_frames: 0,
             tx_dropped: 0,
             tx_output,
@@ -140,14 +145,27 @@ impl RawMbufCapture {
 
     #[inline(always)]
     fn record_tx(&mut self, frame: &[u8]) {
-        if self.tx.len() + 10 + frame.len() > self.tx.capacity() {
+        if self.tx.len() + 18 + frame.len() > self.tx.capacity() {
             self.tx_dropped += 1;
+            self.tx_pending.push(None);
             return;
         }
         self.tx.extend_from_slice(&realtime_ns().to_le_bytes());
+        self.tx_pending.push(Some(self.tx.len()));
+        self.tx.extend_from_slice(&0u64.to_le_bytes());
         self.tx.extend_from_slice(&(frame.len() as u16).to_le_bytes());
         self.tx.extend_from_slice(frame);
         self.tx_frames += 1;
+    }
+
+    /// The first `sent` pending frames went out in the tx_burst call made at `handed_ns`.
+    #[inline(always)]
+    fn record_tx_handed(&mut self, sent: usize, handed_ns: u64) {
+        for slot in self.tx_pending.drain(..sent) {
+            if let Some(at) = slot {
+                self.tx[at..at + 8].copy_from_slice(&handed_ns.to_le_bytes());
+            }
+        }
     }
 
     #[inline(always)]
@@ -770,7 +788,7 @@ impl DpdkDevice {
             rx_hw_timestamp,
             last_rx_hw: None,
             #[cfg(feature = "dpdk-raw-mbuf-capture")]
-            raw_mbuf_capture: Box::new(RawMbufCapture::new(port_id, queue_id)?),
+            raw_mbuf_capture: Box::new(RawMbufCapture::new(port_id, queue_id, queue_descriptors)?),
         })
     }
 
@@ -910,6 +928,8 @@ impl DpdkDevice {
         let total = self.tx_buffer.len();
         stats.total_packets = total;
         stats.burst_calls = 1;
+        #[cfg(feature = "dpdk-raw-mbuf-capture")]
+        let handed_ns = realtime_ns();
         // The fixed pending capacity comes from the queue's u16 descriptor count.
         let sent = unsafe {
             dpdk_wrappers::tx_burst(
@@ -926,6 +946,8 @@ impl DpdkDevice {
         }
         stats.sent_packets = sent;
         stats.zero_retries = usize::from(sent == 0);
+        #[cfg(feature = "dpdk-raw-mbuf-capture")]
+        self.raw_mbuf_capture.record_tx_handed(sent, handed_ns);
         retain_unsent_suffix(&mut self.tx_buffer, sent);
         stats.remaining_packets = self.tx_buffer.len();
         stats
