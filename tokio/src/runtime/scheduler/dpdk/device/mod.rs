@@ -101,7 +101,9 @@ struct RawMbufCapture {
     port_id: u16,
     queue_id: u16,
     /// Transmitted frames, each as u64 CLOCK_REALTIME ns when smoltcp finished writing it, u64 CLOCK_REALTIME ns
-    /// right before the rte_eth_tx_burst call that handed it to the NIC (0: never handed over), u16 length, the frame.
+    /// right before and u64 right after the rte_eth_tx_burst call that handed it to the NIC (both 0: never handed
+    /// over), u16 length, the frame. The return of that call is the last instant this host sees: ENA has no transmit
+    /// hardware timestamp, and its transmit completion is only read at a later call.
     tx: Vec<u8>,
     /// For each frame now in the device's TX pending vector, in its order: where its hand-over time goes in `tx`
     /// (None: not kept).
@@ -145,25 +147,27 @@ impl RawMbufCapture {
 
     #[inline(always)]
     fn record_tx(&mut self, frame: &[u8]) {
-        if self.tx.len() + 18 + frame.len() > self.tx.capacity() {
+        if self.tx.len() + 26 + frame.len() > self.tx.capacity() {
             self.tx_dropped += 1;
             self.tx_pending.push(None);
             return;
         }
         self.tx.extend_from_slice(&realtime_ns().to_le_bytes());
         self.tx_pending.push(Some(self.tx.len()));
-        self.tx.extend_from_slice(&0u64.to_le_bytes());
+        self.tx.extend_from_slice(&[0u8; 16]);
         self.tx.extend_from_slice(&(frame.len() as u16).to_le_bytes());
         self.tx.extend_from_slice(frame);
         self.tx_frames += 1;
     }
 
-    /// The first `sent` pending frames went out in the tx_burst call made at `handed_ns`.
+    /// The first `sent` pending frames went out in the tx_burst call made at `called_ns` that returned at
+    /// `returned_ns`.
     #[inline(always)]
-    fn record_tx_handed(&mut self, sent: usize, handed_ns: u64) {
+    fn record_tx_handed(&mut self, sent: usize, called_ns: u64, returned_ns: u64) {
         for slot in self.tx_pending.drain(..sent) {
             if let Some(at) = slot {
-                self.tx[at..at + 8].copy_from_slice(&handed_ns.to_le_bytes());
+                self.tx[at..at + 8].copy_from_slice(&called_ns.to_le_bytes());
+                self.tx[at + 8..at + 16].copy_from_slice(&returned_ns.to_le_bytes());
             }
         }
     }
@@ -939,6 +943,8 @@ impl DpdkDevice {
                 total as u16,
             )
         } as usize;
+        #[cfg(feature = "dpdk-raw-mbuf-capture")]
+        let returned_ns = realtime_ns();
         if sent > total {
             self.error_counters.record_tx_burst_invalid();
             stats.remaining_packets = total;
@@ -947,7 +953,7 @@ impl DpdkDevice {
         stats.sent_packets = sent;
         stats.zero_retries = usize::from(sent == 0);
         #[cfg(feature = "dpdk-raw-mbuf-capture")]
-        self.raw_mbuf_capture.record_tx_handed(sent, handed_ns);
+        self.raw_mbuf_capture.record_tx_handed(sent, handed_ns, returned_ns);
         retain_unsent_suffix(&mut self.tx_buffer, sent);
         stats.remaining_packets = self.tx_buffer.len();
         stats
