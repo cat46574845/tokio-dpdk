@@ -851,6 +851,16 @@ impl TcpDpdkStream {
         }
     }
 
+    /// When the receive buffer byte `offset` bytes past the head arrived: the time the driver poll that handed it
+    /// to this socket began its smoltcp ingress, right after its RX drain. `None` past the received bytes.
+    pub fn recv_arrival(&self, offset: usize) -> io::Result<Option<std::time::Instant>> {
+        self.assert_on_correct_worker();
+
+        let handle = self.handle;
+        with_current_driver(|driver| driver.recv_arrival(handle, offset))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))
+    }
+
     /// Returns the number of bytes currently queued in the TCP receive buffer.
     pub fn recv_queue_len(&self) -> io::Result<usize> {
         self.assert_on_correct_worker();

@@ -9,7 +9,7 @@
 //! Note: Waker management is handled by smoltcp's native waker mechanism
 //! (`register_recv_waker`/`register_send_waker`), not by a separate ScheduledIo.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::task::Waker;
@@ -905,6 +905,10 @@ pub(crate) struct DpdkDriver {
     ingress_touched: Vec<SocketHandle>,
     /// Dense bitset used to deduplicate ingress touched handles.
     ingress_touched_bits: Box<[u64]>,
+    /// Per socket handle: (next expected sequence number after a poll, time that poll began handing its drained
+    /// packets to smoltcp), for the received bytes not yet consumed; a byte arrived in the first poll whose
+    /// sequence number passes it.
+    rx_arrivals: Box<[VecDeque<(u32, Instant)>]>,
     /// True after the configured IPv4 gateway has been registered for LKG probing.
     gateway_neighbor_configured: bool,
     /// Fixed counters for typed gateway probe failures.
@@ -1030,6 +1034,7 @@ impl DpdkDriver {
             ingress_touched: Vec::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
             ingress_touched_bits: vec![0; (SOCKET_LIFECYCLE_CAPACITY + 63) / 64]
                 .into_boxed_slice(),
+            rx_arrivals: (0..SOCKET_LIFECYCLE_CAPACITY).map(|_| VecDeque::new()).collect(),
             gateway_neighbor_configured,
             gateway_probe_errors: GatewayProbeErrorCounters::default(),
             infra_errors_dirty: false,
@@ -1161,6 +1166,8 @@ impl DpdkDriver {
         #[cfg(feature = "market-trace")]
         let mut smoltcp_poll_at_handle_dur_ns = 0u64;
         if has_smoltcp_rx {
+            // The receive time of the bytes this poll hands to its sockets (TcpDpdkStream::recv_arrival).
+            let rx_at = Instant::now();
             let mut ingress_touched = std::mem::take(&mut self.ingress_touched);
             let mut ingress_touched_bits = std::mem::take(&mut self.ingress_touched_bits);
             ingress_touched.clear();
@@ -1249,6 +1256,7 @@ impl DpdkDriver {
                     }
                     self.queue_egress_at(handle, next_due);
                 }
+                self.note_rx_arrival(handle, rx_at);
                 Self::clear_handle_dedup_bit(&mut ingress_touched_bits, handle);
             }
             #[cfg(feature = "market-trace")]
@@ -1807,6 +1815,33 @@ impl DpdkDriver {
         self.sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle)
     }
 
+    /// The ingress of the poll that began handing its drained packets to smoltcp at `rx_at` touched `handle`: its
+    /// newly received bytes arrived then.
+    /// Entries of bytes already consumed (by any read path) are dropped here.
+    fn note_rx_arrival(&mut self, handle: SocketHandle, rx_at: Instant) {
+        let socket = self.sockets.get::<TcpSocket<'_, LinearBuffer<'_>>>(handle);
+        let next = socket.recv_next_seq();
+        let head = next.wrapping_sub(socket.recv_queue() as u32);
+        let arrivals = &mut self.rx_arrivals[handle.index()];
+        while arrivals.front().is_some_and(|&(end, _)| end.wrapping_sub(head) as i32 <= 0) {
+            arrivals.pop_front();
+        }
+        if arrivals.back().map_or(true, |&(last, _)| last != next) {
+            arrivals.push_back((next, rx_at));
+        }
+    }
+
+    /// When the receive buffer byte `offset` bytes past the head of `handle` arrived: the time the poll that
+    /// handed it to the socket began its smoltcp ingress, right after its RX drain. `None` past the received bytes.
+    pub(crate) fn recv_arrival(&self, handle: SocketHandle, offset: usize) -> Option<Instant> {
+        let socket = self.sockets.get::<TcpSocket<'_, LinearBuffer<'_>>>(handle);
+        let byte = socket.recv_next_seq().wrapping_sub(socket.recv_queue() as u32).wrapping_add(offset as u32);
+        self.rx_arrivals[handle.index()]
+            .iter()
+            .find(|&&(next, _)| next.wrapping_sub(byte) as i32 > 0)
+            .map(|&(_, at)| at)
+    }
+
     /// Remove a socket from the socket set and return its buffers to the pool. A connection the peer
     /// may still hold is aborted first and its RST sent: without it the peer keeps the connection, and a
     /// new connection from the same local address and port waits a SYN retransmission (about 1 s on
@@ -1834,6 +1869,7 @@ impl DpdkDriver {
         self.iface.unregister_tcp_flow(handle);
         self.iface.unregister_tcp_listener(handle);
         self.clear_socket_egress_pending(handle);
+        self.rx_arrivals[handle.index()].clear();
         // SocketSet is exclusively borrowed and was validated immediately
         // above, so its panic-only invalid-handle branch is unreachable here.
         let socket = self.sockets.remove(handle);
