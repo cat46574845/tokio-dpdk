@@ -9,7 +9,7 @@
 use std::ffi::CString;
 use std::io;
 
-use super::device::DpdkDevice;
+use super::device::{DpdkDevice, RxHwTimestampField};
 use super::ffi;
 use super::raw_tail::{RAW_TAIL_REQUIRED_RSS_HF, RAW_TAIL_RSS_KEY};
 
@@ -161,13 +161,18 @@ pub(crate) fn create_mempool(
     Ok(pool)
 }
 
-/// Initialize a DPDK port.
+/// `RTE_ETH_RX_OFFLOAD_TIMESTAMP` (rte_ethdev.h: `RTE_BIT64(14)`); the pre-generated bindings omit the macro.
+const RTE_ETH_RX_OFFLOAD_TIMESTAMP: u64 = 1 << 14;
+
+/// Initialize a DPDK port. `rx_hw_timestamp` requests the NIC's hardware receive timestamp; a port that does not
+/// offer it fails here.
 pub(crate) fn init_port(
     port_id: u16,
     mempool: *mut ffi::rte_mempool,
     nb_rx_queues: u16,
     nb_tx_queues: u16,
     nb_descriptors: u16,
+    rx_hw_timestamp: bool,
 ) -> io::Result<()> {
     // Get device info
     let mut dev_info: ffi::rte_eth_dev_info = unsafe { std::mem::zeroed() };
@@ -198,6 +203,19 @@ pub(crate) fn init_port(
     port_conf.rx_adv_conf.rss_conf.rss_hf = RAW_TAIL_REQUIRED_RSS_HF;
     port_conf.rx_adv_conf.rss_conf.algorithm =
         ffi::rte_eth_hash_function_RTE_ETH_HASH_FUNCTION_DEFAULT;
+    if rx_hw_timestamp {
+        if dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TIMESTAMP == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "DPDK port {} does not offer the hardware receive timestamp (RTE_ETH_RX_OFFLOAD_TIMESTAMP {:#x}): \
+                     rx_offload_capa={:#x}",
+                    port_id, RTE_ETH_RX_OFFLOAD_TIMESTAMP, dev_info.rx_offload_capa
+                ),
+            ));
+        }
+        port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_TIMESTAMP;
+    }
     let ret =
         unsafe { ffi::rte_eth_dev_configure(port_id, nb_rx_queues, nb_tx_queues, &port_conf) };
     if ret != 0 {
@@ -343,12 +361,15 @@ pub(crate) fn generate_eal_args_from_plan(
 /// 2. Creates mempool with configurable size and cache
 /// 3. Initializes each unique port with the required number of queues
 /// 4. Creates InitializedWorker for each worker allocation
+/// 5. With `rx_hw_timestamp`, every port reports the NIC's hardware receive timestamp, which the devices read
+///    from the standard mbuf dynamic field
 pub(crate) fn initialize_dpdk_from_plan(
     plan: &super::allocation::AllocationPlan,
     eal_args: &[String],
     mempool_size: u32,
     cache_size: u32,
     queue_descriptors: u16,
+    rx_hw_timestamp: bool,
 ) -> io::Result<(DpdkResourcesMultiQueue, Vec<InitializedWorker>)> {
     use super::allocation::get_device_queue_counts;
     use std::collections::HashMap;
@@ -405,11 +426,19 @@ pub(crate) fn initialize_dpdk_from_plan(
         })?;
 
         // Initialize port with required number of queues and configurable descriptors
-        init_port(port_id, mempool, *num_queues, *num_queues, queue_descriptors)?;
+        init_port(port_id, mempool, *num_queues, *num_queues, queue_descriptors, rx_hw_timestamp)?;
 
         pci_to_port.insert(pci_address.clone(), port_id);
         initialized_ports.push(port_id);
     }
+
+    // The dynamic field and flag the PMDs write the timestamp to; registered once per process (the PMD that
+    // offers the offload registers the same pair while configuring its port).
+    let rx_hw_timestamp_field = if rx_hw_timestamp {
+        Some(register_rx_hw_timestamp_field()?)
+    } else {
+        None
+    };
 
     // 4. Create InitializedWorker for each allocation
     let mut workers = Vec::with_capacity(plan.workers.len());
@@ -429,6 +458,7 @@ pub(crate) fn initialize_dpdk_from_plan(
                 allocation.queue_id,
                 mempool,
                 queue_descriptors,
+                rx_hw_timestamp_field,
             )
         }?;
 
@@ -451,6 +481,25 @@ pub(crate) fn initialize_dpdk_from_plan(
         },
         workers,
     ))
+}
+
+/// The standard mbuf dynamic field and Rx flag of the hardware receive timestamp
+/// (`rte_mbuf_dyn_rx_timestamp_register`).
+fn register_rx_hw_timestamp_field() -> io::Result<RxHwTimestampField> {
+    let mut offset: std::os::raw::c_int = -1;
+    let mut flag: u64 = 0;
+    // SAFETY: both pointers refer to live locals; EAL is initialized.
+    let ret = unsafe { ffi::rte_mbuf_dyn_rx_timestamp_register(&mut offset, &mut flag) };
+    if ret != 0 || offset < 0 || flag == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "register the mbuf Rx timestamp dynamic field and flag (rte_mbuf_dyn_rx_timestamp_register): \
+                 ret={ret} offset={offset} flag={flag:#x}"
+            ),
+        ));
+    }
+    Ok(RxHwTimestampField { offset: offset as usize, flag })
 }
 
 /// DPDK resources for multi-queue mode.

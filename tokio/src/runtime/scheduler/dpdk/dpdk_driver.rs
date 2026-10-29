@@ -30,6 +30,7 @@ use smoltcp::wire::{
 };
 
 use super::device::DpdkDevice;
+use crate::net::tcp_dpdk::RecvArrival;
 use super::raw_tail::{
     RawTailHandle, RawTailParserBinding, RawTailParserConfig, RawTailTable, RawTailTuple,
     RAW_TAIL_CONNECTION_CAP,
@@ -905,10 +906,10 @@ pub(crate) struct DpdkDriver {
     ingress_touched: Vec<SocketHandle>,
     /// Dense bitset used to deduplicate ingress touched handles.
     ingress_touched_bits: Box<[u64]>,
-    /// Per socket handle: (next expected sequence number after a poll, time that poll began handing its drained
-    /// packets to smoltcp), for the received bytes not yet consumed; a byte arrived in the first poll whose
-    /// sequence number passes it.
-    rx_arrivals: Box<[VecDeque<(u32, Instant)>]>,
+    /// Per socket handle: (next expected sequence number, the receipt that advanced it), for the received bytes not
+    /// yet consumed; a byte arrived with the first entry whose sequence number passes it. One entry per poll, or
+    /// per packet when the port reports hardware receive timestamps.
+    rx_arrivals: Box<[VecDeque<(u32, RecvArrival)>]>,
     /// True after the configured IPv4 gateway has been registered for LKG probing.
     gateway_neighbor_configured: bool,
     /// Fixed counters for typed gateway probe failures.
@@ -1168,6 +1169,8 @@ impl DpdkDriver {
         if has_smoltcp_rx {
             // The receive time of the bytes this poll hands to its sockets (TcpDpdkStream::recv_arrival).
             let rx_at = Instant::now();
+            // With hardware receive timestamps, each packet's bytes are noted with that packet's timestamp.
+            let per_packet_arrival = self.device.rx_hw_timestamp_enabled();
             let mut ingress_touched = std::mem::take(&mut self.ingress_touched);
             let mut ingress_touched_bits = std::mem::take(&mut self.ingress_touched_bits);
             ingress_touched.clear();
@@ -1177,7 +1180,9 @@ impl DpdkDriver {
                     raw_tail_observed_gateway,
                     || self.device.is_last_unprocessed_rx_pending(),
                 );
+                let mut packet_touched = None;
                 let mut on_touched = |handle| {
+                    packet_touched = Some(handle);
                     Self::push_handle_dedup(
                         &mut ingress_touched,
                         &mut ingress_touched_bits,
@@ -1219,6 +1224,12 @@ impl DpdkDriver {
                         }
                     }
                 }
+                if per_packet_arrival {
+                    if let Some(handle) = packet_touched {
+                        let nic = self.device.last_rx_hw();
+                        self.note_rx_arrival(handle, RecvArrival { poll: rx_at, nic });
+                    }
+                }
             }
             #[cfg(feature = "market-trace")]
             {
@@ -1256,7 +1267,9 @@ impl DpdkDriver {
                     }
                     self.queue_egress_at(handle, next_due);
                 }
-                self.note_rx_arrival(handle, rx_at);
+                if !per_packet_arrival {
+                    self.note_rx_arrival(handle, RecvArrival { poll: rx_at, nic: None });
+                }
                 Self::clear_handle_dedup_bit(&mut ingress_touched_bits, handle);
             }
             #[cfg(feature = "market-trace")]
@@ -1815,10 +1828,10 @@ impl DpdkDriver {
         self.sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle)
     }
 
-    /// The ingress of the poll that began handing its drained packets to smoltcp at `rx_at` touched `handle`: its
-    /// newly received bytes arrived then.
+    /// `handle`'s newly received bytes arrived with `arrival`: the ingress of one poll (without hardware
+    /// timestamps), or of one packet of it.
     /// Entries of bytes already consumed (by any read path) are dropped here.
-    fn note_rx_arrival(&mut self, handle: SocketHandle, rx_at: Instant) {
+    fn note_rx_arrival(&mut self, handle: SocketHandle, arrival: RecvArrival) {
         let socket = self.sockets.get::<TcpSocket<'_, LinearBuffer<'_>>>(handle);
         let next = socket.recv_next_seq();
         let head = next.wrapping_sub(socket.recv_queue() as u32);
@@ -1827,19 +1840,21 @@ impl DpdkDriver {
             arrivals.pop_front();
         }
         if arrivals.back().map_or(true, |&(last, _)| last != next) {
-            arrivals.push_back((next, rx_at));
+            arrivals.push_back((next, arrival));
         }
     }
 
-    /// When the receive buffer byte `offset` bytes past the head of `handle` arrived: the time the poll that
-    /// handed it to the socket began its smoltcp ingress, right after its RX drain. `None` past the received bytes.
-    pub(crate) fn recv_arrival(&self, handle: SocketHandle, offset: usize) -> Option<Instant> {
+    /// How the receive buffer byte `offset` bytes past the head of `handle` arrived: the time the poll that
+    /// handed it to the socket began its smoltcp ingress, right after its RX drain, and the NIC's hardware
+    /// receive timestamp of the packet that carried it (when the port reports them). `None` past the received
+    /// bytes.
+    pub(crate) fn recv_arrival(&self, handle: SocketHandle, offset: usize) -> Option<RecvArrival> {
         let socket = self.sockets.get::<TcpSocket<'_, LinearBuffer<'_>>>(handle);
         let byte = socket.recv_next_seq().wrapping_sub(socket.recv_queue() as u32).wrapping_add(offset as u32);
         self.rx_arrivals[handle.index()]
             .iter()
             .find(|&&(next, _)| next.wrapping_sub(byte) as i32 > 0)
-            .map(|&(_, at)| at)
+            .map(|&(_, arrival)| arrival)
     }
 
     /// Remove a socket from the socket set and return its buffers to the pool. A connection the peer

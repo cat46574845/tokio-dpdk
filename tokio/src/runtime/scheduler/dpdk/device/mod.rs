@@ -3,7 +3,7 @@
 //! This module provides `DpdkDevice` which implements `smoltcp::phy::Device`,
 //! allowing DPDK to be used as the network backend for smoltcp's TCP/IP stack.
 
-use std::{io, mem::ManuallyDrop, ptr, ptr::NonNull};
+use std::{io, mem::ManuallyDrop, num::NonZeroU64, ptr, ptr::NonNull};
 
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
 use std::fs::{self, File};
@@ -559,6 +559,33 @@ fn compact_consumed_prefix<T: Copy>(pending: &mut Vec<T>, consumed: &mut usize) 
 // DPDK Device
 // =============================================================================
 
+/// Where a PMD that offers `RTE_ETH_RX_OFFLOAD_TIMESTAMP` writes each received packet's hardware timestamp: the
+/// standard mbuf dynamic field (a `u64` of nanoseconds in the device clock's time base) and the Rx dynamic flag
+/// it sets when it filled the field.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RxHwTimestampField {
+    pub(crate) offset: usize,
+    pub(crate) flag: u64,
+}
+
+impl RxHwTimestampField {
+    /// The hardware receive timestamp of `mbuf`, when the PMD filled it.
+    ///
+    /// # Safety
+    ///
+    /// `mbuf` must be a valid received mbuf of a port configured with the offload.
+    #[inline(always)]
+    unsafe fn read(self, mbuf: *const ffi::rte_mbuf) -> Option<NonZeroU64> {
+        // SAFETY: the caller passes a valid mbuf; the registered dynamic field lies inside the mbuf header.
+        unsafe {
+            if (*mbuf).ol_flags & self.flag == 0 {
+                return None;
+            }
+            NonZeroU64::new(ptr::read_unaligned((mbuf as *const u8).add(self.offset) as *const u64))
+        }
+    }
+}
+
 /// DPDK device for network I/O.
 ///
 /// Implements `smoltcp::phy::Device` to use DPDK for packet transmission
@@ -587,6 +614,10 @@ pub(crate) struct DpdkDevice {
     rx_burst_size: u16,
     /// Fixed counters consumed by the driver's rate-limited ERROR reporter.
     error_counters: DeviceErrorCounters,
+    /// The hardware receive timestamp's mbuf field, when the port was configured with the offload.
+    rx_hw_timestamp: Option<RxHwTimestampField>,
+    /// The hardware receive timestamp of the packet `receive` last handed to smoltcp.
+    last_rx_hw: Option<NonZeroU64>,
     #[cfg(feature = "dpdk-raw-mbuf-capture")]
     raw_mbuf_capture: Box<RawMbufCapture>,
 }
@@ -600,12 +631,14 @@ impl DpdkDevice {
     /// # Safety
     ///
     /// `mempool` must be a valid DPDK memory pool pointer that outlives
-    /// this device.
+    /// this device. `rx_hw_timestamp` is the timestamp field of a port configured with
+    /// `RTE_ETH_RX_OFFLOAD_TIMESTAMP`.
     pub(crate) unsafe fn new(
         port_id: u16,
         queue_id: u16,
         mempool: *mut ffi::rte_mempool,
         queue_descriptors: u16,
+        rx_hw_timestamp: Option<RxHwTimestampField>,
     ) -> io::Result<Self> {
         let raw_tail_rss_key = load_actual_rss_key(port_id)?;
         let rx_burst_size = configured_rx_burst_size();
@@ -653,6 +686,8 @@ impl DpdkDevice {
             rx_burst_buf: vec![ptr::null_mut(); rx_burst_len],
             rx_burst_size,
             error_counters: DeviceErrorCounters::default(),
+            rx_hw_timestamp,
+            last_rx_hw: None,
             #[cfg(feature = "dpdk-raw-mbuf-capture")]
             raw_mbuf_capture: Box::new(RawMbufCapture::new(port_id, queue_id)?),
         })
@@ -673,6 +708,19 @@ impl DpdkDevice {
 
     pub(crate) fn raw_tail_rss_key(&self) -> &[u8] {
         &self.raw_tail_rss_key
+    }
+
+    /// Whether the port reports the NIC's hardware receive timestamp of each packet.
+    #[inline]
+    pub(crate) fn rx_hw_timestamp_enabled(&self) -> bool {
+        self.rx_hw_timestamp.is_some()
+    }
+
+    /// The hardware receive timestamp of the packet `receive` last handed to smoltcp (ns, the device clock's time
+    /// base); `None` without the offload or when the PMD did not fill it.
+    #[inline]
+    pub(crate) fn last_rx_hw(&self) -> Option<NonZeroU64> {
+        self.last_rx_hw
     }
 
     /// Try to receive packets from DPDK.
@@ -1011,6 +1059,11 @@ impl Device for DpdkDevice {
             return None;
         };
         self.rx_index += 1;
+        self.last_rx_hw = match self.rx_hw_timestamp {
+            // SAFETY: `raw_rx` is the valid received mbuf this token now owns.
+            Some(field) => unsafe { field.read(raw_rx) },
+            None => None,
+        };
         Some((
             DpdkRxToken { mbuf: rx_mbuf },
             DpdkTxToken {

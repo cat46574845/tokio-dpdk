@@ -1245,6 +1245,20 @@ impl Builder {
         self
     }
 
+    /// Requests the NIC's hardware receive timestamp (`RTE_ETH_RX_OFFLOAD_TIMESTAMP`) on every DPDK port.
+    ///
+    /// Each received packet then carries the device's timestamp (ns, the device clock's time base), which
+    /// [`TcpDpdkStream::recv_arrival`](crate::net::TcpDpdkStream::recv_arrival) reports with the driver's
+    /// receive time. Building the runtime fails when a port does not offer the offload. Default: off.
+    #[cfg(feature = "dpdk")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dpdk")))]
+    pub fn dpdk_rx_hw_timestamp(&mut self, enabled: bool) -> &mut Self {
+        if let Some(ref mut dpdk_builder) = self.dpdk_builder {
+            *dpdk_builder = std::mem::take(dpdk_builder).rx_hw_timestamp(enabled);
+        }
+        self
+    }
+
     /// Sets the number of scheduler ticks after which the scheduler will poll the global
     /// task queue.
     ///

@@ -156,6 +156,17 @@ fn cleanup_socket_on_owner(handle: SocketHandle, core_id: usize) {
     }
 }
 
+/// How received bytes arrived ([`TcpDpdkStream::recv_arrival`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecvArrival {
+    /// When the driver poll that handed the bytes to the socket began its smoltcp ingress, right after its RX
+    /// drain.
+    pub poll: std::time::Instant,
+    /// The NIC's hardware receive timestamp of the packet that carried the bytes (ns, the device clock's time
+    /// base), when the runtime was built with `Builder::dpdk_rx_hw_timestamp` and the PMD filled it.
+    pub nic: Option<std::num::NonZeroU64>,
+}
+
 /// A DPDK-backed TCP stream.
 ///
 /// This struct provides a TCP connection that uses DPDK for packet I/O
@@ -851,9 +862,9 @@ impl TcpDpdkStream {
         }
     }
 
-    /// When the receive buffer byte `offset` bytes past the head arrived: the time the driver poll that handed it
-    /// to this socket began its smoltcp ingress, right after its RX drain. `None` past the received bytes.
-    pub fn recv_arrival(&self, offset: usize) -> io::Result<Option<std::time::Instant>> {
+    /// How the receive buffer byte `offset` bytes past the head arrived (see [`RecvArrival`]). `None` past the
+    /// received bytes.
+    pub fn recv_arrival(&self, offset: usize) -> io::Result<Option<RecvArrival>> {
         self.assert_on_correct_worker();
 
         let handle = self.handle;

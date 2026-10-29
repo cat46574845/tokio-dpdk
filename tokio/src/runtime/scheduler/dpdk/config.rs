@@ -58,6 +58,10 @@ pub(crate) struct DpdkBuilder {
     /// Additional pairs are allocated when a connection is created, up to the
     /// fixed socket lifecycle capacity.
     tcp_buffer_preallocated_connections: Option<usize>,
+
+    /// Request the NIC's hardware receive timestamp (`RTE_ETH_RX_OFFLOAD_TIMESTAMP`) on every port; port
+    /// initialization fails when a port does not offer it.
+    rx_hw_timestamp: bool,
 }
 
 impl Default for DpdkBuilder {
@@ -69,6 +73,7 @@ impl Default for DpdkBuilder {
             cache_size: None,
             queue_descriptors: None,
             tcp_buffer_preallocated_connections: None,
+            rx_hw_timestamp: false,
         }
     }
 }
@@ -137,6 +142,17 @@ impl DpdkBuilder {
     pub(crate) fn tcp_buffer_preallocated_connections(mut self, count: usize) -> Self {
         self.tcp_buffer_preallocated_connections = Some(count);
         self
+    }
+
+    /// Request the NIC's hardware receive timestamp on every port.
+    pub(crate) fn rx_hw_timestamp(mut self, enabled: bool) -> Self {
+        self.rx_hw_timestamp = enabled;
+        self
+    }
+
+    /// Whether every port is configured with the NIC's hardware receive timestamp.
+    pub(crate) fn get_rx_hw_timestamp(&self) -> bool {
+        self.rx_hw_timestamp
     }
 
     /// Get the extra EAL arguments.

@@ -62,3 +62,13 @@ mod bindings_windows;
 
 #[cfg(target_os = "windows")]
 pub(super) use bindings_windows::*;
+
+// librte_mbuf function the pre-generated bindings omit (rte_mbuf_dyn.h).
+extern "C" {
+    /// Registers (or looks up) the standard Rx timestamp dynamic field (`rte_dynfield_timestamp`, a `u64` of
+    /// nanoseconds) and the Rx dynamic flag a PMD sets when it filled it. 0 on success.
+    pub(super) fn rte_mbuf_dyn_rx_timestamp_register(
+        field_offset: *mut std::os::raw::c_int,
+        rx_flag: *mut u64,
+    ) -> std::os::raw::c_int;
+}

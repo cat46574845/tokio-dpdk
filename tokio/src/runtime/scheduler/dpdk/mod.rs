@@ -171,6 +171,7 @@ impl Dpdk {
             dpdk_builder.get_mempool_size(),
             dpdk_builder.get_cache_size(),
             dpdk_builder.get_queue_descriptors(),
+            dpdk_builder.get_rx_hw_timestamp(),
         )?;
 
         // Create flow rules for multi-queue traffic routing

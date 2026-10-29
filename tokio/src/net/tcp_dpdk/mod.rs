@@ -35,4 +35,4 @@ mod stream;
 pub use listener::TcpDpdkListener;
 pub use socket::TcpDpdkSocket;
 pub use split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
-pub use stream::TcpDpdkStream;
+pub use stream::{RecvArrival, TcpDpdkStream};
