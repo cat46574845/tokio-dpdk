@@ -46,6 +46,7 @@ pub(crate) const SPAN_DPDK_RAW_TAIL_EGRESS_QUEUE: u16 = 145;
 pub(crate) const SPAN_DPDK_INFRA_ERROR_REPORT: u16 = 146;
 pub(crate) const SPAN_DPDK_RX_BURST: u16 = 147;
 pub(crate) const SPAN_DPDK_RX_CLASSIFY: u16 = 148;
+pub(crate) const SPAN_DPDK_RX_PREFILTER: u16 = 149;
 pub(crate) const COUNTER_DPDK_QUEUE_TOTAL_DEPTH: u16 = 130;
 pub(crate) const COUNTER_DPDK_RUN_QUEUE_DEPTH: u16 = 131;
 pub(crate) const COUNTER_DPDK_OVERFLOW_DEPTH: u16 = 132;

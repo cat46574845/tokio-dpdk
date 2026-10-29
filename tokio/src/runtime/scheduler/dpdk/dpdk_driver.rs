@@ -30,7 +30,7 @@ use smoltcp::wire::{
 };
 
 use super::device::DpdkDevice;
-use crate::net::tcp_dpdk::RecvArrival;
+use crate::net::tcp_dpdk::{RecvArrival, RecvPrefilter};
 use super::raw_tail::{
     RawTailHandle, RawTailParserBinding, RawTailParserConfig, RawTailTable, RawTailTuple,
     RAW_TAIL_CONNECTION_CAP,
@@ -913,6 +913,8 @@ pub(crate) struct DpdkDriver {
     /// yet consumed; a byte arrived with the first entry whose sequence number passes it. One entry per poll, or
     /// per packet when the port reports hardware receive timestamps.
     rx_arrivals: Box<[VecDeque<(u32, RecvArrival)>]>,
+    /// Per socket handle: the filter that drops received bytes before the reader is woken (`set_rx_prefilter`).
+    rx_prefilters: Box<[Option<std::sync::Arc<dyn RecvPrefilter>>]>,
     /// True after the configured IPv4 gateway has been registered for LKG probing.
     gateway_neighbor_configured: bool,
     /// Fixed counters for typed gateway probe failures.
@@ -1040,6 +1042,7 @@ impl DpdkDriver {
             ingress_touched_bits: vec![0; (SOCKET_LIFECYCLE_CAPACITY + 63) / 64]
                 .into_boxed_slice(),
             rx_arrivals: (0..SOCKET_LIFECYCLE_CAPACITY).map(|_| VecDeque::new()).collect(),
+            rx_prefilters: (0..SOCKET_LIFECYCLE_CAPACITY).map(|_| None).collect(),
             gateway_neighbor_configured,
             gateway_probe_errors: GatewayProbeErrorCounters::default(),
             infra_errors_dirty: false,
@@ -1300,6 +1303,9 @@ impl DpdkDriver {
                 #[cfg(feature = "market-trace")]
                 {
                     smoltcp_poll_at_handle_count += 1;
+                }
+                if let Some(filter) = self.rx_prefilters[handle.index()].as_deref() {
+                    Self::prefilter_rx(&mut self.sockets, filter, handle, self.worker_index);
                 }
                 if let Some(next_due) = self.iface.poll_at_handle(smol_now, &self.sockets, handle) {
                     #[cfg(feature = "market-trace")]
@@ -1880,6 +1886,49 @@ impl DpdkDriver {
         self.sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle)
     }
 
+    pub(crate) fn set_rx_prefilter(&mut self, handle: SocketHandle, filter: std::sync::Arc<dyn RecvPrefilter>) {
+        self.rx_prefilters[handle.index()] = Some(filter);
+        self.sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle).set_defer_rx_wake(true);
+    }
+
+    /// A prefiltered socket this poll handed data: its filter drops what it does not want, then the reader is woken
+    /// only when bytes remain.
+    fn prefilter_rx(
+        sockets: &mut SocketSet<'static, LinearBuffer<'static>>,
+        filter: &dyn RecvPrefilter,
+        handle: SocketHandle,
+        worker_index: usize,
+    ) {
+        let socket = sockets.get_mut::<TcpSocket<'_, LinearBuffer<'_>>>(handle);
+        if !socket.take_deferred_rx_wake() {
+            return;
+        }
+        #[cfg(feature = "market-trace")]
+        let start_ns = crate::runtime::market_trace::now_ns();
+        // The receive buffer is linear: the filter sees every queued byte and drops a prefix of them.
+        let (dropped, woken) = match socket.recv(|received| {
+            let dropped = filter.filter(received);
+            (dropped, dropped)
+        }) {
+            Ok(dropped) => (dropped, socket.recv_queue() > 0),
+            // The receive half is closed or finished: its reader takes the error or the end of stream.
+            Err(_) => (0, true),
+        };
+        if woken {
+            socket.wake_receiver();
+        }
+        #[cfg(not(feature = "market-trace"))]
+        let _ = (dropped, worker_index);
+        #[cfg(feature = "market-trace")]
+        crate::runtime::market_trace::complete(
+            start_ns,
+            crate::runtime::market_trace::now_ns().saturating_sub(start_ns),
+            crate::runtime::market_trace::SPAN_DPDK_RX_PREFILTER,
+            crate::runtime::market_trace::dpdk_track(worker_index),
+            ((dropped as u64) << 1) | woken as u64,
+        );
+    }
+
     /// `handle`'s newly received bytes arrived with `arrival`: the ingress of one poll (without hardware
     /// timestamps), or of one packet of it.
     /// Entries of bytes already consumed (by any read path) are dropped here.
@@ -1937,6 +1986,7 @@ impl DpdkDriver {
         self.iface.unregister_tcp_listener(handle);
         self.clear_socket_egress_pending(handle);
         self.rx_arrivals[handle.index()].clear();
+        self.rx_prefilters[handle.index()] = None;
         // SocketSet is exclusively borrowed and was validated immediately
         // above, so its panic-only invalid-handle branch is unreachable here.
         let socket = self.sockets.remove(handle);

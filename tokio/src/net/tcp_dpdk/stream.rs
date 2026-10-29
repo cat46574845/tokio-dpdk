@@ -167,6 +167,13 @@ pub struct RecvArrival {
     pub nic: Option<std::num::NonZeroU64>,
 }
 
+/// Drops received bytes before the stream's reader sees them ([`TcpDpdkStream::set_recv_prefilter`]).
+pub trait RecvPrefilter: Send + Sync {
+    /// The bytes at the head of the receive buffer, right after a driver poll handed the socket new data and before
+    /// its reader is woken: how many of them to drop. The reader is woken only when bytes remain.
+    fn filter(&self, received: &[u8]) -> usize;
+}
+
 /// A DPDK-backed TCP stream.
 ///
 /// This struct provides a TCP connection that uses DPDK for packet I/O
@@ -860,6 +867,16 @@ impl TcpDpdkStream {
             Some(Err(kind)) => Err(io::Error::new(kind, "consume error")),
             None => Err(io::Error::new(io::ErrorKind::Other, "driver unavailable")),
         }
+    }
+
+    /// Runs `filter` on the socket's newly received bytes in every driver poll that hands it data, before the
+    /// reader is woken; the reader is woken only when bytes remain. Stays for the socket's life.
+    pub fn set_recv_prefilter(&self, filter: std::sync::Arc<dyn RecvPrefilter>) -> io::Result<()> {
+        self.assert_on_correct_worker();
+
+        let handle = self.handle;
+        with_current_driver(|driver| driver.set_rx_prefilter(handle, filter))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "driver unavailable"))
     }
 
     /// How the receive buffer byte `offset` bytes past the head arrived (see [`RecvArrival`]). `None` past the
