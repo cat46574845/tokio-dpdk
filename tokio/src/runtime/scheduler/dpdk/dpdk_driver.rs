@@ -904,6 +904,9 @@ pub(crate) struct DpdkDriver {
     pending_egress: PendingEgress,
     /// Socket handles touched by the current smoltcp ingress drain.
     ingress_touched: Vec<SocketHandle>,
+    /// The event loop's polls leave the pending egress (the ACKs of the data they received first among it)
+    /// to `flush_deferred_egress`, which the loop runs once the received data has been handled.
+    egress_deferred: bool,
     /// Dense bitset used to deduplicate ingress touched handles.
     ingress_touched_bits: Box<[u64]>,
     /// Per socket handle: (next expected sequence number, the receipt that advanced it), for the received bytes not
@@ -1033,6 +1036,7 @@ impl DpdkDriver {
             raw_tail_egress_handles: Vec::with_capacity(RAW_TAIL_CONNECTION_CAP),
             pending_egress: PendingEgress::new(),
             ingress_touched: Vec::with_capacity(SOCKET_LIFECYCLE_CAPACITY),
+            egress_deferred: false,
             ingress_touched_bits: vec![0; (SOCKET_LIFECYCLE_CAPACITY + 63) / 64]
                 .into_boxed_slice(),
             rx_arrivals: (0..SOCKET_LIFECYCLE_CAPACITY).map(|_| VecDeque::new()).collect(),
@@ -1054,6 +1058,43 @@ impl DpdkDriver {
     ///
     /// Returns `true` if there was network activity.
     pub(crate) fn poll(&mut self, now: Instant) -> bool {
+        self.poll_with(now, false)
+    }
+
+    /// The event loop's poll: when it hands received data to sockets, or an earlier one of the loop's polls did
+    /// and the loop has not yet run `flush_deferred_egress`, the pending egress waits for that call, so the
+    /// tasks reading the data run before its ACKs are built and sent. `poll` sends everything pending.
+    pub(crate) fn poll_deferring_egress(&mut self, now: Instant) -> bool {
+        self.poll_with(now, true)
+    }
+
+    /// Sends the pending egress an event-loop poll left (`poll_deferring_egress`); whether there was any.
+    pub(crate) fn flush_deferred_egress(&mut self) -> bool {
+        if !std::mem::take(&mut self.egress_deferred) {
+            return false;
+        }
+        #[cfg(feature = "market-trace")]
+        let start_ns = crate::runtime::market_trace::now_ns();
+        let smol_now = self.smol_instant(Instant::now());
+        let _ = self.poll_pending_egress(smol_now);
+        #[cfg(feature = "market-trace")]
+        {
+            let stats = self.device.flush_tx_with_stats();
+            // Flush phase 2: the deferred egress, its ACKs built here too.
+            crate::runtime::market_trace::complete(
+                start_ns,
+                crate::runtime::market_trace::now_ns().saturating_sub(start_ns),
+                crate::runtime::market_trace::SPAN_DPDK_FLUSH_TX,
+                crate::runtime::market_trace::dpdk_track(self.worker_index),
+                pack_trace_aux3(2, stats.total_packets, stats.zero_retries),
+            );
+        }
+        #[cfg(not(feature = "market-trace"))]
+        let _ = self.device.flush_tx();
+        true
+    }
+
+    fn poll_with(&mut self, now: Instant, defer_egress: bool) -> bool {
         #[cfg(feature = "market-trace")]
         let track_id = crate::runtime::market_trace::dpdk_track(self.worker_index);
         let smol_now = self.smol_instant(now);
@@ -1322,7 +1363,14 @@ impl DpdkDriver {
 
         #[cfg(feature = "market-trace")]
         let smoltcp_egress_pending_start = self.pending_egress.heap.len();
-        let (egress_result, smoltcp_egress_processed) = self.poll_pending_egress(smol_now);
+        // Received data first goes to its tasks (`poll_deferring_egress`); a plain poll sends what an
+        // event-loop poll left too.
+        self.egress_deferred = defer_egress && (received_rx || self.egress_deferred);
+        let (egress_result, smoltcp_egress_processed) = if self.egress_deferred {
+            (PollResult::None, 0)
+        } else {
+            self.poll_pending_egress(smol_now)
+        };
         #[cfg(not(feature = "market-trace"))]
         let _ = smoltcp_egress_processed;
         if egress_result == PollResult::SocketStateChanged {
@@ -1350,14 +1398,18 @@ impl DpdkDriver {
             0
         };
         #[cfg(feature = "market-trace")]
-        let flush_tx_after_stats = if trace_poll {
+        let flush_tx_after_stats = if self.egress_deferred {
+            Default::default()
+        } else if trace_poll {
             self.device.flush_tx_with_stats()
         } else {
             let _ = self.device.flush_tx();
             Default::default()
         };
         #[cfg(not(feature = "market-trace"))]
-        let _ = self.device.flush_tx();
+        if !self.egress_deferred {
+            let _ = self.device.flush_tx();
+        }
         #[cfg(feature = "market-trace")]
         let flush_tx_after_dur_ns = if trace_poll {
             crate::runtime::market_trace::now_ns().saturating_sub(flush_tx_after_start_ns)

@@ -1545,6 +1545,12 @@ impl Context {
                     }
                 }
             }
+            // The egress this iteration's polls left (the ACKs of the data they received) goes once that data
+            // was handled: after the drain hook, or at the end of an iteration without one; data the drain
+            // check found first goes to its tasks in the next iteration.
+            if carried_network.is_none() {
+                self.worker.driver.with_mut(|driver| driver.flush_deferred_egress());
+            }
             if idle {
                 run_idle_hook();
             }
@@ -1579,7 +1585,7 @@ impl Context {
             let sched_detail = crate::runtime::market_trace::sched_detail_enabled();
             #[cfg(feature = "market-trace")]
             let poll_driver_outer_start_ns = crate::runtime::market_trace::now_ns();
-            let active = driver.poll(now);
+            let active = driver.poll_deferring_egress(now);
             #[cfg(feature = "market-trace")]
             if active {
                 let poll_driver_outer_dur_ns = crate::runtime::market_trace::now_ns()
