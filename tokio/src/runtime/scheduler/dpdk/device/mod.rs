@@ -40,6 +40,36 @@ pub(crate) const RAW_MBUF_CAPTURE_MEMPOOL_SIZE: u32 = 2_097_151;
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
 const RAW_MBUF_CAPTURE_DIR_ENV: &str = "TOKIO_DPDK_RAW_MBUF_CAPTURE_DIR";
 
+/// Bytes of pre-touched memory per worker for the transmitted frames (a copy each, with its send time): the
+/// frames past it are counted and not kept.
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+const TX_CAPTURE_BYTES_ENV: &str = "TOKIO_DPDK_TX_CAPTURE_BYTES";
+
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+fn tx_capture_bytes() -> io::Result<usize> {
+    let value = std::env::var(TX_CAPTURE_BYTES_ENV).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is required by dpdk-raw-mbuf-capture: {}", TX_CAPTURE_BYTES_ENV, error),
+        )
+    })?;
+    value.parse().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}={:?} is not a byte count: {}", TX_CAPTURE_BYTES_ENV, value, error),
+        )
+    })
+}
+
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+#[inline(always)]
+fn realtime_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid timespec for clock_gettime to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
 fn raw_mbuf_capture_output_dir() -> io::Result<PathBuf> {
     std::env::var_os(RAW_MBUF_CAPTURE_DIR_ENV)
@@ -54,6 +84,7 @@ fn raw_mbuf_capture_output_dir() -> io::Result<PathBuf> {
 
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
 pub(crate) fn preflight_raw_mbuf_capture() -> io::Result<()> {
+    tx_capture_bytes()?;
     let output_dir = raw_mbuf_capture_output_dir()?;
     fs::create_dir_all(&output_dir)?;
     let probe = output_dir.join(".tokio-dpdk-raw-mbuf-capture-preflight");
@@ -69,6 +100,11 @@ struct RawMbufCapture {
     output_file: File,
     port_id: u16,
     queue_id: u16,
+    /// Transmitted frames, each as u64 CLOCK_REALTIME ns when smoltcp finished writing it, u16 length, the frame.
+    tx: Vec<u8>,
+    tx_frames: u64,
+    tx_dropped: u64,
+    tx_output: PathBuf,
 }
 
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
@@ -77,6 +113,11 @@ impl RawMbufCapture {
         let output_dir = raw_mbuf_capture_output_dir()?;
         let output = output_dir.join(format!("rx-port{}-queue{}.mbuf", port_id, queue_id));
         let output_file = File::create(&output)?;
+        let tx_output = output_dir.join(format!("tx-port{}-queue{}.frames", port_id, queue_id));
+        let mut tx = Vec::with_capacity(tx_capture_bytes()?);
+        for index in (0..tx.capacity()).step_by(4096) {
+            unsafe { ptr::write_volatile(tx.as_mut_ptr().add(index), 0u8) };
+        }
         let mut retained =
             vec![ptr::null_mut(); RAW_MBUF_CAPTURE_MEMPOOL_SIZE as usize].into_boxed_slice();
         let pointers_per_page = 4096 / std::mem::size_of::<*mut ffi::rte_mbuf>();
@@ -90,7 +131,23 @@ impl RawMbufCapture {
             output_file,
             port_id,
             queue_id,
+            tx,
+            tx_frames: 0,
+            tx_dropped: 0,
+            tx_output,
         })
+    }
+
+    #[inline(always)]
+    fn record_tx(&mut self, frame: &[u8]) {
+        if self.tx.len() + 10 + frame.len() > self.tx.capacity() {
+            self.tx_dropped += 1;
+            return;
+        }
+        self.tx.extend_from_slice(&realtime_ns().to_le_bytes());
+        self.tx.extend_from_slice(&(frame.len() as u16).to_le_bytes());
+        self.tx.extend_from_slice(frame);
+        self.tx_frames += 1;
     }
 
     #[inline(always)]
@@ -102,11 +159,13 @@ impl RawMbufCapture {
         self.retained_len += 1;
     }
 
-    fn write_capture(&mut self) -> io::Result<u64> {
+    /// Version 2 adds each packet's hardware receive timestamp (0 when the PMD did not fill it or the port has
+    /// no timestamp offload) after its ingress port.
+    fn write_capture(&mut self, rx_hw_timestamp: Option<RxHwTimestampField>) -> io::Result<u64> {
         self.output_file.set_len(0)?;
         let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, &mut self.output_file);
         writer.write_all(b"TDPDKRX1")?;
-        writer.write_all(&1u32.to_le_bytes())?;
+        writer.write_all(&2u32.to_le_bytes())?;
         writer.write_all(&self.port_id.to_le_bytes())?;
         writer.write_all(&self.queue_id.to_le_bytes())?;
         writer.write_all(&(self.retained_len as u64).to_le_bytes())?;
@@ -123,6 +182,12 @@ impl RawMbufCapture {
             writer.write_all(&pkt_len.to_le_bytes())?;
             writer.write_all(&nb_segs.to_le_bytes())?;
             writer.write_all(&ingress_port.to_le_bytes())?;
+            let hw = match rx_hw_timestamp {
+                // SAFETY: `head` is a retained received mbuf of this port.
+                Some(field) => unsafe { field.read(head) }.map_or(0, NonZeroU64::get),
+                None => 0,
+            };
+            writer.write_all(&hw.to_le_bytes())?;
 
             let mut segment = head;
             for _ in 0..nb_segs {
@@ -139,14 +204,30 @@ impl RawMbufCapture {
         Ok(frame_bytes)
     }
 
-    fn dump_and_release(&mut self) -> io::Result<(usize, u64)> {
+    fn write_tx(&self) -> io::Result<()> {
+        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&self.tx_output)?);
+        writer.write_all(b"TDPDKTX1")?;
+        writer.write_all(&self.port_id.to_le_bytes())?;
+        writer.write_all(&self.queue_id.to_le_bytes())?;
+        writer.write_all(&self.tx_frames.to_le_bytes())?;
+        writer.write_all(&self.tx_dropped.to_le_bytes())?;
+        writer.write_all(&self.tx)?;
+        writer.flush()
+    }
+
+    fn dump_and_release(&mut self, rx_hw_timestamp: Option<RxHwTimestampField>) -> io::Result<(usize, u64)> {
         let packet_count = self.retained_len;
-        let write_result = self.write_capture();
+        let write_result = self.write_capture(rx_hw_timestamp);
+        let tx_result = self.write_tx();
         for &mbuf in &self.retained[..self.retained_len] {
             unsafe { dpdk_wrappers::pktmbuf_free(mbuf) };
         }
         self.retained_len = 0;
-        write_result.map(|frame_bytes| (packet_count, frame_bytes))
+        let frame_bytes = write_result?;
+        tx_result.map_err(|error| {
+            io::Error::new(error.kind(), format!("TX capture {}: {}", self.tx_output.display(), error))
+        })?;
+        Ok((packet_count, frame_bytes))
     }
 }
 
@@ -940,12 +1021,15 @@ impl Drop for DpdkDevice {
         #[cfg(feature = "dpdk-raw-mbuf-capture")]
         let captured_packets = self.raw_mbuf_capture.retained_len;
         #[cfg(feature = "dpdk-raw-mbuf-capture")]
-        match self.raw_mbuf_capture.dump_and_release() {
+        match self.raw_mbuf_capture.dump_and_release(self.rx_hw_timestamp) {
             Ok((packets, frame_bytes)) => eprintln!(
-                "[tokio-dpdk] raw mbuf capture exported path={} packets={} frame_bytes={}",
+                "[tokio-dpdk] raw mbuf capture exported path={} packets={} frame_bytes={} tx_path={} tx_frames={} tx_dropped={}",
                 self.raw_mbuf_capture.output.display(),
                 packets,
-                frame_bytes
+                frame_bytes,
+                self.raw_mbuf_capture.tx_output.display(),
+                self.raw_mbuf_capture.tx_frames,
+                self.raw_mbuf_capture.tx_dropped
             ),
             Err(error) => eprintln!(
                 "[tokio-dpdk] ERROR raw mbuf capture export failed path={} packets={} error={}",
@@ -1024,6 +1108,8 @@ impl<'a> smoltcp::phy::TxToken for DpdkTxToken<'a> {
         let data = unsafe { std::slice::from_raw_parts_mut(prepared.data.as_ptr(), len) };
 
         let result = f(data);
+        #[cfg(feature = "dpdk-raw-mbuf-capture")]
+        this.device.raw_mbuf_capture.record_tx(data);
 
         debug_assert!(this.device.tx_buffer.len() < this.device.tx_pending_cap);
         this.device.tx_buffer.push(prepared.mbuf.into_raw());
