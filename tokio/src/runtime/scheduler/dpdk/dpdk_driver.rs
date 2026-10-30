@@ -930,9 +930,9 @@ pub(crate) struct DpdkDriver {
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
 impl Drop for DpdkDriver {
     fn drop(&mut self) {
-        // Every RX pointer was retained in NIC order at drain_rx entry. Drop
-        // the remaining wrappers before DpdkDevice exports and releases the
-        // underlying mbufs.
+        // Every kept RX pointer was retained in NIC order at drain_rx entry
+        // (the not-kept ones are the wrappers' own). Drop the remaining
+        // wrappers before DpdkDevice exports and releases the retained mbufs.
         self.raw_tail.release_pending_mbufs_for_shutdown();
     }
 }

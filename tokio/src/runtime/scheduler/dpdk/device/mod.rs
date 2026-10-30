@@ -40,6 +40,54 @@ pub(crate) const RAW_MBUF_CAPTURE_MEMPOOL_SIZE: u32 = 2_097_151;
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
 const RAW_MBUF_CAPTURE_DIR_ENV: &str = "TOKIO_DPDK_RAW_MBUF_CAPTURE_DIR";
 
+/// Local TCP ports (comma-separated) whose received frames the capture does not keep: those mbufs are freed as
+/// without the capture and take nothing of its pool (a replay's redundant copies of a connection, whose frames its
+/// analysis does not need). Unset: every received frame is kept.
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+const RAW_MBUF_CAPTURE_SKIP_PORTS_ENV: &str = "TOKIO_DPDK_RAW_MBUF_CAPTURE_SKIP_PORTS";
+
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+fn raw_mbuf_capture_skip_ports() -> io::Result<Box<[u64]>> {
+    let mut bits = vec![0u64; (u16::MAX as usize + 1) / 64].into_boxed_slice();
+    let Some(value) = std::env::var_os(RAW_MBUF_CAPTURE_SKIP_PORTS_ENV) else {
+        return Ok(bits);
+    };
+    let value = value.into_string().map_err(|value| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not UTF-8: {:?}", RAW_MBUF_CAPTURE_SKIP_PORTS_ENV, value),
+        )
+    })?;
+    for item in value.split(',').filter(|item| !item.trim().is_empty()) {
+        let port: u16 = item.trim().parse().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}={:?}: {:?} is not a TCP port: {}", RAW_MBUF_CAPTURE_SKIP_PORTS_ENV, value, item, error),
+            )
+        })?;
+        bits[port as usize / 64] |= 1 << (port % 64);
+    }
+    Ok(bits)
+}
+
+/// A pending received mbuf the capture did not keep carries this bit in its pointer (an rte_mbuf is cache-line
+/// aligned), so the token that consumes it frees it.
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+const RX_NOT_KEPT_TAG: usize = 1;
+
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+#[inline(always)]
+fn tag_rx_pending(mbuf: *mut ffi::rte_mbuf, kept: bool) -> *mut ffi::rte_mbuf {
+    (mbuf as usize | if kept { 0 } else { RX_NOT_KEPT_TAG }) as *mut ffi::rte_mbuf
+}
+
+/// The pending mbuf and whether the capture keeps it.
+#[cfg(feature = "dpdk-raw-mbuf-capture")]
+#[inline(always)]
+fn untag_rx_pending(tagged: *mut ffi::rte_mbuf) -> (*mut ffi::rte_mbuf, bool) {
+    ((tagged as usize & !RX_NOT_KEPT_TAG) as *mut ffi::rte_mbuf, tagged as usize & RX_NOT_KEPT_TAG == 0)
+}
+
 /// Bytes of pre-touched memory per worker for the transmitted frames (a copy each, with its send times): the
 /// frames past it are counted and not kept.
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
@@ -85,6 +133,7 @@ fn raw_mbuf_capture_output_dir() -> io::Result<PathBuf> {
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
 pub(crate) fn preflight_raw_mbuf_capture() -> io::Result<()> {
     tx_capture_bytes()?;
+    raw_mbuf_capture_skip_ports()?;
     let output_dir = raw_mbuf_capture_output_dir()?;
     fs::create_dir_all(&output_dir)?;
     let probe = output_dir.join(".tokio-dpdk-raw-mbuf-capture-preflight");
@@ -111,6 +160,10 @@ struct RawMbufCapture {
     tx_frames: u64,
     tx_dropped: u64,
     tx_output: PathBuf,
+    /// RAW_MBUF_CAPTURE_SKIP_PORTS_ENV as a bit per local TCP port.
+    skip_ports: Box<[u64]>,
+    /// Received frames not kept (to a skipped port).
+    skipped: u64,
 }
 
 #[cfg(feature = "dpdk-raw-mbuf-capture")]
@@ -142,7 +195,33 @@ impl RawMbufCapture {
             tx_frames: 0,
             tx_dropped: 0,
             tx_output,
+            skip_ports: raw_mbuf_capture_skip_ports()?,
+            skipped: 0,
         })
+    }
+
+    /// Whether the capture keeps this received frame: every frame but an IPv4 TCP segment to a skipped local port.
+    #[inline(always)]
+    unsafe fn keeps(&mut self, mbuf: *mut ffi::rte_mbuf) -> bool {
+        let len = unsafe { (*mbuf).data_len } as usize;
+        // Ethernet II (14 bytes), IPv4 with its header length, the TCP destination port 2 bytes into the TCP header.
+        if len < 14 + 20 + 4 {
+            return true;
+        }
+        let frame = unsafe { std::slice::from_raw_parts(dpdk_wrappers::pktmbuf_mtod(mbuf), len) };
+        if frame[12..14] != [0x08, 0x00] || frame[23] != 6 {
+            return true;
+        }
+        let tcp = 14 + usize::from(frame[14] & 0x0f) * 4;
+        if len < tcp + 4 {
+            return true;
+        }
+        let port = u16::from_be_bytes([frame[tcp + 2], frame[tcp + 3]]);
+        if self.skip_ports[port as usize / 64] & (1 << (port % 64)) == 0 {
+            return true;
+        }
+        self.skipped += 1;
+        false
     }
 
     #[inline(always)]
@@ -863,19 +942,21 @@ impl DpdkDevice {
                 // In particular, a superseded raw-tail mbuf is freed by
                 // capture_mbuf before the next burst is requested.
                 for &raw_mbuf in &self.rx_burst_buf[..n as usize] {
+                    #[cfg(feature = "dpdk-raw-mbuf-capture")]
+                    let kept = raw_mbuf.is_null() || unsafe { self.raw_mbuf_capture.keeps(raw_mbuf) };
                     let Some(mbuf) = (unsafe {
                         OwnedMbuf::from_received(
                             raw_mbuf,
                             #[cfg(feature = "dpdk-raw-mbuf-capture")]
-                            true,
+                            kept,
                         )
                     }) else {
                         self.error_counters.record_rx_mbuf_invalid();
                         continue;
                     };
                     #[cfg(feature = "dpdk-raw-mbuf-capture")]
-                    unsafe {
-                        self.raw_mbuf_capture.retain(raw_mbuf);
+                    if kept {
+                        unsafe { self.raw_mbuf_capture.retain(raw_mbuf) };
                     }
                     let mbuf = if raw_tail.is_empty() {
                         mbuf
@@ -888,7 +969,10 @@ impl DpdkDevice {
                             Err(mbuf) => mbuf,
                         }
                     };
+                    #[cfg(not(feature = "dpdk-raw-mbuf-capture"))]
                     self.rx_pending.push(mbuf.into_raw());
+                    #[cfg(feature = "dpdk-raw-mbuf-capture")]
+                    self.rx_pending.push(tag_rx_pending(mbuf.into_raw(), kept));
                     stats.smoltcp_pending += 1;
                 }
                 #[cfg(feature = "market-trace")]
@@ -1046,15 +1130,24 @@ impl Drop for DpdkDevice {
                 dpdk_wrappers::pktmbuf_free(*mbuf);
             }
         }
+        // The kept ones are the capture's, freed after its export.
+        #[cfg(feature = "dpdk-raw-mbuf-capture")]
+        for &tagged in &self.rx_pending[self.rx_index..] {
+            let (mbuf, kept) = untag_rx_pending(tagged);
+            if !kept {
+                unsafe { dpdk_wrappers::pktmbuf_free(mbuf) };
+            }
+        }
         #[cfg(feature = "dpdk-raw-mbuf-capture")]
         let captured_packets = self.raw_mbuf_capture.retained_len;
         #[cfg(feature = "dpdk-raw-mbuf-capture")]
         match self.raw_mbuf_capture.dump_and_release(self.rx_hw_timestamp) {
             Ok((packets, frame_bytes)) => eprintln!(
-                "[tokio-dpdk] raw mbuf capture exported path={} packets={} frame_bytes={} tx_path={} tx_frames={} tx_dropped={}",
+                "[tokio-dpdk] raw mbuf capture exported path={} packets={} frame_bytes={} skipped={} tx_path={} tx_frames={} tx_dropped={}",
                 self.raw_mbuf_capture.output.display(),
                 packets,
                 frame_bytes,
+                self.raw_mbuf_capture.skipped,
                 self.raw_mbuf_capture.tx_output.display(),
                 self.raw_mbuf_capture.tx_frames,
                 self.raw_mbuf_capture.tx_dropped
@@ -1161,12 +1254,14 @@ impl Device for DpdkDevice {
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let raw_rx = *self.rx_pending.get(self.rx_index)?;
+        #[cfg(feature = "dpdk-raw-mbuf-capture")]
+        let (raw_rx, kept) = untag_rx_pending(raw_rx);
         let prepared = self.try_reserve_tx_mbuf()?;
         let Some(rx_mbuf) = (unsafe {
             OwnedMbuf::from_received(
                 raw_rx,
                 #[cfg(feature = "dpdk-raw-mbuf-capture")]
-                true,
+                kept,
             )
         }) else {
             self.error_counters.record_rx_mbuf_invalid();
